@@ -60,6 +60,11 @@ Do not invoke `aark mine reveal` unless the case authorization explicitly requir
 - Preserve exact 64-bit Windows file identities in mining manifests and cleanup
   snapshots/tokens. Values outside JavaScript's safe-integer range are decimal
   strings for compatibility with existing numeric Linux manifests.
+- Finalized relative artifact references may use Windows or Unix separators.
+  Reveal canonicalizes either separator, but must reject absolute paths, empty
+  components, and `.` or `..` traversal components before matching an inventory
+  entry. The inventory's absolute `outputRoot` must still match its containing
+  output directory.
 - Child commands use a minimal platform-specific environment, not inherited
   credentials or user PATH entries. Windows needs the system root and system
   executable directories. Test fixtures must canonicalize temporary paths,

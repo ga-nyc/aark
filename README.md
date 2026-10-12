@@ -131,7 +131,7 @@ The output contains:
 
 The recovery layer writes the same pair of final-report filenames at the case root. Its sensitive report records the restored-data folder, source and destination devices, stage status, provenance, and per-stage output locations. Reports are produced by deterministic local code; their content is not sent to an LLM or remote service.
 
-Use `aark mine reveal <artifact>` when you intentionally want a validated artifact printed locally. It first checks that the file is referenced by a finalized adjacent inventory and still matches its recorded size and SHA-256 hash. The explicit reveal command is never invoked by a scan and its output is never copied into a log. Inventories created under the former `agetnic-tools` name remain supported.
+Use `aark mine reveal <artifact>` when you intentionally want a validated artifact printed locally. It first checks that the file is referenced by a finalized adjacent inventory and still matches its recorded size and SHA-256 hash. Relative artifact references may use Windows or Unix separators; alternate separators are canonicalized without accepting absolute or traversing paths. The inventory's absolute `outputRoot` must still match its containing output directory. The explicit reveal command is never invoked by a scan and its output is never copied into a log. Inventories created under the former `agetnic-tools` name remain supported.
 
 ## Recovery stages
 

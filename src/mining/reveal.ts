@@ -10,6 +10,15 @@ const MAX_REVEAL_BYTES = 256 * 1024 * 1024;
 const TERMINAL_STATUSES = new Set(["paused", "complete", "complete-with-errors", "failed", "interrupted"]);
 const SUPPORTED_INVENTORY_TOOLS = new Set(["aark", "agetnic-tools"]);
 
+function portableArtifactPath(value: unknown): string | undefined {
+  if (typeof value !== "string" || value.length === 0 || value.includes("\0")) return undefined;
+  const normalized = value.replaceAll("\\", "/");
+  if (normalized.startsWith("/") || /^[A-Za-z]:\//u.test(normalized)) return undefined;
+  const components = normalized.split("/");
+  if (components.some((component) => component === "" || component === "." || component === "..")) return undefined;
+  return components.join("/");
+}
+
 async function readStableRegularFile(filename: string, maximumBytes: number, expected?: { dev: bigint; ino: bigint }): Promise<Buffer> {
   const handle = await open(filename, constants.O_RDONLY | constants.O_NOFOLLOW);
   try {
@@ -93,11 +102,12 @@ export async function readValidatedRevealArtifact(input: string): Promise<Buffer
   ) {
     throw new Error("the adjacent mining inventory is incomplete or does not match the artifact tree");
   }
-  const relative = path.relative(output, artifact);
+  const relative = portableArtifactPath(path.relative(output, artifact));
+  if (relative === undefined) throw new Error("the requested artifact is outside the finalized artifact tree");
   const matchingFindings = (inventory.findings as unknown[]).filter((item) => {
     if (typeof item !== "object" || item === null || Array.isArray(item)) return false;
     const artifactFiles = (item as Record<string, unknown>).artifactFiles;
-    return Array.isArray(artifactFiles) && artifactFiles.filter((entry) => entry === relative).length === 1;
+    return Array.isArray(artifactFiles) && artifactFiles.filter((entry) => portableArtifactPath(entry) === relative).length === 1;
   }) as Array<Record<string, unknown>>;
   if (matchingFindings.length !== 1) {
     throw new Error("the requested file is not referenced by the adjacent mining inventory");
@@ -108,14 +118,14 @@ export async function readValidatedRevealArtifact(input: string): Promise<Buffer
     || !Number.isSafeInteger(finding.id)
     || Number(finding.id) < 1
     || `finding-${String(finding.id).padStart(6, "0")}` !== path.basename(findingDirectory)
-    || path.dirname(relative) !== path.join("artifacts", path.basename(findingDirectory))
+    || path.posix.dirname(relative) !== path.posix.join("artifacts", path.basename(findingDirectory))
   ) throw new Error("the requested artifact does not match its finding directory metadata");
   const integrityMatches = Array.isArray(finding.artifactIntegrity)
     ? (finding.artifactIntegrity as unknown[]).filter((item) => (
       typeof item === "object"
       && item !== null
       && !Array.isArray(item)
-      && (item as Record<string, unknown>).path === relative
+      && portableArtifactPath((item as Record<string, unknown>).path) === relative
     )) as Array<Record<string, unknown>>
     : [];
   const integrity = integrityMatches.length === 1 ? integrityMatches[0] : undefined;

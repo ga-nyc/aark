@@ -55,6 +55,22 @@ test("reveal validation accepts only artifacts referenced by a finalized adjacen
   inventory.tool = "aark";
   await writeFile(path.join(output, "inventory-sensitive.json"), JSON.stringify(inventory));
 
+  const foreignSeparator = path.sep === "\\" ? "/" : "\\";
+  const foreignArtifactPath = ["artifacts", "finding-000001", "value.txt"].join(foreignSeparator);
+  inventory.findings[0]!.artifactFiles = [foreignArtifactPath];
+  inventory.findings[0]!.artifactIntegrity[0]!.path = foreignArtifactPath;
+  await writeFile(path.join(output, "inventory-sensitive.json"), JSON.stringify(inventory));
+  assert.deepEqual(await readValidatedRevealArtifact(artifact), exact);
+
+  const traversingArtifactPath = ["artifacts", "finding-000001", "..", "finding-000001", "value.txt"].join(foreignSeparator);
+  inventory.findings[0]!.artifactFiles = [traversingArtifactPath];
+  inventory.findings[0]!.artifactIntegrity[0]!.path = traversingArtifactPath;
+  await writeFile(path.join(output, "inventory-sensitive.json"), JSON.stringify(inventory));
+  await assert.rejects(readValidatedRevealArtifact(artifact), /not referenced/);
+  inventory.findings[0]!.artifactFiles = [path.join("artifacts", "finding-000001", "value.txt")];
+  inventory.findings[0]!.artifactIntegrity[0]!.path = path.join("artifacts", "finding-000001", "value.txt");
+  await writeFile(path.join(output, "inventory-sensitive.json"), JSON.stringify(inventory));
+
   await assert.rejects(readValidatedRevealArtifact(unlisted), /not referenced/);
 
   const alias = path.join(findingDirectory, "alias.txt");
