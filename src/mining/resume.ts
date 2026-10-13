@@ -75,6 +75,8 @@ export interface ScanSemanticOptions {
   overlapBytes: number;
   wholeFileBytes: number;
   deepKeySchedules: boolean;
+  /** Missing only in checkpoints created before crypto-only scan support. */
+  cryptoOnly?: boolean;
 }
 
 export interface ScanOperationalOptions {
@@ -561,6 +563,7 @@ export async function loadScanState(output: string, signal?: AbortSignal): Promi
     || Number(semantic.wholeFileBytes) < 1
     || Number(semantic.wholeFileBytes) > MAX_WHOLE_FILE_BYTES
     || typeof semantic.deepKeySchedules !== "boolean"
+    || (semantic.cryptoOnly !== undefined && typeof semantic.cryptoOnly !== "boolean")
     || !nonNegativeSafe(operational.workers)
     || Number(operational.workers) < 1
     || Number(operational.workers) > 4

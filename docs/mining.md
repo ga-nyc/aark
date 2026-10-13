@@ -46,6 +46,8 @@ aark mine scan /case/recovery/unallocated/free-space.raw \
   --whole-file-mib 128
 ```
 
+For cryptocurrency-only recovery, add `--crypto-only`. This preserves BIP-39, WIF, BIP-32/SLIP-132, Stellar, XRP, Tezos, context-bound secp256k1 material, Bitcoin wallet databases, Ethereum V3, Electrum, MetaMask, and Solana validators. It skips the unrelated credential, password-store, generic-key, DPAPI, and BitLocker detectors. The flag is a semantic scan setting recorded in the integrity-linked checkpoint, so a paused run resumes with exactly the same scope. It is mutually exclusive with `--deep-key-schedules`.
+
 Whole-file validation is capped at 256 MiB and streaming chunks at 128 MiB to keep accidental memory use bounded. Raising the whole-file limit is useful for unusually large browser databases or password vaults; it does not affect streaming detection of embedded keys and tokens.
 
 Before each sensitive artifact write, AARK verifies the exact output-directory and exclusive-lock identities through their live filesystem identities. It also re-enumerates and validates input/output mount topology periodically and before checkpoints. This keeps path substitution checks on the write path without making every finding invoke an expensive operating-system mount inventory.

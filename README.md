@@ -91,6 +91,8 @@ aark mine scan /mnt/recovery/case-001/recovered \
   --min-free-percent 5
 ```
 
+Use `--crypto-only` when the case is limited to cryptocurrency recovery. It runs only the cryptocurrency key/seed detector and cryptocurrency-specific whole-file validators (Bitcoin wallets, Ethereum V3, Electrum, MetaMask, and Solana), skipping provider credentials, password stores, generic key material, and BitLocker. The scope is integrity-linked into pause/resume state. It cannot be combined with `--deep-key-schedules`.
+
 `SIGINT`, `SIGTERM`, the free-space reserve, and an optional `--max-output-gib` cap produce a clean mining pause at a committed chunk boundary. A paused command returns JSON with `resumable: true` and exits `75`; preserve the output and use its `resumeCommand`:
 
 ```bash

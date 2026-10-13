@@ -12,7 +12,7 @@ function indexes(expression: RegExp, text: string): IterableIterator<RegExpMatch
   return text.matchAll(new RegExp(expression.source, expression.flags));
 }
 
-export function detectWalletSecrets(data: Buffer, context: DetectionContext): Candidate[] {
+export function detectCryptocurrencySecrets(data: Buffer, context: DetectionContext): Candidate[] {
   const output: Candidate[] = [];
   for (const hit of findBip39Mnemonics(
     data,
@@ -160,6 +160,13 @@ export function detectWalletSecrets(data: Buffer, context: DetectionContext): Ca
     }, context)) return output;
   }
 
+  return output;
+}
+
+export function detectWalletSecrets(data: Buffer, context: DetectionContext): Candidate[] {
+  const output = detectCryptocurrencySecrets(data, context);
+  if (context.runtimeState?.candidateLimitReached === true || context.runtimeState?.validationLimitReached === true) return output;
+  const text = decodedText(data, "latin1");
   const bitLockerExpression = /(?<!\d)\d{6}(?:-\d{6}){7}(?!\d)/g;
   for (const match of indexes(bitLockerExpression, text)) {
     if (match.index === undefined) continue;

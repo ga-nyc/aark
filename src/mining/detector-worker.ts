@@ -2,11 +2,11 @@ import { parentPort } from "node:worker_threads";
 import { detectCryptographicKeys, detectDeepKeySchedules } from "./detectors/keys.js";
 import { detectConfigurationSecrets } from "./detectors/config-secrets.js";
 import { detectProviderCredentials } from "./detectors/providers.js";
-import { detectStructuredArtifacts } from "./detectors/structured.js";
-import { detectWalletSecrets } from "./detectors/wallets.js";
+import { detectStructuredArtifacts, detectStructuredCryptocurrencyArtifacts } from "./detectors/structured.js";
+import { detectCryptocurrencySecrets, detectWalletSecrets } from "./detectors/wallets.js";
 import type { DetectorRuntimeState } from "./detectors/types.js";
 import { MAX_CANDIDATE_BYTES_PER_DETECTOR_JOB, MAX_STREAMING_CANDIDATE_BYTES_PER_DETECTOR_JOB } from "./limits.js";
-import { STREAMING_DETECTOR_NAMES } from "./worker-protocol.js";
+import { CRYPTOCURRENCY_STREAMING_DETECTOR_NAMES, STREAMING_DETECTOR_NAMES } from "./worker-protocol.js";
 import type { DetectorBatchResult, DetectorJobRequest, DetectorJobResponse } from "./worker-protocol.js";
 
 if (parentPort === null) throw new Error("detector worker must run inside a worker thread");
@@ -61,10 +61,17 @@ port.on("message", (request: DetectorJobRequest) => {
       if (request.kind === "small-file") {
         response.results.push(invoke("structured-artifacts", detectStructuredArtifacts, request, data, true));
       }
+    } else if (request.kind === "cryptocurrency-streaming" || request.kind === "cryptocurrency-small-file") {
+      response.results = CRYPTOCURRENCY_STREAMING_DETECTOR_NAMES.map((name) => invoke(name, detectCryptocurrencySecrets, request, data));
+      if (request.kind === "cryptocurrency-small-file") {
+        response.results.push(invoke("structured-artifacts", detectStructuredCryptocurrencyArtifacts, request, data, true));
+      }
     } else if (request.kind === "deep-key-schedules") {
       response.results = [invoke("deep-key-schedules", detectDeepKeySchedules, request, data)];
     } else if (request.kind === "structured") {
       response.results = [invoke("structured-artifacts", detectStructuredArtifacts, request, data)];
+    } else if (request.kind === "cryptocurrency-structured") {
+      response.results = [invoke("structured-artifacts", detectStructuredCryptocurrencyArtifacts, request, data)];
     } else {
       const detector = {
         "cryptographic-keys": detectCryptographicKeys,

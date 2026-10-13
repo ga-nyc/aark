@@ -211,6 +211,57 @@ test("scanner keeps exact values local while default manifests stay redacted", a
   }
 });
 
+test("crypto-only scans retain wallet findings and exclude unrelated secrets", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "aark-crypto-only-test-"));
+  const input = path.join(root, "recovered");
+  const output = path.join(root, "mined");
+  await mkdir(input);
+  const mnemonic = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+  const providerToken = `ghp_${randomAlphanumeric(36)}`;
+  const bitLocker = "000000-000000-000000-000000-000000-000000-000000-000000";
+  const { privateKey } = generateKeyPairSync("ed25519");
+  const pem = privateKey.export({ format: "pem", type: "pkcs8" });
+  await writeFile(path.join(input, "mixed.txt"), `${mnemonic}\n${providerToken}\n${bitLocker}\n${pem}`);
+
+  const result = await scanSensitiveMaterial({
+    inputs: [input],
+    output,
+    provenance: "unallocated-carve",
+    chunkBytes: 17 * 1024 * 1024,
+    overlapBytes: 17 * 1024 * 1024,
+    wholeFileBytes: 1024 * 1024,
+    cryptoOnly: true,
+    minimumFreeGiB: 0,
+    minimumFreePercent: 0,
+  });
+  assert.equal(result.status, "complete");
+  assert.equal(result.cryptoOnly, true);
+  const inventory = JSON.parse(await readFile(path.join(output, "inventory-sensitive.json"), "utf8")) as SensitiveScanInventory;
+  assert.deepEqual(inventory.findings.map((finding) => finding.category), ["bip39-mnemonic"]);
+  assert.equal(inventory.resumeCheckpoint?.semantic.cryptoOnly, true);
+  const manifest = JSON.parse(await readFile(path.join(output, "manifest-redacted.json"), "utf8")) as { cryptoOnly?: boolean };
+  assert.equal(manifest.cryptoOnly, true);
+  assert.match(await readFile(path.join(output, "final-report-redacted.md"), "utf8"), /Scan scope: cryptocurrency only/);
+});
+
+test("crypto-only scans reject deep key-schedule mode", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "aark-crypto-deep-conflict-"));
+  const input = path.join(root, "input.bin");
+  await writeFile(input, "synthetic");
+  await assert.rejects(scanSensitiveMaterial({
+    inputs: [input],
+    output: path.join(root, "mined"),
+    provenance: "unknown",
+    chunkBytes: 17 * 1024 * 1024,
+    overlapBytes: 17 * 1024 * 1024,
+    wholeFileBytes: 1024,
+    cryptoOnly: true,
+    deepKeySchedules: true,
+    minimumFreeGiB: 0,
+    minimumFreePercent: 0,
+  }), /cannot be combined/);
+});
+
 test("scanner rejects an output that aliases a scanned input through a parent symlink", { skip: process.platform === "win32" }, async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), "agetnic-alias-test-"));
   const input = path.join(root, "recovered");

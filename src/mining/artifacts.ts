@@ -63,6 +63,7 @@ export class ArtifactStore {
     private readonly assertOutputSafe?: () => Promise<void>,
     private readonly storageBudget?: StorageBudget,
     private readonly observer?: ArtifactStoreObserver,
+    private readonly cryptoOnly = false,
   ) {}
 
   public restore(inventory: SensitiveScanInventory): void {
@@ -338,6 +339,7 @@ export class ArtifactStore {
       offsetsRedacted: true,
       hashesRedacted: true,
       deepKeySchedules: this.deepKeySchedules,
+      cryptoOnly: this.cryptoOnly,
       filesVisited: progress.filesVisited,
       filesScanned: progress.filesScanned,
       bytesScanned: progress.bytesScanned,

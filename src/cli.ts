@@ -137,6 +137,7 @@ mine.command("scan")
   .option("--overlap-mib <number>", "window overlap in MiB", "17")
   .option("--whole-file-mib <number>", "maximum file size for whole-file container validation", "64")
   .option("--deep-key-schedules", "scan every byte for AES schedules and initialized ChaCha states", false)
+  .option("--crypto-only", "scan only cryptocurrency keys, seeds, wallets, and keystores", false)
   .option("--workers <number>", "detector worker threads (1-4; defaults to available CPUs minus one, capped at 4)")
   .option("--min-free-gib <number>", "minimum free-space reserve in GiB", "5")
   .option("--min-free-percent <number>", "minimum free-space reserve as a filesystem percentage", "5")
@@ -149,6 +150,7 @@ mine.command("scan")
     overlapMib: string;
     wholeFileMib: string;
     deepKeySchedules: boolean;
+    cryptoOnly: boolean;
     workers?: string;
     minFreeGib: string;
     minFreePercent: string;
@@ -171,6 +173,7 @@ mine.command("scan")
         overlapBytes: mib(options.overlapMib),
         wholeFileBytes: mib(options.wholeFileMib),
         deepKeySchedules: options.deepKeySchedules,
+        cryptoOnly: options.cryptoOnly,
         ...(options.workers === undefined ? {} : { workers: workers(options.workers) }),
         minimumFreeGiB: quantity(options.minFreeGib, "minimum free GiB"),
         minimumFreePercent: quantity(options.minFreePercent, "minimum free percent"),

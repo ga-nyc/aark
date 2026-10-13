@@ -39,7 +39,7 @@ import type {
 import type { MiningOptions, MiningPerformance, MiningProgress, MiningRunStatus, SensitiveScanInventory } from "./types.js";
 import { isBoundedJsonValue, isSafeDetectorIdentifier, MAX_CANDIDATE_BYTES_PER_DETECTOR_JOB, MAX_DERIVED_ARTIFACT_BYTES_PER_CANDIDATE, MAX_INPUT_ROOTS, MAX_STREAMING_CANDIDATE_BYTES_PER_DETECTOR_JOB } from "./limits.js";
 import { MAX_DPAPI_BLOB_BYTES } from "./validators/dpapi.js";
-import { STREAMING_DETECTOR_NAMES } from "./worker-protocol.js";
+import { expectedDetectorNames } from "./worker-protocol.js";
 import type { DetectorBatchResult, DetectorJobKind } from "./worker-protocol.js";
 import { DetectorWorkerPool } from "./worker-pool.js";
 
@@ -82,6 +82,7 @@ interface NormalizedMiningOptions extends MiningOptions {
   workers: number;
   minimumFreeGiB: number;
   minimumFreePercent: number;
+  cryptoOnly: boolean;
 }
 
 export interface MiningResumeOptions {
@@ -469,6 +470,7 @@ function validatedOptions(input: MiningOptions): NormalizedMiningOptions {
     workers: validateWorkerCount(input.workers ?? Math.min(4, Math.max(1, availableParallelism() - 1))),
     minimumFreeGiB: input.minimumFreeGiB ?? 5,
     minimumFreePercent: input.minimumFreePercent ?? 5,
+    cryptoOnly: input.cryptoOnly === true,
   };
   if (options.inputs.length === 0) throw new Error("at least one mining input is required");
   if (options.inputs.length > MAX_INPUT_ROOTS) throw new Error(`mining accepts at most ${MAX_INPUT_ROOTS} input roots per scan`);
@@ -479,6 +481,7 @@ function validatedOptions(input: MiningOptions): NormalizedMiningOptions {
   if (options.chunkBytes < MINIMUM_SAFE_OVERLAP || options.chunkBytes > 128 * 1024 * 1024) throw new Error("chunkBytes must be between 17 MiB and 128 MiB");
   if (options.overlapBytes < MINIMUM_SAFE_OVERLAP || options.overlapBytes > options.chunkBytes) throw new Error("overlapBytes must be between 17 MiB and chunkBytes so every supported streaming format can cross a chunk boundary");
   if (options.wholeFileBytes > 256 * 1024 * 1024) throw new Error("wholeFileBytes must not exceed 256 MiB");
+  if (options.cryptoOnly && options.deepKeySchedules === true) throw new Error("cryptoOnly cannot be combined with deepKeySchedules");
   storagePolicyFromGiB(options.minimumFreeGiB, options.minimumFreePercent, options.maximumOutputGiB);
   return options;
 }
@@ -492,6 +495,7 @@ function semanticOptions(options: NormalizedMiningOptions): ScanSemanticOptions 
     overlapBytes: options.overlapBytes,
     wholeFileBytes: options.wholeFileBytes,
     deepKeySchedules: options.deepKeySchedules === true,
+    cryptoOnly: options.cryptoOnly,
   };
 }
 
@@ -707,8 +711,20 @@ async function commitDetectorWorkInBatches(
   return clean;
 }
 
-function workForWindow(data: Buffer, context: DetectionContext, deep: boolean, deepPrimaryStart = 0): DetectorWork[] {
-  const work: DetectorWork[] = [{ kind: "streaming", data, context }];
+function streamingJobKind(cryptoOnly: boolean): DetectorJobKind {
+  return cryptoOnly ? "cryptocurrency-streaming" : "streaming";
+}
+
+function smallFileJobKind(cryptoOnly: boolean): DetectorJobKind {
+  return cryptoOnly ? "cryptocurrency-small-file" : "small-file";
+}
+
+function structuredJobKind(cryptoOnly: boolean): DetectorJobKind {
+  return cryptoOnly ? "cryptocurrency-structured" : "structured";
+}
+
+function workForWindow(data: Buffer, context: DetectionContext, deep: boolean, cryptoOnly: boolean, deepPrimaryStart = 0): DetectorWork[] {
+  const work: DetectorWork[] = [{ kind: streamingJobKind(cryptoOnly), data, context }];
   if (!deep) return work;
   const scanStart = deepPrimaryStart === 0 ? 0 : Math.max(0, deepPrimaryStart - DEEP_SCAN_OVERLAP_BYTES);
   let primaryStart = scanStart;
@@ -855,7 +871,7 @@ async function prepareSmallFile(runtime: ScanRuntime, file: FrozenScanFile): Pro
     };
     let batches: DetectorBatchResult[];
     try {
-      batches = await runtime.pool.run("small-file", data, context);
+      batches = await runtime.pool.run(smallFileJobKind(runtime.options.cryptoOnly), data, context);
     } catch (error) {
       if (detectorWorkCancelled(error, runtime.options.signal)) throw new ScanPauseError("scan paused", { cause: error });
       throw new ScanControlError("detector worker execution failed", { cause: error });
@@ -906,11 +922,13 @@ async function processSmallFileBatch(
       let completelyScanned = false;
       if ("prepared" in outcome) {
         try {
-          const streamingBatches = outcome.prepared.batches.slice(0, STREAMING_DETECTOR_NAMES.length);
+          const streamingKind = streamingJobKind(runtime.options.cryptoOnly);
+          const streamingDetectorCount = expectedDetectorNames(streamingKind).length;
+          const streamingBatches = outcome.prepared.batches.slice(0, streamingDetectorCount);
           const streamingMayPublish = streamingBatches.some((batch) => batch.error !== undefined || batch.candidates.length > 0);
           await assertPreparedFileCurrent(runtime, outcome.prepared);
           const result: DetectorWorkResult = {
-            kind: "small-file",
+            kind: streamingKind,
             data: outcome.prepared.data,
             context: {
               sourcePath: file.path,
@@ -939,7 +957,7 @@ async function processSmallFileBatch(
           await maybeCheckpoint();
           runtime.state.cursor = { fileIndex: file.index, phase: "whole-file", nextOffset: 0 };
           if (interrupted(runtime.options.signal)) throw new ScanPauseError("scan paused");
-          const structuredBatch = outcome.prepared.batches[STREAMING_DETECTOR_NAMES.length];
+          const structuredBatch = outcome.prepared.batches[streamingDetectorCount];
           if (structuredBatch === undefined) {
             throw new ScanControlError("small-file worker omitted its structured detector result");
           }
@@ -947,7 +965,7 @@ async function processSmallFileBatch(
           const structuredStarted = performance.now();
           try {
             completelyScanned = await commitDetectorResults({
-              kind: "structured",
+              kind: structuredJobKind(runtime.options.cryptoOnly),
               data: outcome.prepared.data,
               context: {
                 sourcePath: file.path,
@@ -1227,7 +1245,7 @@ async function processFile(runtime: ScanRuntime, file: FrozenScanFile, cursor: S
           const context: DetectionContext = { sourcePath: file.path, baseOffset: windowStart, wholeFile: false, deepKeySchedules: false };
           clean = await commitDetectorWorkInBatches(
             runtime,
-            workForWindow(data, context, true, primaryOffset - windowStart),
+            workForWindow(data, context, true, runtime.options.cryptoOnly, primaryOffset - windowStart),
             file.path,
             assertSourceCurrent,
           ) && clean;
@@ -1259,7 +1277,7 @@ async function processFile(runtime: ScanRuntime, file: FrozenScanFile, cursor: S
           return { primaryOffset, primaryEnd, data, context };
         }));
         await assertSourceCurrent();
-        const orderedWork = windows.flatMap((window) => workForWindow(window.data, window.context, false));
+        const orderedWork = windows.flatMap((window) => workForWindow(window.data, window.context, false, runtime.options.cryptoOnly));
         let completedWork = 0;
         for await (const result of runDetectorWorkOrdered(runtime.pool, orderedWork, runtime.options.signal)) {
           await assertSourceCurrent();
@@ -1298,7 +1316,7 @@ async function processFile(runtime: ScanRuntime, file: FrozenScanFile, cursor: S
         wholeFile: true,
         deepKeySchedules: runtime.options.deepKeySchedules === true,
       };
-      const [result] = await runDetectorWork(runtime.pool, [{ kind: "structured", data, context }], runtime.options.signal);
+      const [result] = await runDetectorWork(runtime.pool, [{ kind: structuredJobKind(runtime.options.cryptoOnly), data, context }], runtime.options.signal);
       if (result === undefined) throw new Error("structured detector worker returned no result");
       await assertSourceCurrent();
       const commitStarted = performance.now();
@@ -1338,6 +1356,7 @@ function resultObject(
     occurrences: progress.occurrences,
     scanErrors: progress.scanErrors,
     deepKeySchedules: deep,
+    cryptoOnly: state.semantic.cryptoOnly === true,
     workers: state.operational.workers,
     valuesPrinted: false,
     reports: { sensitive: "final-report-sensitive.md", redacted: "final-report-redacted.md" },
@@ -1680,7 +1699,7 @@ export async function scanSensitiveMaterial(input: MiningOptions): Promise<Recor
     // let an already-aborted signal prevent creation of the clean, resumable
     // inventory-phase pause that the caller requested.
     const budget = new StorageBudget(options.output, policy, await directoryLogicalBytes(options.output));
-    const store = new ArtifactStore(options.output, options.inputs, options.deepKeySchedules === true, assertSafeOutput, budget, metrics);
+    const store = new ArtifactStore(options.output, options.inputs, options.deepKeySchedules === true, assertSafeOutput, budget, metrics, options.cryptoOnly);
     await store.initialize();
     const progress: MiningProgress = {
       phase: "inventory",
@@ -1855,7 +1874,7 @@ export async function resumeSensitiveMaterial(input: MiningResumeOptions): Promi
     await verifyResumeArtifacts(output, inventory, options.signal);
     state.operational = operationalOptions(options);
     state.updatedAt = new Date().toISOString();
-    const store = new ArtifactStore(output, options.inputs, options.deepKeySchedules === true, assertSafeOutput, budget, metrics);
+    const store = new ArtifactStore(output, options.inputs, options.deepKeySchedules === true, assertSafeOutput, budget, metrics, options.cryptoOnly);
     store.restore(inventory);
     const progress: MiningProgress = { ...state.progress };
     try {

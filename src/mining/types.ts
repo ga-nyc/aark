@@ -9,6 +9,7 @@ export interface MiningOptions {
   overlapBytes: number;
   wholeFileBytes: number;
   deepKeySchedules?: boolean;
+  cryptoOnly?: boolean;
   workers?: number;
   minimumFreeGiB?: number;
   minimumFreePercent?: number;
@@ -105,6 +106,7 @@ export interface SensitiveScanInventory {
       overlapBytes: number;
       wholeFileBytes: number;
       deepKeySchedules: boolean;
+      cryptoOnly?: boolean;
     };
     inputRoots: Array<{ path: string; device: FilesystemIdentity; inode: FilesystemIdentity; kind: "file" | "directory"; mount: string }>;
     manifest: { filename: string; entries: number; bytes: number; sha256: string };

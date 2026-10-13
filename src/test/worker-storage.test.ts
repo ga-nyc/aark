@@ -96,6 +96,48 @@ test("detector workers bound repetitive malformed structural markers", async () 
   }
 });
 
+test("cryptocurrency worker scope runs only cryptocurrency detectors", async () => {
+  const mnemonic = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+  const provider = `ghp_${"aB3dE5fG7hJ9kL2mN4pQ6rS8tV0wX1yZ2cD3e"}`;
+  const bitLocker = "000000-000000-000000-000000-000000-000000-000000-000000";
+  const data = Buffer.from(`${mnemonic}\n${provider}\n${bitLocker}\n`, "utf8");
+  const pool = new DetectorWorkerPool(1);
+  try {
+    const batches = await pool.run("cryptocurrency-streaming", data, { sourcePath: "/synthetic", baseOffset: 0, wholeFile: false });
+    assert.deepEqual(batches.map((batch) => batch.detector), ["wallet-secrets"]);
+    const categories = batches.flatMap((batch) => batch.candidates.map((candidate) => candidate.category));
+    assert.deepEqual(categories, ["bip39-mnemonic"]);
+    const full = await pool.run("streaming", data, { sourcePath: "/synthetic", baseOffset: 0, wholeFile: false });
+    const fullCategories = full.flatMap((batch) => batch.candidates.map((candidate) => candidate.category));
+    assert.ok(fullCategories.includes("github-access-token"), "the excluded provider-token control was not detectable");
+    assert.ok(fullCategories.includes("bitlocker-recovery-password"), "the excluded BitLocker control was not detectable");
+  } finally {
+    await pool.close();
+  }
+});
+
+test("cryptocurrency small-file scope retains wallet keystores", async () => {
+  const document = Buffer.from(JSON.stringify({
+    version: 3,
+    crypto: {
+      cipher: "aes-128-ctr",
+      ciphertext: "11".repeat(32),
+      cipherparams: { iv: "22".repeat(16) },
+      kdf: "scrypt",
+      kdfparams: { salt: "33".repeat(16) },
+      mac: "44".repeat(32),
+    },
+  }));
+  const pool = new DetectorWorkerPool(1);
+  try {
+    const batches = await pool.run("cryptocurrency-small-file", document, { sourcePath: "/synthetic.json", baseOffset: 0, wholeFile: false });
+    assert.deepEqual(batches.map((batch) => batch.detector), ["wallet-secrets", "structured-artifacts"]);
+    assert.deepEqual(batches[1]?.candidates.map((candidate) => candidate.category), ["ethereum-v3-keystore"]);
+  } finally {
+    await pool.close();
+  }
+});
+
 test("exact DPAPI signatures do not exhaust the shared structural-validation budget", async () => {
   const data = Buffer.concat(Array.from(
     { length: MAX_STRUCTURAL_VALIDATIONS_PER_DETECTOR_JOB + 1 },

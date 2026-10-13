@@ -57,6 +57,7 @@ Do not invoke `aark mine reveal` unless the case authorization explicitly requir
 - Mining supports native Windows local drive-letter volumes with Node.js 22.12+.
   Reject UNC paths, mapped network drives, and paths absent from the local
   volume-manager inventory; do not bypass the volume inventory.
+- `aark mine scan --crypto-only` is a semantic, resume-frozen scope. It must run only cryptocurrency key/seed and cryptocurrency-specific structured-wallet validators, must exclude BitLocker and unrelated credentials, and must remain mutually exclusive with `--deep-key-schedules`.
 - Preserve exact 64-bit Windows file identities in mining manifests and cleanup
   snapshots/tokens. Values outside JavaScript's safe-integer range are decimal
   strings for compatibility with existing numeric Linux manifests.

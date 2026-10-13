@@ -1,7 +1,7 @@
 import { createPrivateKey, createPublicKey } from "node:crypto";
 import type { Candidate, JsonValue } from "../../core/types.js";
 import { decodeChromiumDpapiWrapper, parseDpapiMasterKeyFile } from "../validators/dpapi.js";
-import { validateStructuredContainer } from "../validators/containers.js";
+import { validateBitcoinCoreBerkeleyWallet, validateSensitiveSqlite, validateStructuredContainer } from "../validators/containers.js";
 import { appendCandidate, markValidationLimit, takeStructuralValidation } from "./types.js";
 import type { DetectionContext } from "./types.js";
 import { MAX_STRUCTURED_JSON_PARSE_BYTES } from "../limits.js";
@@ -337,20 +337,64 @@ function looksLikeJsonDocument(data: Buffer): boolean {
   return data[cursor] === 0x7b || data[cursor] === 0x5b;
 }
 
+function appendContainerCandidate(
+  output: Candidate[],
+  container: NonNullable<ReturnType<typeof validateStructuredContainer>>,
+  context: DetectionContext,
+): boolean {
+  return appendCandidate(output, {
+    category: container.category,
+    offset: context.baseOffset,
+    length: container.value.length,
+    value: container.value,
+    confidence: container.confidence,
+    validation: { method: "complete-sensitive-container", checks: container.checks },
+    extension: container.extension,
+  }, context);
+}
+
+function appendCryptocurrencyJsonCandidates(data: Buffer, context: DetectionContext, output: Candidate[]): void {
+  if (!looksLikeJsonDocument(data)) return;
+  if (data.length > MAX_STRUCTURED_JSON_PARSE_BYTES) {
+    markValidationLimit(context);
+    return;
+  }
+  try {
+    const parsed: unknown = JSON.parse(data.toString("utf8").replace(/^\uFEFF/u, ""));
+    const document = record(parsed);
+    if (document !== null) {
+      for (const validator of [ethereumV3, electrum, metamask]) {
+        const candidate = validator(document, data, context);
+        if (candidate !== null && !appendCandidate(output, candidate, context)) return;
+        if (validationLimitReached(context)) return;
+      }
+    }
+    const solana = solanaKeypair(parsed, data, context);
+    if (solana !== null) appendCandidate(output, solana, context);
+  } catch {
+    // Non-JSON input is expected during broad recovery scans.
+  }
+}
+
+export function detectStructuredCryptocurrencyArtifacts(data: Buffer, context: DetectionContext): Candidate[] {
+  if (!context.wholeFile) return [];
+  const output: Candidate[] = [];
+  const bitcoinWallet = validateBitcoinCoreBerkeleyWallet(data);
+  if (bitcoinWallet !== null && !appendContainerCandidate(output, bitcoinWallet, context)) return output;
+  if (validationLimitReached(context)) return output;
+  const sqlite = validateSensitiveSqlite(data);
+  if (sqlite?.category === "bitcoin-core-sqlite-wallet" && !appendContainerCandidate(output, sqlite, context)) return output;
+  if (validationLimitReached(context)) return output;
+  appendCryptocurrencyJsonCandidates(data, context, output);
+  return output;
+}
+
 export function detectStructuredArtifacts(data: Buffer, context: DetectionContext): Candidate[] {
   if (!context.wholeFile) return [];
   const output: Candidate[] = [];
   const container = validateStructuredContainer(data, () => takeStructuralValidation(context));
   if (container !== null) {
-    if (!appendCandidate(output, {
-      category: container.category,
-      offset: context.baseOffset,
-      length: container.value.length,
-      value: container.value,
-      confidence: container.confidence,
-      validation: { method: "complete-sensitive-container", checks: container.checks },
-      extension: container.extension,
-    }, context)) return output;
+    if (!appendContainerCandidate(output, container, context)) return output;
   }
   if (validationLimitReached(context)) return output;
   const der = derPrivateKey(data, context);
