@@ -44,6 +44,19 @@ The default reserve is the larger of 5 GiB and 5% of the destination filesystem.
 
 When the guard stops ddrescue, AARK terminates its process group, retains the image and mapfile, records the stage as `paused-disk-quota-resumable`, finalizes the run as `paused`, prints that status as JSON, and exits `75`. Free space or explicitly authorize a revised storage policy, then rerun the same `aark recover run --config <case.json> --execute` command. The mapfile makes the retry authoritative.
 
+Recovery manifests and CLI JSON also report `resumable` and, for a quota stop,
+`storageStop`. Its `reason` distinguishes `output-cap` from `free-space-reserve`;
+decimal-string byte counters record the observed output, available space, reserve,
+and configured cap without revealing paths or tool errors. Exit `75` is a pause,
+not a completed recovery or an ordinary failure; a supervisor must preserve the
+case and report that it needs resuming rather than silently abandoning it.
+
+Quota walks count each directory-entry name once per containing directory. This
+prevents concurrent atomic file replacement on NTFS from replaying a subtree or
+file into the total. Distinct pathnames, including hard links, still count
+separately. The walk retains at most one million entry names across its active
+directories and fails closed if that tracking bound is exceeded.
+
 Other recovery engines do not have a uniform, verified in-place resume protocol. A quota stop records `failed-disk-quota`, finalizes the run as failed, and exits nonzero. Retain the partial outputs and logs, but do not treat them as complete or blindly rerun into the same paths. An ordinary failed optional engine may likewise leave type-checked partial output; it is retained with a warning and later independent stages may continue, but the partial directory is never mislabeled complete.
 
 The `ntfsundelete` listing uses `--verbose` with `--parent`, as required by the tool. Its percentage option filters scan output rather than selecting undelete candidates, so the match-based recovery stage omits it and attempts every matching deleted record. If some candidates cannot be reconstructed and ntfsundelete returns exit 1, the runner records `completed-with-warnings` only when the current invocation retained at least one new recovery file; the same exit with no new output remains a failed optional stage.

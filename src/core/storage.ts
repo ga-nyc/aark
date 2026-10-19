@@ -1,9 +1,10 @@
 import type { BigIntStats } from "node:fs";
-import { lstat, opendir, statfs } from "node:fs/promises";
+import fs, { lstat, statfs } from "node:fs/promises";
 import path from "node:path";
 
 const GIBIBYTE = 1024n ** 3n;
 const MAX_OUTPUT_TREE_DEPTH = 256;
+const MAX_TRACKED_OUTPUT_ENTRIES = 1_000_000;
 
 function fixedPointInteger(value: number, scale: number, label: string): number {
   const scaled = Math.round(value * scale);
@@ -136,6 +137,7 @@ export class StorageBudget {
 export async function directoryLogicalBytes(root: string, signal?: AbortSignal): Promise<bigint> {
   const resolvedRoot = path.resolve(root);
   const ancestors = new Set<string>();
+  let trackedEntries = 0;
   const assertNotAborted = (): void => {
     if (signal?.aborted === true) throw new Error("output tree size walk was interrupted");
   };
@@ -159,16 +161,27 @@ export async function directoryLogicalBytes(root: string, signal?: AbortSignal):
     if (ancestors.has(directoryKey)) throw new Error("output tree contains a recursive directory identity");
     ancestors.add(directoryKey);
     let total = 0n;
+    const names = new Set<string>();
     try {
-      const directory = await opendir(current);
+      const directory = await fs.opendir(current);
       for await (const entry of directory) {
         assertNotAborted();
+        // Concurrent atomic replacement can make NTFS replay directory entries.
+        // Count a pathname once per walk, including directory subtrees, while
+        // preserving separate charges for distinct names and hard links.
+        if (names.has(entry.name)) continue;
+        if (trackedEntries >= MAX_TRACKED_OUTPUT_ENTRIES) {
+          throw new Error("output tree exceeds the bounded directory-entry tracking limit");
+        }
+        names.add(entry.name);
+        trackedEntries += 1;
         total += await visit(path.join(current, entry.name), depth + 1);
       }
     } catch (error) {
       const code = error instanceof Error && "code" in error ? (error as NodeJS.ErrnoException).code : undefined;
       if (code !== "ENOENT" && code !== "ENOTDIR") throw error;
     } finally {
+      trackedEntries -= names.size;
       ancestors.delete(directoryKey);
     }
     return total;

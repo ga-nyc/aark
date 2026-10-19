@@ -66,6 +66,20 @@ function storageQuota(error: unknown): StorageQuotaError | undefined {
   return undefined;
 }
 
+export function redactedStorageStop(error: unknown): Record<string, JsonValue> | undefined {
+  const quota = storageQuota(error);
+  if (quota === undefined) return undefined;
+  return {
+    reason: quota.reason,
+    // Decimal strings preserve exact counters without exposing paths or errors.
+    availableBytes: quota.capacity.availableBytes.toString(),
+    totalBytes: quota.capacity.totalBytes.toString(),
+    reservedBytes: quota.capacity.reservedBytes.toString(),
+    outputBytes: quota.capacity.outputBytes.toString(),
+    plannedBytes: quota.capacity.plannedBytes.toString(),
+  };
+}
+
 function redactArg(arg: string, plan: RecoveryPlan): string {
   if (arg === plan.source) return "<SOURCE>";
   if (arg === plan.analysisSource) return "<ANALYSIS_SOURCE>";
@@ -607,12 +621,18 @@ export async function runRecoveryPlan(
     await writeCaseFile(safeJoin(plan.destination, "final-report-sensitive.md"), sensitiveReport);
     await writeCaseFile(safeJoin(plan.destination, "final-report-redacted.md"), redactedReport, 0o644);
     const complete = status === "complete" || status === "complete-with-warnings";
+    const storageStop = redactedStorageStop(failure);
     const manifest: Record<string, JsonValue> = {
       tool: "aark",
       layer: "recovery",
       runId,
       status,
       complete,
+      resumable: status === "paused" && failure instanceof RecoveryQuotaStop && failure.resumable,
+      ...(storageStop === undefined ? {} : { storageStop: {
+        ...storageStop,
+        maximumOutputBytes: storagePolicy.maximumOutputBytes?.toString() ?? null,
+      } }),
       finishedAt,
       caseId: "<CASE_ID>",
       sourcePathsAndToolLogsRedacted: true,
