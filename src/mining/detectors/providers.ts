@@ -33,7 +33,10 @@ const TOKEN_PATTERNS: TokenPattern[] = [
 ];
 
 const SECRET_NAME = /(?:api[_-]?key|access[_-]?token|auth[_-]?token|client[_-]?secret|consumer[_-]?secret|secret[_-]?key|private[_-]?key|password|passwd|pwd|passphrase|refresh[_-]?token|recovery[_-]?key|wallet[_-]?seed|mnemonic|psk)/i;
-const ASSIGNMENT = /(?:^|[\r\n,{;]\s*)(["']?)([A-Za-z][A-Za-z0-9_.-]{1,80})\1\s*[:=]\s*(?:"([^"\r\n]{8,4096})"|'([^'\r\n]{8,4096})'|([^\s,;}#]{8,1024}))/gm;
+// Start at the last line break in a whitespace run. Crossing line breaks here
+// retries the entire remaining run at every blank line when no assignment follows.
+// The final delimiter still finds the same key, value, and absolute value offset.
+const ASSIGNMENT = /(?:^|[\r\n,{;][^\S\r\n]*)(["']?)([A-Za-z][A-Za-z0-9_.-]{1,80})\1\s*[:=]\s*(?:"([^"\r\n]{8,4096})"|'([^'\r\n]{8,4096})'|([^\s,;}#]{8,1024}))/gm;
 const CREDENTIAL_URL = /\b(?:https?|ftp|postgres(?:ql)?|mysql|mongodb(?:\+srv)?|redis|amqps?):\/\/[^\s<>"']{1,512}/g;
 const JWT = /(?<![A-Za-z0-9_-])([A-Za-z0-9_-]{8,2048})\.([A-Za-z0-9_-]{8,8192})\.([A-Za-z0-9_-]{8,4096})(?![A-Za-z0-9_-])/g;
 
