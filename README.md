@@ -27,6 +27,12 @@ No telemetry, LLM/API integration, cloud validation, or network lookup is perfor
 - Root access for raw block-device work on Linux
 - A separate destination disk with enough free space
 
+Linux recovery and mining outputs must not use the kernel `ntfs3` driver.
+AARK rejects those output mounts before creating case directories or locks.
+Use a native Linux filesystem, or mount an existing NTFS destination explicitly
+with `ntfs-3g`. Read-only NTFS sources remain supported. See
+[destination drivers and live-session recovery](docs/recovery.md#destination-drivers-and-live-session-recovery).
+
 The recovery layer remains Linux-only because it orchestrates Linux forensic
 engines and kernel block-device safeguards. The mining layer also supports
 native Windows local volumes. On Windows, AARK inventories local volume-manager

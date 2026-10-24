@@ -7,7 +7,8 @@ import path from "node:path";
 import { loadRecoveryConfig } from "../recovery/config.js";
 import { buildRecoveryPlan } from "../recovery/plan.js";
 import { renderRecoveryRedactedReport, renderRecoverySensitiveReport } from "../recovery/report.js";
-import { recoveryStepStatus, redactedPlan, runRecoveryPlan } from "../recovery/runner.js";
+import { recoveryStepStatus, redactedPlan, redactedStorageStop, runRecoveryPlan } from "../recovery/runner.js";
+import { StorageQuotaError } from "../core/storage.js";
 import type { SourceSafety } from "../recovery/source-safety.js";
 import type { RecoveryConfig } from "../recovery/types.js";
 
@@ -33,6 +34,28 @@ function config(): RecoveryConfig {
     },
   };
 }
+
+test("recovery quota diagnostics retain exact counters without paths or nested error messages", () => {
+  const quota = new StorageQuotaError("output-cap", {
+    availableBytes: 4_000_000_000_000n,
+    totalBytes: 5_000_000_000_000n,
+    reservedBytes: 250_000_000_000n,
+    outputBytes: 9_007_199_254_740_993n,
+    plannedBytes: 0n,
+  });
+  const result = redactedStorageStop(new Error("/synthetic/private/tool.log", { cause: quota }));
+  assert.deepEqual(result, {
+    reason: "output-cap",
+    availableBytes: "4000000000000",
+    totalBytes: "5000000000000",
+    reservedBytes: "250000000000",
+    outputBytes: "9007199254740993",
+    plannedBytes: "0",
+  });
+  assert.equal(redactedStorageStop(new Error("/synthetic/private/other-error")), undefined);
+  assert.equal(redactedStorageStop(undefined), undefined);
+  assert.equal(redactedStorageStop(new StorageQuotaError("free-space-reserve", quota.capacity))?.reason, "free-space-reserve");
+});
 
 test("recovery plan selects deleted/unallocated modes and redacts local paths", { skip: process.platform === "win32" }, () => {
   const plan = buildRecoveryPlan(config());

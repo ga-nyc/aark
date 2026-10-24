@@ -15,6 +15,13 @@ stronger `/proc/self/fd` handle-to-canonical-path check.
 
 ## Output contract
 
+On Linux, both fresh scans and resume operations reject `ntfs3` output mounts
+before acquiring locks or creating output files. Use `ntfs-3g` for an existing
+NTFS destination, or a native Linux filesystem. This output policy does not
+reject read-only NTFS sources or native Windows volumes. See the
+[live-session recovery rules](recovery.md#destination-drivers-and-live-session-recovery)
+before rebooting a machine with unfinished scans.
+
 A scan writes these related local outputs:
 
 | Output | Contents | Handling |
