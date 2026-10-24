@@ -83,10 +83,6 @@ The recovery configuration accepts an optional storage policy:
 
 The default reserve is the larger of 5 GiB and 5% of the destination filesystem. `maxOutputGiB` is optional and measures the logical size of the whole case tree, including evidence, recovered files, logs, and reports. AARK checks capacity before each stage and every second while an external engine runs. Case-size accounting streams wide directory trees instead of retaining their full frontier in memory and rejects recursive or pathologically deep directory layouts. The boundary is conservative but not a byte-exact write limit: an engine can write during the polling interval, and reserved space remains available for termination and final reports.
 
-During an engine run, the free-space reserve and destination/source safety checks run independently of full-tree logical-size accounting. A large case inventory therefore cannot hold up the next free-space check. Neither check overlaps another invocation of itself, and any in-flight check must finish before command outputs are accepted. A logical-size cap can still overshoot while its inventory is in progress; the independent free-space reserve remains enforced during that walk. These guards preserve headroom but do not estimate how much output a recovery stage will produce.
-
-Budget for all enabled stages before starting: an evidence image, an unallocated-space stream, outputs from multiple metadata-recovery engines, and signature-carved files can coexist. Their combined size can exceed the source volume's size. Filesystems with large allocation units can also use much more physical space than the sum of small files' logical sizes. Check actual free space between stages and allow room for later mining outputs; a case's logical-size cap does not bound physical allocation.
-
 When the guard stops ddrescue, AARK terminates its process group, retains the image and mapfile, records the stage as `paused-disk-quota-resumable`, finalizes the run as `paused`, prints that status as JSON, and exits `75`. Free space or explicitly authorize a revised storage policy, then rerun the same `aark recover run --config <case.json> --execute` command. The mapfile makes the retry authoritative.
 
 Recovery manifests and CLI JSON also report `resumable` and, for a quota stop,
@@ -136,3 +132,9 @@ Keep the encrypted physical source read-only. Use dislocker or another audited i
 ## “All and only deleted” limitation
 
 No recovery engine can make that guarantee on real media. TRIM can zero SSD cells before acquisition; overwritten clusters no longer contain the old bytes; metadata can be reused; and signature carving can mistake random or embedded data for standalone files. The toolkit addresses this by retaining provenance, separating markers from validated structures, comparing against allocated references, and never silently relabeling historical data as deleted.
+
+## Capacity planning and monitoring
+
+During an engine run, the free-space reserve and destination/source safety checks run independently of full-tree logical-size accounting. A large case inventory therefore cannot hold up the next free-space check. Neither check overlaps another invocation of itself, and any in-flight check must finish before command outputs are accepted. A logical-size cap can still overshoot while its inventory is in progress; the independent free-space reserve remains enforced during that walk. These guards preserve headroom but do not estimate how much output a recovery stage will produce.
+
+Budget for all enabled stages before starting: an evidence image, an unallocated-space stream, outputs from multiple metadata-recovery engines, and signature-carved files can coexist. Their combined size can exceed the source volume's size. Filesystems with large allocation units can also use much more physical space than the sum of small files' logical sizes. Check actual free space between stages and allow room for later mining outputs; a case's logical-size cap does not bound physical allocation.
