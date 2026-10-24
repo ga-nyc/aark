@@ -73,6 +73,11 @@ or reveal artifacts. Unknown fields in an edited snapshot are omitted. A status
 snapshot is informational and does not authorize cleanup or prove checkpoint
 integrity.
 
+Older outputs may have no progress snapshot; use their redacted manifests and
+final reports instead. Existing cleanly paused scans remain resumable under the
+normal checks. Older AARK revisions can reject a new progress file as an unknown
+control, so use this or a newer compatible revision to resume new outputs.
+
 Recovery writes progress at stage transitions, approximately every five seconds
 while an engine runs, and at terminal status. It reports stage, elapsed time,
 physical headroom, reserve, cached logical-size measurement and its timestamp,
