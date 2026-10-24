@@ -235,7 +235,7 @@ test("command runner reports bounded capture truncation", async () => {
   assert.equal(result.stderrTruncated, true);
 });
 
-for (const checkOption of ["safetyCheck", "backgroundSafetyCheck"] as const) {
+for (const checkOption of ["safetyCheck", "backgroundSafetyCheck", "progress"] as const) {
   test(`a ${checkOption} that finishes after process exit still invalidates the command`, async () => {
     let markStarted: (() => void) | undefined;
     const started = new Promise<void>((resolve) => { markStarted = resolve; });
@@ -243,6 +243,7 @@ for (const checkOption of ["safetyCheck", "backgroundSafetyCheck"] as const) {
     const pendingSafety = new Promise<void>((_resolve, reject) => { rejectSafety = reject; });
     const command = captureCommand(process.execPath, ["-e", "setTimeout(() => {}, 40)"], {
       safetyCheckIntervalMs: 10,
+      progressIntervalMs: 10,
       [checkOption]: async () => {
         markStarted?.();
         await pendingSafety;

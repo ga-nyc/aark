@@ -20,12 +20,12 @@ Deletion is intentionally outside that standing authorization. Even if the origi
 
 1. Run `aark recover inventory --json` and identify the exact source and a destination on a different physical device.
 2. Create the strict case JSON. Keep `requireReadOnlySource: true`; set a storage policy explicitly when the defaults are not appropriate.
-3. Run `aark recover plan --config <case.json>` and verify that every command, source, destination, and enabled stage stays inside the authorization.
+3. Run `aark recover assess --config <case.json>`, then `aark recover plan --config <case.json>` and verify that every command, source, destination, and enabled stage stays inside the authorization. Assessment counts only known bulk minimums: unknown output sizes and physical allocation overhead require headroom; `knownMinimumFits` is not a promise that the whole workflow fits. See [storage assessment and progress](docs/storage-planning.md).
 4. Execute only when both confirmations are present: `execute: true` in the reviewed configuration and `aark recover run --config <case.json> --execute`.
 5. Treat a JSON result with `status: "paused"`, or process exit code `75`, as a safe retry condition rather than success or failure. Free space and rerun the identical recovery command for a ddrescue quota pause.
 6. Mine each intended local recovery output with the correct provenance. Use the default bounded worker pool unless the case requires `--workers 1`.
 7. On mining exit code `75`, preserve the output unchanged and run the returned `resumeCommand`, normally `aark mine resume --output <directory>`.
-8. Use aggregate JSON, `manifest-redacted.json`, and `final-report-redacted.md` for automation. Review redacted material before sharing it.
+8. Use aggregate JSON, `manifest-redacted.json`, and `final-report-redacted.md` for automation. Use `aark recover status --case <directory>` or `aark mine status --output <directory>` for bounded redacted progress rather than opening sensitive controls. Liveness and observed activity do not prove completion; progress snapshots do not authorize cleanup. Review redacted material before sharing it.
 9. When recovery and all intended scans are complete, run `aark cleanup plan <MINING_OUTPUTS...> --case <CASE_DIRECTORY>`. The command is read-only and normally succeeds only when the recovery case is terminal-successful, every supplied scan is exactly `complete` with zero errors, its frozen inputs are unchanged, every artifact hash verifies, and the scans collectively cover every selected recovery file. The narrow `--accept-interrupted-case` compatibility option may be used only after the owner explicitly accepts a legacy interrupted run; it must leave that state truthful and still enforce inactive locks, matching per-run controls, exact complete scan coverage, and fresh cleanup approval.
 10. Show the path-redacted plan, filesystem-entry/regular-file deletion counts and byte totals, retained-artifact count, retained whole-source file count and bytes, marker-only count, evidence disposition, and approval token to the end user. Ask explicitly whether AARK should delete the bulk recovered copy while keeping the root final reports, complete mining outputs, exact sensitive artifacts, every complete finding-containing source file, and minimal integrity metadata. Do not continue until the user says yes.
 11. After approval, run the unchanged command with `--approval-token <TOKEN> --execute --confirm-delete-recovered-copy`. Evidence images remain by default. If the user separately approves evidence deletion, use `--include-evidence` in both commands and `--confirm-delete-evidence` during execution.
@@ -95,6 +95,10 @@ Do not invoke `aark mine reveal` unless the case authorization explicitly requir
   that its controller and child scanner are inactive.
 
 ## Repository changes
+
+Track deferred workflow changes in [the project backlog](docs/backlog.md). WFL-001
+covers scanning completed outputs after a later recovery failure; do not silently
+implement that behavior by weakening case success, coverage, or cleanup gates.
 
 Detector workers must remain pure: they receive bounded bytes and return candidates or errors. The main thread exclusively verifies candidate bytes and source offsets, assigns deterministic IDs, deduplicates, writes artifacts, accounts for capacity, and publishes checkpoints. Preserve deterministic ordering across worker counts 1 through 4, add synthetic tests, and run `npm run check` on Ubuntu before proposing a change.
 

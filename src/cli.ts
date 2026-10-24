@@ -6,6 +6,8 @@ import { machineInventory } from "./recovery/inventory.js";
 import { loadRecoveryConfig } from "./recovery/config.js";
 import { buildRecoveryPlan } from "./recovery/plan.js";
 import { redactedPlan, runRecoveryPlan } from "./recovery/runner.js";
+import { assessRecoveryStorage } from "./recovery/assessment.js";
+import { readProgress } from "./core/progress.js";
 import { resumeSensitiveMaterial, scanSensitiveMaterial } from "./mining/scanner.js";
 import { readValidatedRevealArtifact } from "./mining/reveal.js";
 import { planCleanup, runCleanup } from "./cleanup.js";
@@ -101,23 +103,42 @@ recover.command("inventory")
 recover.command("plan")
   .description("Build and display a redacted recovery plan")
   .requiredOption("-c, --config <path>", "case configuration JSON")
-  .action(async (options: { config: string }) => {
+  .option("--assess-storage", "include a read-only live storage assessment", false)
+  .action(async (options: { config: string; assessStorage: boolean }) => {
     const config = await loadRecoveryConfig(options.config);
-    json(redactedPlan(buildRecoveryPlan(config)));
+    json({ ...redactedPlan(buildRecoveryPlan(config)),
+      ...(options.assessStorage ? { storageAssessment: await assessRecoveryStorage(config) } : {}),
+    });
   });
+
+recover.command("assess")
+  .description("Assess known storage requirements without creating outputs or changing media")
+  .requiredOption("-c, --config <path>", "case configuration JSON")
+  .action(async (options: { config: string }) => {
+    const assessment = await assessRecoveryStorage(await loadRecoveryConfig(options.config));
+    json(assessment);
+    if (assessment.knownMinimumFits === false) process.exitCode = 2;
+  });
+
+recover.command("status")
+  .description("Read aggregate recovery progress without opening sensitive controls")
+  .requiredOption("--case <directory>", "recovery case directory")
+  .action(async (options: { case: string }) => json(await readProgress(options.case, "recovery")));
 
 recover.command("run")
   .description("Execute a reviewed recovery plan; requires two independent confirmations")
   .requiredOption("-c, --config <path>", "case configuration JSON")
   .option("--execute", "second execution confirmation", false)
-  .action(async (options: { config: string; execute: boolean }) => {
+  .option("--quiet", "suppress aggregate progress on stderr", false)
+  .action(async (options: { config: string; execute: boolean; quiet: boolean }) => {
     const config = await loadRecoveryConfig(options.config);
     const controller = new AbortController();
     const interrupt = (): void => controller.abort();
     process.on("SIGINT", interrupt);
     process.on("SIGTERM", interrupt);
     try {
-      const result = await runRecoveryPlan(config, buildRecoveryPlan(config), options.execute, controller.signal);
+      const result = await runRecoveryPlan(config, buildRecoveryPlan(config), options.execute, controller.signal,
+        options.quiet ? undefined : (snapshot) => { process.stderr.write(`progress=${JSON.stringify(snapshot)}\n`); });
       json(result);
       if (result.status === "paused") process.exitCode = 75;
     } finally {
@@ -127,6 +148,11 @@ recover.command("run")
   });
 
 const mine = program.command("mine").description("Scan local recovered data for validated sensitive material");
+
+mine.command("status")
+  .description("Read aggregate scan progress without opening sensitive inventories")
+  .requiredOption("-o, --output <directory>", "mining output directory")
+  .action(async (options: { output: string }) => json(await readProgress(options.output, "mining")));
 
 mine.command("scan")
   .description("Stream-scan files and directories; exact values are written only to local artifacts")

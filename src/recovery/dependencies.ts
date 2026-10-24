@@ -18,6 +18,7 @@ export const DEPENDENCIES: Dependency[] = [
   { executable: "tsk_recover", ubuntuPackage: "sleuthkit", layer: "recovery", purpose: "deleted-file extraction", required: false },
   { executable: "blkls", ubuntuPackage: "sleuthkit", layer: "recovery", purpose: "unallocated-space extraction", required: false },
   { executable: "ntfsundelete", ubuntuPackage: "ntfs-3g", layer: "recovery", purpose: "NTFS deleted-record recovery", required: false },
+  { executable: "ntfsinfo", ubuntuPackage: "ntfs-3g", layer: "recovery", purpose: "read-only NTFS free-space estimates", required: false },
   { executable: "photorec", ubuntuPackage: "testdisk", layer: "recovery", purpose: "signature carving", required: false },
   { executable: "vshadowinfo", ubuntuPackage: "libvshadow-utils", layer: "recovery", purpose: "Volume Shadow Copy inventory", required: false },
   { executable: "vshadowmount", ubuntuPackage: "libvshadow-utils", layer: "recovery", purpose: "read-only Volume Shadow Copy access", required: false },
