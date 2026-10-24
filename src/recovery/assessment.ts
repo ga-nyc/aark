@@ -22,11 +22,17 @@ export interface OutputEstimate {
   allocationRoundedBytes: string | null;
 }
 
+export interface StageByteEstimate {
+  logicalBytes: bigint | null;
+  allocationBytes: bigint | null;
+}
+
 export function stageCapacityForecast(
   additionalBytes: bigint | null, capacity: StorageCapacity, allocationUnitBytes: bigint,
   caseLogicalBytes: bigint | null, maximumOutputBytes?: bigint,
+  additionalAllocationBytes: bigint | null = additionalBytes,
 ): Record<string, unknown> {
-  const physical = additionalBytes === null ? null : rounded(additionalBytes, allocationUnitBytes);
+  const physical = additionalAllocationBytes === null ? null : rounded(additionalAllocationBytes, allocationUnitBytes);
   return {
     additionalLogicalBytes: additionalBytes?.toString() ?? null,
     additionalAllocationRoundedBytes: physical?.toString() ?? null,
@@ -39,10 +45,11 @@ export function stageCapacityForecast(
 export function assertStageMinimumCapacity(
   additionalBytes: bigint | null, capacity: StorageCapacity, allocationUnitBytes: bigint,
   caseLogicalBytes: bigint | null, maximumOutputBytes?: bigint,
+  additionalAllocationBytes: bigint | null = additionalBytes,
 ): void {
-  const forecast = stageCapacityForecast(additionalBytes, capacity, allocationUnitBytes, caseLogicalBytes, maximumOutputBytes);
-  if (forecast.fitsFreeSpace === false && additionalBytes !== null) {
-    throw new StorageQuotaError("free-space-reserve", { ...capacity, plannedBytes: rounded(additionalBytes, allocationUnitBytes) });
+  const forecast = stageCapacityForecast(additionalBytes, capacity, allocationUnitBytes, caseLogicalBytes, maximumOutputBytes, additionalAllocationBytes);
+  if (forecast.fitsFreeSpace === false && additionalAllocationBytes !== null) {
+    throw new StorageQuotaError("free-space-reserve", { ...capacity, plannedBytes: rounded(additionalAllocationBytes, allocationUnitBytes) });
   }
   if (forecast.fitsOutputCap === false && additionalBytes !== null) {
     throw new StorageQuotaError("output-cap", { ...capacity, outputBytes: caseLogicalBytes ?? 0n, plannedBytes: additionalBytes });
@@ -165,28 +172,39 @@ export async function assessRecoveryStorage(config: RecoveryConfig): Promise<Rec
 /** Forecast only known bulk writes; unknown engine output remains explicit. */
 export async function estimateStageBytes(
   step: RecoveryStep, sourceBytes: number, analysisSource: string, sectorOffset: number,
-): Promise<bigint | null> {
-  if (!Number.isSafeInteger(sourceBytes) || sourceBytes < 0) return null;
+): Promise<StageByteEstimate> {
+  const unknown = { logicalBytes: null, allocationBytes: null };
+  if (!Number.isSafeInteger(sourceBytes) || sourceBytes < 0) return unknown;
   if (step.id === "image-fast-pass") {
-    let existing = 0n;
+    let existingLogical = 0n;
+    let existingAllocated = 0n;
     try {
       const filename = step.outputs[0];
       if (filename !== undefined) {
         const info = await lstat(filename, { bigint: true });
-        if (info.isFile() && !info.isSymbolicLink()) existing = info.blocks * 512n;
+        if (info.isFile() && !info.isSymbolicLink()) {
+          existingLogical = info.size;
+          existingAllocated = info.blocks * 512n;
+        }
       }
     } catch (error) {
       if (!(error instanceof Error) || !("code" in error) || error.code !== "ENOENT") throw error;
     }
-    return BigInt(sourceBytes) > existing ? BigInt(sourceBytes) - existing : 0n;
+    const total = BigInt(sourceBytes);
+    // Filling holes consumes free space without extending the logical file.
+    return {
+      logicalBytes: total > existingLogical ? total - existingLogical : 0n,
+      allocationBytes: total > existingAllocated ? total - existingAllocated : 0n,
+    };
   }
   if (step.id === "unallocated-stream") {
     let bytes = BigInt(sourceBytes);
     try {
       const info = await lstat(analysisSource, { bigint: true });
       if (info.isFile() && !info.isSymbolicLink()) bytes = info.size;
-    } catch { return null; }
-    return await probeUnallocatedBytes(analysisSource, bytes, sectorOffset);
+    } catch { return unknown; }
+    const unallocated = await probeUnallocatedBytes(analysisSource, bytes, sectorOffset);
+    return { logicalBytes: unallocated, allocationBytes: unallocated };
   }
-  return null;
+  return unknown;
 }

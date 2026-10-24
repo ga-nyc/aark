@@ -719,16 +719,16 @@ export async function runRecoveryPlan(
       try {
         await assertRecoveryCapacity();
         await assertStepOutputsSafe(recoveryStep, safety, analysisSafety, false, true);
-        const additionalBytes = await estimateStageBytes(recoveryStep, safety.bytes, plan.analysisSource, config.sectorOffset);
+        const estimate = await estimateStageBytes(recoveryStep, safety.bytes, plan.analysisSource, config.sectorOffset);
         const [capacity, filesystem] = await Promise.all([
           storageCapacity(plan.destination, storagePolicy), statfs(plan.destination, { bigint: true }),
         ]);
-        nextStageCapacity = stageCapacityForecast(additionalBytes, capacity, filesystem.bsize, caseLogicalBytes, storagePolicy.maximumOutputBytes);
+        nextStageCapacity = stageCapacityForecast(estimate.logicalBytes, capacity, filesystem.bsize, caseLogicalBytes, storagePolicy.maximumOutputBytes, estimate.allocationBytes);
         await writeProgress();
         // Preserve ddrescue's verified quota-pause workflow. Refuse a known
         // non-resumable bulk write before starting it when it cannot fit.
         if (recoveryStep.executable !== "ddrescue") {
-          assertStageMinimumCapacity(additionalBytes, capacity, filesystem.bsize, caseLogicalBytes, storagePolicy.maximumOutputBytes);
+          assertStageMinimumCapacity(estimate.logicalBytes, capacity, filesystem.bsize, caseLogicalBytes, storagePolicy.maximumOutputBytes, estimate.allocationBytes);
         }
         await assertSourceSafetyCurrent(config.source, plan.destination, safety, config.requireReadOnlySource, "source");
         if (analysisSafety !== undefined) {

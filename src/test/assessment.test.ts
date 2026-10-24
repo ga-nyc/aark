@@ -1,10 +1,11 @@
 import assert from "node:assert/strict";
-import { access, readFile, stat, writeFile } from "node:fs/promises";
+import { access, mkdir, open, readFile, stat, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { StorageQuotaError } from "../core/storage.js";
-import { assessRecoveryStorage, assertStageMinimumCapacity, parseNtfsUnallocatedBytes, stageCapacityForecast, storageAssessment } from "../recovery/assessment.js";
+import { assessRecoveryStorage, assertStageMinimumCapacity, estimateStageBytes, parseNtfsUnallocatedBytes, stageCapacityForecast, storageAssessment } from "../recovery/assessment.js";
+import { buildRecoveryPlan } from "../recovery/plan.js";
 import type { CapacityFacts } from "../recovery/assessment.js";
 import type { RecoveryConfig } from "../recovery/types.js";
 import { mkdtemp } from "./helpers.js";
@@ -91,4 +92,46 @@ test("live assessment leaves a synthetic source and a nonexistent destination un
   assert.equal((await stat(input.source)).mtimeMs, before.mtimeMs);
   assert.deepEqual(await readFile(input.source), Buffer.alloc(8192, 7));
   await assert.rejects(access(input.destination));
+});
+
+test("physical allocation can exhaust headroom without increasing the logical case size", () => {
+  const capacity = { ...facts().capacity, availableBytes: 8192n, reservedBytes: 0n, outputBytes: 16384n };
+  const forecast = stageCapacityForecast(0n, capacity, 4096n, 16384n, 16384n, 12288n);
+  assert.equal(forecast.additionalLogicalBytes, "0");
+  assert.equal(forecast.additionalAllocationRoundedBytes, "12288");
+  assert.equal(forecast.fitsOutputCap, true);
+  assert.equal(forecast.fitsFreeSpace, false);
+  assert.throws(() => assertStageMinimumCapacity(0n, capacity, 4096n, 16384n, 16384n, 12288n),
+    (error: unknown) => error instanceof StorageQuotaError
+      && error.reason === "free-space-reserve" && error.capacity.plannedBytes === 12288n);
+});
+
+test("image forecasts distinguish file extension from filling existing sparse holes", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "aark-image-forecast-"));
+  const input = config(root);
+  const step = buildRecoveryPlan(input).steps.find(item => item.id === "image-fast-pass");
+  assert.ok(step);
+  const sourceBytes = 2 * 1024 * 1024;
+  assert.deepEqual(await estimateStageBytes(step, sourceBytes, input.source, 0), {
+    logicalBytes: BigInt(sourceBytes), allocationBytes: BigInt(sourceBytes),
+  });
+  await mkdir(path.dirname(input.image.path), { recursive: true });
+  const image = await open(input.image.path, "w");
+  try {
+    for (const length of [sourceBytes / 2, sourceBytes]) {
+      await image.truncate(length);
+      const metadata = await image.stat({ bigint: true });
+      const estimate = await estimateStageBytes(step, sourceBytes, input.source, 0);
+      const remainingAllocation = BigInt(sourceBytes) - metadata.blocks * 512n;
+      assert.equal(estimate.logicalBytes, BigInt(sourceBytes) - metadata.size);
+      assert.equal(estimate.allocationBytes, remainingAllocation > 0n ? remainingAllocation : 0n);
+      const forecast = stageCapacityForecast(estimate.logicalBytes,
+        { ...facts().capacity, availableBytes: 0n, reservedBytes: 0n }, 4096n,
+        metadata.size, BigInt(sourceBytes), estimate.allocationBytes);
+      assert.equal(forecast.fitsOutputCap, true);
+      assert.equal(forecast.fitsFreeSpace, estimate.allocationBytes === 0n);
+    }
+  } finally {
+    await image.close();
+  }
 });

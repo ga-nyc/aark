@@ -56,6 +56,10 @@ GNU ddrescue retains its existing mapfile-based quota pause and verified retry
 contract, even when its forecast shows insufficient headroom. No new automatic
 resume contract is introduced for other engines.
 
+For an existing evidence image, forecasts distinguish logical file growth from
+remaining disk allocation. Filling sparse holes can require physical free space
+without increasing the image's logical length or its charge against the case cap.
+
 A preflight refusal can still leave the case terminal-failed. Preserve completed
 outputs and use the normal fresh-destination rules; do not edit case controls to
 force a retry.
