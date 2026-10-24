@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { lstat, opendir, realpath } from "node:fs/promises";
+import { lstat, opendir, realpath, statfs } from "node:fs/promises";
 import path from "node:path";
 import { captureCommand, commandExists } from "../core/command.js";
 import { acquireExclusiveLock, assertNoSymlinkComponents, atomicWriteFile, atomicWriteJson, ensurePrivateDirectory, nearestExistingParent, readDirectoryNamesBounded, readJson, safeJoin } from "../core/fs-safe.js";
@@ -7,7 +7,10 @@ import type { ExclusiveLock } from "../core/fs-safe.js";
 import { assertSupportedOutputMount, filesystemEnforcesUnixModes, mountForPath, mountForPathFrom, mountIsNetworkBacked, mountIsReadOnly, mounts } from "../core/mounts.js";
 import type { MountRecord } from "../core/mounts.js";
 import type { JsonValue } from "../core/types.js";
-import { assertStorageCapacity, directoryLogicalBytes, StorageQuotaError, storagePolicyFromGiB } from "../core/storage.js";
+import { assertStorageCapacity, directoryLogicalBytes, StorageQuotaError, storageCapacity, storagePolicyFromGiB } from "../core/storage.js";
+import { PROGRESS_FILENAME, redactedProgress } from "../core/progress.js";
+import type { CommandProgress } from "../core/command.js";
+import { assertStageMinimumCapacity, estimateStageBytes, stageCapacityForecast } from "./assessment.js";
 import type { RecoveryConfig, RecoveryPlan, RecoveryRunStatus, RecoveryStep } from "./types.js";
 import { buildRecoveryPlan } from "./plan.js";
 import { inspectSourceSafety } from "./source-safety.js";
@@ -446,6 +449,7 @@ export async function runRecoveryPlan(
   plan: RecoveryPlan,
   cliExecute: boolean,
   signal?: AbortSignal,
+  onProgress?: (snapshot: Record<string, unknown>) => void,
 ): Promise<Record<string, JsonValue>> {
   if (!config.execute || !cliExecute) throw new Error("execution requires execute=true in the case config and --execute on the CLI");
   const canonicalPlan = buildRecoveryPlan(config);
@@ -508,6 +512,7 @@ export async function runRecoveryPlan(
     safeJoin(plan.destination, "manifest-redacted.json"),
     safeJoin(plan.destination, "final-report-sensitive.md"),
     safeJoin(plan.destination, "final-report-redacted.md"),
+    safeJoin(plan.destination, PROGRESS_FILENAME),
   ]) await assertNoSymlinkComponents(plan.destination, controlPath);
   for (const recoveryStep of plan.steps) {
     for (const output of destinationPaths(recoveryStep, plan.destination)) {
@@ -549,6 +554,8 @@ export async function runRecoveryPlan(
       || nestedMount
     ) throw new Error("recovery destination, mount, or exclusive lock changed during execution");
   };
+  let caseLogicalBytes: bigint | null = null;
+  let caseLogicalBytesUpdatedAt: string | undefined;
   const assertRecoveryCapacity = async (): Promise<void> => {
     // Check free space before and after the potentially long logical-size walk,
     // so a very large recovery tree cannot delay reserve enforcement until the
@@ -557,6 +564,8 @@ export async function runRecoveryPlan(
     if (storagePolicy.maximumOutputBytes !== undefined) {
       const outputBytes = await directoryLogicalBytes(plan.destination, signal);
       await assertStorageCapacity(plan.destination, storagePolicy, outputBytes);
+      caseLogicalBytes = outputBytes;
+      caseLogicalBytesUpdatedAt = new Date().toISOString();
     }
   };
   const permissionsEnforced = filesystemEnforcesUnixModes(targetMount);
@@ -587,10 +596,34 @@ export async function runRecoveryPlan(
     await atomicWriteJson(filename, value, mode);
     await assertDestinationControlCurrent();
   };
+  let stageStartedAt = Date.now();
+  let activity: CommandProgress | undefined;
+  let nextStageCapacity: Record<string, unknown> | null = null;
+  let progressStorageStop: Record<string, JsonValue> | undefined;
+  const writeProgress = async (): Promise<void> => {
+    const capacity = await storageCapacity(plan.destination, storagePolicy);
+    const stageIndex = sensitiveRun.currentStep === null ? null : plan.steps.findIndex((step) => step.id === sensitiveRun.currentStep);
+    const snapshot = redactedProgress({
+      version: 1, tool: "aark", layer: "recovery", sourcePathsRedacted: true,
+      status: sensitiveRun.status, updatedAt: new Date().toISOString(), startedAt,
+      currentStage: sensitiveRun.currentStep, ...(stageIndex === null ? {} : { stageIndex }), stagesTotal: plan.steps.length,
+      elapsedMs: Date.now() - Date.parse(startedAt), stageElapsedMs: sensitiveRun.currentStep === null ? 0 : Date.now() - stageStartedAt,
+      availableBytes: capacity.availableBytes.toString(), totalBytes: capacity.totalBytes.toString(), reservedBytes: capacity.reservedBytes.toString(),
+      maximumOutputBytes: storagePolicy.maximumOutputBytes?.toString() ?? null,
+      caseLogicalBytes: caseLogicalBytes?.toString() ?? null, caseLogicalBytesUpdatedAt,
+      engineRunning: sensitiveRun.status === "running" && sensitiveRun.currentStep !== null && activity?.engineRunning === true,
+      ...(activity === undefined || sensitiveRun.currentStep === null ? {} : { activity: activity.activity }),
+      ...(sensitiveRun.currentStep === null ? {} : { nextStageCapacity }),
+      ...(progressStorageStop === undefined ? {} : { storageStop: progressStorageStop }),
+    }, "recovery");
+    await writeCaseJson(safeJoin(plan.destination, PROGRESS_FILENAME), snapshot, 0o644);
+    onProgress?.(snapshot);
+  };
   const persistState = async (): Promise<void> => {
     sensitiveRun.updatedAt = new Date().toISOString();
     await writeCaseJson(runStatePath, sensitiveRun);
     await writeCaseJson(safeJoin(plan.destination, "case-sensitive.json"), sensitiveRun);
+    await writeProgress();
   };
   await assertRecoveryCapacity();
   const renderedPlan = redactedPlan(plan);
@@ -624,6 +657,7 @@ export async function runRecoveryPlan(
     await writeCaseFile(safeJoin(plan.destination, "final-report-redacted.md"), redactedReport, 0o644);
     const complete = status === "complete" || status === "complete-with-warnings";
     const storageStop = redactedStorageStop(failure);
+    progressStorageStop = storageStop;
     const manifest: Record<string, JsonValue> = {
       tool: "aark",
       layer: "recovery",
@@ -643,6 +677,7 @@ export async function runRecoveryPlan(
       reports: {
         sensitive: "final-report-sensitive.md",
         redacted: "final-report-redacted.md",
+        progress: PROGRESS_FILENAME,
       },
       results: redactedResults,
       warnings: [
@@ -677,10 +712,28 @@ export async function runRecoveryPlan(
         : undefined;
       const temporaryDirectory = safeJoin(plan.destination, "logs", runId, `${recoveryStep.id}.tmp-sensitive`);
       sensitiveRun.currentStep = recoveryStep.id;
+      stageStartedAt = Date.now();
+      activity = undefined;
+      nextStageCapacity = null;
       await persistState();
       try {
         await assertRecoveryCapacity();
         await assertStepOutputsSafe(recoveryStep, safety, analysisSafety, false, true);
+        const estimate = await estimateStageBytes(recoveryStep, safety.bytes, plan.analysisSource, config.sectorOffset);
+        const [capacity, filesystem] = await Promise.all([
+          storageCapacity(plan.destination, storagePolicy), statfs(plan.destination, { bigint: true }),
+        ]);
+        nextStageCapacity = stageCapacityForecast(estimate.logicalBytes, capacity, filesystem.bsize, caseLogicalBytes, storagePolicy.maximumOutputBytes, estimate.allocationBytes);
+        await writeProgress();
+        // Preserve ddrescue's verified quota-pause workflow. Refuse a known
+        // non-resumable bulk write before starting it when it cannot fit.
+        if (recoveryStep.executable !== "ddrescue") {
+          assertStageMinimumCapacity(estimate.logicalBytes, capacity, filesystem.bsize, caseLogicalBytes, storagePolicy.maximumOutputBytes, estimate.allocationBytes);
+        }
+        await assertSourceSafetyCurrent(config.source, plan.destination, safety, config.requireReadOnlySource, "source");
+        if (analysisSafety !== undefined) {
+          await assertSourceSafetyCurrent(plan.analysisSource, plan.destination, analysisSafety, config.requireReadOnlySource, "analysisSource", analysisDestinationResident);
+        }
         for (const directory of recoveryStep.createsDirectories) await ensurePrivateDirectory(directory);
         if (!(await commandExists(recoveryStep.executable))) {
           const status = recoveryStep.optional ? "skipped-missing-optional-tool" : "failed-missing-required-tool";
@@ -730,6 +783,10 @@ export async function runRecoveryPlan(
           stderrFile: stderrLog,
           temporaryDirectory,
           ...(signal === undefined ? {} : { signal }),
+          progress: async (snapshot) => {
+            activity = snapshot;
+            await writeProgress();
+          },
           safetyCheck: async () => {
             // Check free space on every tick without waiting for the full case
             // inventory, which may take minutes on a wide recovery tree.

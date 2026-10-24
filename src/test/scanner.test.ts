@@ -10,6 +10,7 @@ import { entropyToMnemonic } from "@scure/bip39";
 import { wordlist as english } from "@scure/bip39/wordlists/english.js";
 import { sha256Hex } from "../core/crypto.js";
 import { ArtifactStore } from "../mining/artifacts.js";
+import { PROGRESS_FILENAME, readProgress } from "../core/progress.js";
 import { resumeSensitiveMaterial, scanSensitiveMaterial } from "../mining/scanner.js";
 import type { MiningPerformance, SensitiveScanInventory } from "../mining/types.js";
 import { expandAesKey } from "../mining/validators/aes.js";
@@ -426,6 +427,7 @@ test("an output cap cancels an in-flight small-file batch and resumes after an o
   });
   assert.equal(paused.status, "paused");
   assert.equal(paused.pauseReason, "output-cap");
+  assert.equal((await readProgress(output, "mining")).pauseReason, "output-cap");
   assert.equal(paused.filesVisited, 1);
   assert.equal(paused.filesScanned, 0);
   assert.equal((paused.performance as MiningPerformance).maximumOutstandingFiles, 4);
@@ -527,6 +529,20 @@ test("a pause during a file resumes from its committed chunk", async () => {
     },
   });
   assert.equal(result.status, "paused");
+  const pausedProgress = await readProgress(output, "mining");
+  assert.equal(pausedProgress.status, "paused");
+  assert.equal(pausedProgress.pauseReason, "signal");
+  assert.equal(pausedProgress.bytesScanned, result.bytesScanned);
+  // Informational progress never replaces the integrity-linked resume controls.
+  await writeFile(path.join(output, PROGRESS_FILENAME), JSON.stringify({ ...pausedProgress, status: "complete" }));
+  if (process.platform !== "win32") {
+    const savedProgress = path.join(root, "progress-backup.json");
+    renameSync(path.join(output, PROGRESS_FILENAME), savedProgress);
+    await symlink(savedProgress, path.join(output, PROGRESS_FILENAME));
+    await assert.rejects(resumeSensitiveMaterial({ output }), /progress must remain a single-link regular/);
+    unlinkSync(path.join(output, PROGRESS_FILENAME));
+    renameSync(savedProgress, path.join(output, PROGRESS_FILENAME));
+  }
   const inventory = JSON.parse(await readFile(path.join(output, "inventory-sensitive.json"), "utf8")) as SensitiveScanInventory;
   assert.equal(inventory.status, "paused");
   assert.equal(inventory.complete, false);
@@ -553,6 +569,7 @@ test("a pause during a file resumes from its committed chunk", async () => {
   assert.equal(resumed.filesVisited, 1);
   assert.equal(resumed.filesScanned, 1);
   assert.equal(resumed.bytesScanned, 20 * 1024 * 1024);
+  assert.equal((await readProgress(output, "mining")).status, "complete");
 });
 
 test("a changing input produces complete-with-errors reports instead of a false clean result", async () => {

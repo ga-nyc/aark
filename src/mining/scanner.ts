@@ -3,6 +3,7 @@ import { availableParallelism } from "node:os";
 import { lstat, open, realpath } from "node:fs/promises";
 import path from "node:path";
 import { performance } from "node:perf_hooks";
+import { PROGRESS_FILENAME } from "../core/progress.js";
 import type { Candidate } from "../core/types.js";
 import { acquireExclusiveLock, nearestExistingParent, readDirectoryNamesBounded, stableHandleStat, stableLstat, walkRegularFiles } from "../core/fs-safe.js";
 import type { ExclusiveLock, FilesystemIdentity, StableStat, WalkedFile } from "../core/fs-safe.js";
@@ -447,6 +448,7 @@ async function assertLockedResumeOutput(output: string): Promise<void> {
     "final-report-redacted.md",
     SCAN_FILES_FILENAME,
     SCAN_STATE_FILENAME,
+    PROGRESS_FILENAME,
   ]);
   const entries = await readDirectoryNamesBounded(output, allowed.size + 1);
   if (
@@ -454,6 +456,12 @@ async function assertLockedResumeOutput(output: string): Promise<void> {
     || entries.some((entry) => !allowed.has(entry))
   ) {
     throw new Error("resumed mining output contains unexpected control or artifact entries");
+  }
+  if (entries.includes(PROGRESS_FILENAME)) {
+    const progress = await lstat(path.join(output, PROGRESS_FILENAME), { bigint: true });
+    if (progress.isSymbolicLink() || !progress.isFile() || progress.nlink !== 1n) {
+      throw new Error("mining progress must remain a single-link regular control file");
+    }
   }
 }
 
@@ -1054,6 +1062,7 @@ function inventoryCheckpoint(state: ScanState): NonNullable<SensitiveScanInvento
 
 async function publishProgress(runtime: ScanRuntime): Promise<void> {
   Object.assign(runtime.progress, runtime.store.counts());
+  await runtime.store.progress("in-progress", runtime.progress);
   try {
     runtime.options.progress?.({ ...runtime.progress });
   } catch (error) {
@@ -1073,6 +1082,7 @@ async function createFrozenInputManifest(
   const traversalStarted = performance.now();
   progress.phase = "inventory";
   progress.filesTotal = 0;
+  await store.progress("in-progress", progress);
   let currentMounts = await mounts();
   let mountsUpdatedAt = Date.now();
   const walked = walkRegularFiles(options.inputs, {
@@ -1091,6 +1101,7 @@ async function createFrozenInputManifest(
     for await (const file of walked) {
       if (interrupted(options.signal)) throw new ScanPauseError("scan paused during input inventory");
       progress.filesTotal = (progress.filesTotal ?? 0) + 1;
+      await store.progress("in-progress", progress);
       if (progress.filesTotal % 1_000 === 0) {
         Object.assign(progress, store.counts());
         try {
@@ -1153,7 +1164,7 @@ async function finalizeCleanPause(
   state.pauseReason = reason;
   state.updatedAt = new Date().toISOString();
   state.progress = { ...progress };
-  const inventory = await store.finalize("paused", progress, message, true, inventoryCheckpoint(state));
+  const inventory = await store.finalize("paused", progress, message, true, inventoryCheckpoint(state), reason);
   state.inventory = { filename: "inventory-sensitive.json", ...inventory };
   await writeScanState(options.output, state, budget, true);
   return resultObject("paused", progress, state, options.deepKeySchedules === true, metrics, pool);
@@ -1574,7 +1585,7 @@ async function runManifest(runtime: ScanRuntime): Promise<Record<string, unknown
       runtime.state.pauseReason = reason;
       runtime.state.updatedAt = new Date().toISOString();
       runtime.state.progress = { ...runtime.progress };
-      const inventory = await runtime.store.finalize("paused", runtime.progress, `scan paused: ${reason}`, true, inventoryCheckpoint(runtime.state));
+      const inventory = await runtime.store.finalize("paused", runtime.progress, `scan paused: ${reason}`, true, inventoryCheckpoint(runtime.state), reason);
       runtime.state.inventory = { filename: "inventory-sensitive.json", ...inventory };
       await writeScanState(runtime.options.output, runtime.state, runtime.budget, true);
       return resultObject("paused", runtime.progress, runtime.state, runtime.options.deepKeySchedules === true, runtime.metrics, runtime.pool);
@@ -1903,7 +1914,7 @@ export async function resumeSensitiveMaterial(input: MiningResumeOptions): Promi
         state.resumable = true;
         state.updatedAt = new Date().toISOString();
         state.progress = { ...progress };
-        const checkpoint = await store.finalize("paused", progress, "input inventory rebuilt; detector execution has not started", false, inventoryCheckpoint(state));
+        const checkpoint = await store.finalize("paused", progress, "input inventory rebuilt; detector execution has not started", false, inventoryCheckpoint(state), state.pauseReason);
         state.inventory = { filename: "inventory-sensitive.json", ...checkpoint };
         await writeScanState(output, state, budget);
       } catch (error) {

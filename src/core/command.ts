@@ -1,6 +1,6 @@
 import { spawn } from "node:child_process";
 import { constants } from "node:fs";
-import { access, open, stat, unlink } from "node:fs/promises";
+import { access, open, readFile, stat, unlink } from "node:fs/promises";
 import { basename, delimiter, dirname, isAbsolute, join, resolve } from "node:path";
 import { ensurePrivateDirectory, stableHandleStat, stableLstat, syncDirectory, type FilesystemIdentity } from "./fs-safe.js";
 
@@ -33,6 +33,35 @@ export interface CommandOptions {
   // Each callback is serialized with itself; both must settle before success.
   backgroundSafetyCheck?: () => Promise<void>;
   safetyCheckIntervalMs?: number;
+  progress?: (progress: CommandProgress) => Promise<void>;
+  progressIntervalMs?: number;
+}
+
+export interface CommandProgress {
+  elapsedMs: number;
+  engineRunning: boolean;
+  activity: { scope: "engine-process-only"; readBytes: string | null; writeBytes: string | null;
+    cpuTicks: string | null; observedSinceLastSample: boolean | null };
+}
+
+async function processActivity(pid: number | undefined): Promise<CommandProgress["activity"]> {
+  const empty: CommandProgress["activity"] = { scope: "engine-process-only", readBytes: null, writeBytes: null,
+    cpuTicks: null, observedSinceLastSample: null };
+  if (process.platform !== "linux" || pid === undefined) return empty;
+  const [io, cpu] = await Promise.allSettled([readFile(`/proc/${pid}/io`, "utf8"), readFile(`/proc/${pid}/stat`, "utf8")]);
+  if (io.status === "fulfilled") {
+    empty.readBytes = /^rchar:\s*([0-9]+)$/m.exec(io.value)?.[1] ?? null;
+    empty.writeBytes = /^wchar:\s*([0-9]+)$/m.exec(io.value)?.[1] ?? null;
+  }
+  if (cpu.status === "fulfilled") {
+    const fields = cpu.value.slice(cpu.value.lastIndexOf(")") + 2).trim().split(/\s+/);
+    const user = fields[11];
+    const system = fields[12];
+    if (user !== undefined && system !== undefined && /^[0-9]+$/.test(user) && /^[0-9]+$/.test(system)) {
+      empty.cpuTicks = (BigInt(user) + BigInt(system)).toString();
+    }
+  }
+  return empty;
 }
 
 const WINDOWS_DIRECTORY = process.platform === "win32"
@@ -146,6 +175,10 @@ export async function captureCommand(
   const safetyCheckIntervalMs = options.safetyCheckIntervalMs ?? 5_000;
   if (!Number.isSafeInteger(safetyCheckIntervalMs) || safetyCheckIntervalMs < 10 || safetyCheckIntervalMs > 60_000) {
     throw new Error("safetyCheckIntervalMs must be an integer from 10 through 60000");
+  }
+  const progressIntervalMs = options.progressIntervalMs ?? 5_000;
+  if (!Number.isSafeInteger(progressIntervalMs) || progressIntervalMs < 10 || progressIntervalMs > 60_000) {
+    throw new Error("progressIntervalMs must be an integer from 10 through 60000");
   }
   let outputHandle: Awaited<ReturnType<typeof open>> | undefined;
   let errorHandle: Awaited<ReturnType<typeof open>> | undefined;
@@ -269,7 +302,7 @@ export async function captureCommand(
       timer = setTimeout(() => terminate("timeout"), options.timeoutMs);
       timer.unref();
     }
-    const scheduleSafetyCheck = (check: () => Promise<void>): void => {
+    const scheduleSafetyCheck = (check: () => Promise<void>, intervalMs = safetyCheckIntervalMs): void => {
       if (settled || terminationReason !== null) return;
       const safetyTimer = setTimeout(() => {
         safetyTimers.delete(safetyTimer);
@@ -284,15 +317,29 @@ export async function captureCommand(
           })
           .finally(() => {
             safetyCheckPromises.delete(checkPromise);
-            scheduleSafetyCheck(check);
+            scheduleSafetyCheck(check, intervalMs);
           });
         safetyCheckPromises.add(checkPromise);
-      }, safetyCheckIntervalMs);
+      }, intervalMs);
       safetyTimers.add(safetyTimer);
       safetyTimer.unref();
     };
     if (options.safetyCheck !== undefined) scheduleSafetyCheck(options.safetyCheck);
     if (options.backgroundSafetyCheck !== undefined) scheduleSafetyCheck(options.backgroundSafetyCheck);
+    if (options.progress !== undefined) {
+      let previous: CommandProgress["activity"] | undefined;
+      scheduleSafetyCheck(async () => {
+        const activity = await processActivity(child.pid);
+        if (previous !== undefined) {
+          const comparable = (["readBytes", "writeBytes", "cpuTicks"] as const)
+            .filter((key) => activity[key] !== null && previous?.[key] !== null);
+          if (comparable.length > 0) activity.observedSinceLastSample = comparable.some((key) => activity[key] !== previous?.[key]);
+        }
+        previous = activity;
+        await options.progress?.({ elapsedMs: Date.now() - started,
+          engineRunning: child.exitCode === null && child.signalCode === null, activity });
+      }, progressIntervalMs);
+    }
     if (options.stdin !== undefined) {
       child.stdin?.on("error", () => undefined);
       child.stdin?.end(options.stdin);

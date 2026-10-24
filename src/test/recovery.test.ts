@@ -8,6 +8,7 @@ import { loadRecoveryConfig } from "../recovery/config.js";
 import { buildRecoveryPlan } from "../recovery/plan.js";
 import { renderRecoveryRedactedReport, renderRecoverySensitiveReport } from "../recovery/report.js";
 import { recoveryStepStatus, redactedPlan, redactedStorageStop, runRecoveryPlan } from "../recovery/runner.js";
+import { readProgress } from "../core/progress.js";
 import { StorageQuotaError } from "../core/storage.js";
 import type { SourceSafety } from "../recovery/source-safety.js";
 import type { RecoveryConfig } from "../recovery/types.js";
@@ -269,6 +270,11 @@ test("recovery completion and interruption both produce sensitive and redacted f
   const completeConfig = makeConfig(completeDestination);
   const result = await runRecoveryPlan(completeConfig, buildRecoveryPlan(completeConfig), true);
   assert.equal(result.status, "complete");
+  const progress = await readProgress(completeDestination, "recovery");
+  assert.equal(progress.status, "complete");
+  assert.equal(progress.engineRunning, false);
+  assert.equal(progress.currentStage, null);
+  assert.equal(JSON.stringify(progress).includes(source), false);
   assert.match(await readFile(path.join(completeDestination, "final-report-sensitive.md"), "utf8"), /Status: complete/);
   const completeRedacted = await readFile(path.join(completeDestination, "final-report-redacted.md"), "utf8");
   assert.match(completeRedacted, /Status: complete/);
@@ -307,6 +313,7 @@ test("recovery completion and interruption both produce sensitive and redacted f
   await assert.rejects(runRecoveryPlan(interruptedConfig, buildRecoveryPlan(interruptedConfig), true, controller.signal), /interrupted/);
   assert.match(await readFile(path.join(interruptedDestination, "final-report-sensitive.md"), "utf8"), /Status: interrupted/);
   assert.match(await readFile(path.join(interruptedDestination, "final-report-redacted.md"), "utf8"), /Status: interrupted/);
+  assert.equal((await readProgress(interruptedDestination, "recovery")).status, "interrupted");
   await assert.rejects(access(path.join(interruptedDestination, ".aark-recovery.lock")));
   await assert.rejects(access(path.join(interruptedDestination, ".agetnic-recovery.lock")));
 });

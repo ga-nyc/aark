@@ -78,7 +78,13 @@ Create a case configuration and review its execution plan:
 
 ```bash
 cp examples/recovery-case.example.json recovery-case.json
+    aark recover assess --config recovery-case.json
 aark recover plan --config recovery-case.json
+
+Assessment reports known minimum storage requirements and explicitly unknown
+output sizes. It does not promise the entire workflow will fit. Use
+`recover plan --assess-storage` to include the live assessment in a plan display.
+See [storage assessment and live progress](docs/storage-planning.md).
 ```
 
 The generated plan defaults to dry-run behavior. Execution requires both a configuration that says `execute: true` and an explicit CLI confirmation flag:
@@ -192,6 +198,9 @@ Small complete files are scanned through a bounded multi-file worker pipeline: u
 See [Security model](SECURITY.md), [data flow and failure behavior](docs/data-flow.md), [Recovery architecture](docs/recovery.md), [Mining architecture](docs/mining.md), [Cleanup workflow](docs/cleanup.md), the [OSS adapter matrix](docs/translation-matrix.md), and the [optional DPAPI bridge](docs/optional-dpapi.md).
 
 ## Project status
+
+Deferred workflow work is recorded in the [project backlog](docs/backlog.md),
+including independently scanning completed outputs after a later recovery failure.
 
 This is an early forensic toolkit. Review every plan before execution and retain original images and tool logs until recovery and scanning have been validated. Remove the managed recovered copy only through the separately approved cleanup workflow. Contributions that add deterministic validators, new read-only adapters, or synthetic tests are welcome.
 
