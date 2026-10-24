@@ -4,7 +4,7 @@ import path from "node:path";
 import { captureCommand, commandExists } from "../core/command.js";
 import { acquireExclusiveLock, assertNoSymlinkComponents, atomicWriteFile, atomicWriteJson, ensurePrivateDirectory, nearestExistingParent, readDirectoryNamesBounded, readJson, safeJoin } from "../core/fs-safe.js";
 import type { ExclusiveLock } from "../core/fs-safe.js";
-import { filesystemEnforcesUnixModes, mountForPath, mountForPathFrom, mountIsNetworkBacked, mountIsReadOnly, mounts } from "../core/mounts.js";
+import { assertSupportedOutputMount, filesystemEnforcesUnixModes, mountForPath, mountForPathFrom, mountIsNetworkBacked, mountIsReadOnly, mounts } from "../core/mounts.js";
 import type { MountRecord } from "../core/mounts.js";
 import type { JsonValue } from "../core/types.js";
 import { assertStorageCapacity, directoryLogicalBytes, StorageQuotaError, storagePolicyFromGiB } from "../core/storage.js";
@@ -64,6 +64,20 @@ function storageQuota(error: unknown): StorageQuotaError | undefined {
     current = current instanceof Error && "cause" in current ? current.cause : undefined;
   }
   return undefined;
+}
+
+export function redactedStorageStop(error: unknown): Record<string, JsonValue> | undefined {
+  const quota = storageQuota(error);
+  if (quota === undefined) return undefined;
+  return {
+    reason: quota.reason,
+    // Decimal strings preserve exact counters without exposing paths or errors.
+    availableBytes: quota.capacity.availableBytes.toString(),
+    totalBytes: quota.capacity.totalBytes.toString(),
+    reservedBytes: quota.capacity.reservedBytes.toString(),
+    outputBytes: quota.capacity.outputBytes.toString(),
+    plannedBytes: quota.capacity.plannedBytes.toString(),
+  };
 }
 
 function redactArg(arg: string, plan: RecoveryPlan): string {
@@ -439,7 +453,9 @@ export async function runRecoveryPlan(
     throw new Error("refusing to execute a recovery plan that does not exactly match the supplied configuration");
   }
   const storagePolicy = storagePolicyFromGiB(plan.storage.minFreeGiB, plan.storage.minFreePercent, plan.storage.maxOutputGiB);
-  await assertStorageCapacity(await nearestExistingParent(plan.destination), storagePolicy);
+  const destinationParent = await nearestExistingParent(plan.destination);
+  assertSupportedOutputMount(await mountForPath(destinationParent));
+  await assertStorageCapacity(destinationParent, storagePolicy);
   const safety = await inspectSourceSafety(config.source, plan.destination);
   if (inside(plan.destination, safety.resolvedSource)) {
     throw new Error("the canonical recovery source must not be stored inside its case destination");
@@ -607,12 +623,18 @@ export async function runRecoveryPlan(
     await writeCaseFile(safeJoin(plan.destination, "final-report-sensitive.md"), sensitiveReport);
     await writeCaseFile(safeJoin(plan.destination, "final-report-redacted.md"), redactedReport, 0o644);
     const complete = status === "complete" || status === "complete-with-warnings";
+    const storageStop = redactedStorageStop(failure);
     const manifest: Record<string, JsonValue> = {
       tool: "aark",
       layer: "recovery",
       runId,
       status,
       complete,
+      resumable: status === "paused" && failure instanceof RecoveryQuotaStop && failure.resumable,
+      ...(storageStop === undefined ? {} : { storageStop: {
+        ...storageStop,
+        maximumOutputBytes: storagePolicy.maximumOutputBytes?.toString() ?? null,
+      } }),
       finishedAt,
       caseId: "<CASE_ID>",
       sourcePathsAndToolLogsRedacted: true,

@@ -1,10 +1,21 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { blockTransportIsNetwork, filesystemEnforcesUnixModes, filesystemIsNetwork, mountForPath, mountForPathFrom, mountIsNetworkBacked, mountIsReadOnly, mounts, windowsMountvolToMounts, type MountRecord } from "../core/mounts.js";
+import { assertSupportedOutputMount, blockTransportIsNetwork, filesystemEnforcesUnixModes, filesystemIsNetwork, mountForPath, mountForPathFrom, mountIsNetworkBacked, mountIsReadOnly, mounts, windowsMountvolToMounts, type MountRecord } from "../core/mounts.js";
 
 function mount(filesystem: string, source = "/dev/test", options = ["rw"]): MountRecord {
   return { source, target: "/mnt/test", filesystem, options };
 }
+
+test("output mount policy rejects the kernel NTFS3 driver while allowing FUSE and native filesystems", () => {
+  for (const filesystem of ["ntfs3", "NTFS3"]) {
+    assert.throws(() => assertSupportedOutputMount(mount(filesystem)), /ntfs3 output mounts.*ntfs-3g/);
+  }
+  for (const filesystem of ["ext4", "xfs", "btrfs", "tmpfs", "fuseblk", "fuse.ntfs-3g", "unknown"]) {
+    assert.doesNotThrow(() => assertSupportedOutputMount(mount(filesystem)));
+  }
+  // Source/read-only mount classification is independent of the output policy.
+  assert.equal(mountIsReadOnly(mount("ntfs3", "/dev/test", ["ro"])), true);
+});
 
 test("mount classification is conservative for permissions, read-only state, and network boundaries", () => {
   assert.equal(filesystemEnforcesUnixModes(mount("ext4")), true);
