@@ -158,7 +158,6 @@ for (const checkOption of ["safetyCheck", "backgroundSafetyCheck"] as const) {
 test("a pending accounting walk cannot delay the free-space guard or process termination", async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), "aark-command-independent-guard-"));
   const ready = path.join(root, "ready");
-  const stopped = path.join(root, "stopped");
   let releaseAccounting!: () => void;
   const pendingAccounting = new Promise<void>((resolve) => { releaseAccounting = resolve; });
   let accountingStarted = false;
@@ -169,8 +168,7 @@ test("a pending accounting walk cannot delay the free-space guard or process ter
   const controller = new AbortController();
   const command = captureCommand(process.execPath, ["-e", [
     "const fs=require('node:fs');",
-    `process.on('SIGTERM',()=>{fs.writeFileSync(${JSON.stringify(stopped)},'stopped');process.exit(0)});`,
-    `fs.writeFileSync(${JSON.stringify(ready)},'ready');`,
+    `fs.writeFileSync(${JSON.stringify(ready)},String(process.pid));`,
     "setInterval(()=>{},1000);",
   ].join("")], {
     signal: controller.signal,
@@ -198,13 +196,23 @@ test("a pending accounting walk cannot delay the free-space guard or process ter
     return true;
   });
   let stoppedDuringAccounting = false;
+  let writerPid: number | undefined;
   try {
     for (let attempt = 0; attempt < 200; attempt += 1) {
-      try {
-        await access(stopped);
-        stoppedDuringAccounting = accountingActive === 1;
-        break;
-      } catch { await new Promise((resolve) => setTimeout(resolve, 10)); }
+      if (writerPid === undefined) {
+        try {
+          const candidate = Number(await readFile(ready, "utf8"));
+          if (Number.isSafeInteger(candidate) && candidate > 0) writerPid = candidate;
+        } catch { /* Child is still starting. */ }
+      }
+      if (writerPid !== undefined && Number.isSafeInteger(writerPid) && writerPid > 0) {
+        try { process.kill(writerPid, 0); } catch (error) {
+          if (!(error instanceof Error) || !("code" in error) || error.code !== "ESRCH") throw error;
+          stoppedDuringAccounting = accountingActive === 1;
+          break;
+        }
+      }
+      await new Promise((resolve) => setTimeout(resolve, 10));
     }
   } finally {
     if (!stoppedDuringAccounting) controller.abort();
