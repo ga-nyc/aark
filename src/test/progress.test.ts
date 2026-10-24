@@ -17,12 +17,15 @@ test("progress readers return only validated aggregates and never extra local fi
     source: "/synthetic/private-source", value: "synthetic-private-value", message: "synthetic-private-message",
     activity: { readBytes: "123", writeBytes: "456", cpuTicks: "9", observedSinceLastSample: true, privateField: "synthetic-private-value" },
     nextStageCapacity: { additionalLogicalBytes: null, fitsFreeSpace: null, privateField: "synthetic-private-value" },
+    storageStop: { reason: "free-space-reserve", plannedBytes: "8192", privateField: "synthetic-private-value" },
   }, "recovery");
   assert.equal(report.currentStage, "signature-carving");
   assert.equal(report.availableBytes, "123456789");
+  assert.deepEqual(report.storageStop, { reason: "free-space-reserve", plannedBytes: "8192" });
   assert.equal(JSON.stringify(report).includes("private"), false);
   assert.equal(redactedProgress({ ...header("recovery"), currentStage: "synthetic-private-value", availableBytes: "/synthetic/private-path" }, "recovery").currentStage, undefined);
   assert.throws(() => redactedProgress(header("recovery"), "mining"), /invalid progress/);
+  assert.equal(redactedProgress({ ...header("mining"), pauseReason: ["signal"] }, "mining").pauseReason, undefined);
 });
 
 test("local status reads are bounded and reject symbolic-link controls", async () => {

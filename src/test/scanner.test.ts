@@ -427,6 +427,7 @@ test("an output cap cancels an in-flight small-file batch and resumes after an o
   });
   assert.equal(paused.status, "paused");
   assert.equal(paused.pauseReason, "output-cap");
+  assert.equal((await readProgress(output, "mining")).pauseReason, "output-cap");
   assert.equal(paused.filesVisited, 1);
   assert.equal(paused.filesScanned, 0);
   assert.equal((paused.performance as MiningPerformance).maximumOutstandingFiles, 4);
@@ -530,6 +531,7 @@ test("a pause during a file resumes from its committed chunk", async () => {
   assert.equal(result.status, "paused");
   const pausedProgress = await readProgress(output, "mining");
   assert.equal(pausedProgress.status, "paused");
+  assert.equal(pausedProgress.pauseReason, "signal");
   assert.equal(pausedProgress.bytesScanned, result.bytesScanned);
   // Informational progress never replaces the integrity-linked resume controls.
   await writeFile(path.join(output, PROGRESS_FILENAME), JSON.stringify({ ...pausedProgress, status: "complete" }));

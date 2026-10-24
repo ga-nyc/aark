@@ -28,6 +28,17 @@ export function redactedProgress(value: unknown, layer: "recovery" | "mining"): 
   if (input.currentStage === null || (typeof input.currentStage === "string" && STAGES.has(input.currentStage))) result.currentStage = input.currentStage;
   if (typeof input.phase === "string" && PHASES.has(input.phase)) result.phase = input.phase;
   if (typeof input.engineRunning === "boolean") result.engineRunning = input.engineRunning;
+  if (typeof input.pauseReason === "string" && ["signal", "free-space-reserve", "output-cap"].includes(input.pauseReason)) result.pauseReason = input.pauseReason;
+  if (typeof input.storageStop === "object" && input.storageStop !== null && !Array.isArray(input.storageStop)) {
+    const stop = input.storageStop as Record<string, unknown>;
+    if (stop.reason === "free-space-reserve" || stop.reason === "output-cap") {
+      const safe: Record<string, unknown> = { reason: stop.reason };
+      for (const key of ["availableBytes", "totalBytes", "reservedBytes", "outputBytes", "plannedBytes", "maximumOutputBytes"] as const) {
+        if (isBytes(stop[key]) || stop[key] === null) safe[key] = stop[key];
+      }
+      result.storageStop = safe;
+    }
+  }
   if (typeof input.activity === "object" && input.activity !== null && !Array.isArray(input.activity)) {
     const activity = input.activity as Record<string, unknown>;
     const safe: Record<string, unknown> = { scope: "engine-process-only" };

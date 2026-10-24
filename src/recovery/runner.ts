@@ -599,6 +599,7 @@ export async function runRecoveryPlan(
   let stageStartedAt = Date.now();
   let activity: CommandProgress | undefined;
   let nextStageCapacity: Record<string, unknown> | null = null;
+  let progressStorageStop: Record<string, JsonValue> | undefined;
   const writeProgress = async (): Promise<void> => {
     const capacity = await storageCapacity(plan.destination, storagePolicy);
     const stageIndex = sensitiveRun.currentStep === null ? null : plan.steps.findIndex((step) => step.id === sensitiveRun.currentStep);
@@ -613,6 +614,7 @@ export async function runRecoveryPlan(
       engineRunning: sensitiveRun.status === "running" && sensitiveRun.currentStep !== null && activity?.engineRunning === true,
       ...(activity === undefined || sensitiveRun.currentStep === null ? {} : { activity: activity.activity }),
       ...(sensitiveRun.currentStep === null ? {} : { nextStageCapacity }),
+      ...(progressStorageStop === undefined ? {} : { storageStop: progressStorageStop }),
     }, "recovery");
     await writeCaseJson(safeJoin(plan.destination, PROGRESS_FILENAME), snapshot, 0o644);
     onProgress?.(snapshot);
@@ -655,6 +657,7 @@ export async function runRecoveryPlan(
     await writeCaseFile(safeJoin(plan.destination, "final-report-redacted.md"), redactedReport, 0o644);
     const complete = status === "complete" || status === "complete-with-warnings";
     const storageStop = redactedStorageStop(failure);
+    progressStorageStop = storageStop;
     const manifest: Record<string, JsonValue> = {
       tool: "aark",
       layer: "recovery",

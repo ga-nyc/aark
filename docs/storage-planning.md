@@ -86,6 +86,8 @@ ticks show observed activity between samples. Descendant work is not included;
 unavailable counters remain null. Process liveness and activity are not a
 completion percentage or proof that the engine will finish. Progress writes run
 independently of case-size accounting and use the existing protected case writer.
+Terminal quota snapshots retain the redacted storage-stop reason and byte counts;
+paused mining snapshots retain whether the cause was a signal, reserve, or cap.
 
 `recover run` also emits aggregate progress on stderr; use `--quiet` to suppress
 that stream. Its stdout remains the final JSON result.

@@ -1164,7 +1164,7 @@ async function finalizeCleanPause(
   state.pauseReason = reason;
   state.updatedAt = new Date().toISOString();
   state.progress = { ...progress };
-  const inventory = await store.finalize("paused", progress, message, true, inventoryCheckpoint(state));
+  const inventory = await store.finalize("paused", progress, message, true, inventoryCheckpoint(state), reason);
   state.inventory = { filename: "inventory-sensitive.json", ...inventory };
   await writeScanState(options.output, state, budget, true);
   return resultObject("paused", progress, state, options.deepKeySchedules === true, metrics, pool);
@@ -1585,7 +1585,7 @@ async function runManifest(runtime: ScanRuntime): Promise<Record<string, unknown
       runtime.state.pauseReason = reason;
       runtime.state.updatedAt = new Date().toISOString();
       runtime.state.progress = { ...runtime.progress };
-      const inventory = await runtime.store.finalize("paused", runtime.progress, `scan paused: ${reason}`, true, inventoryCheckpoint(runtime.state));
+      const inventory = await runtime.store.finalize("paused", runtime.progress, `scan paused: ${reason}`, true, inventoryCheckpoint(runtime.state), reason);
       runtime.state.inventory = { filename: "inventory-sensitive.json", ...inventory };
       await writeScanState(runtime.options.output, runtime.state, runtime.budget, true);
       return resultObject("paused", runtime.progress, runtime.state, runtime.options.deepKeySchedules === true, runtime.metrics, runtime.pool);
@@ -1914,7 +1914,7 @@ export async function resumeSensitiveMaterial(input: MiningResumeOptions): Promi
         state.resumable = true;
         state.updatedAt = new Date().toISOString();
         state.progress = { ...progress };
-        const checkpoint = await store.finalize("paused", progress, "input inventory rebuilt; detector execution has not started", false, inventoryCheckpoint(state));
+        const checkpoint = await store.finalize("paused", progress, "input inventory rebuilt; detector execution has not started", false, inventoryCheckpoint(state), state.pauseReason);
         state.inventory = { filename: "inventory-sensitive.json", ...checkpoint };
         await writeScanState(output, state, budget);
       } catch (error) {

@@ -396,7 +396,8 @@ export class ArtifactStore {
     return serialized;
   }
 
-  public async progress(status: MiningRunStatus, progress: MiningProgress, force = false, enforceCapacity = true): Promise<void> {
+  public async progress(status: MiningRunStatus, progress: MiningProgress, force = false, enforceCapacity = true,
+    pauseReason?: "signal" | "free-space-reserve" | "output-cap"): Promise<void> {
     const now = Date.now();
     if (!force && now - this.progressUpdatedAt < 5_000) return;
     const capacity = this.storageBudget === undefined ? undefined
@@ -405,6 +406,7 @@ export class ArtifactStore {
       version: 1, tool: "aark", layer: "mining", sourcePathsRedacted: true,
       status, startedAt: this.startedAt, updatedAt: new Date(now).toISOString(),
       elapsedMs: Math.max(0, now - Date.parse(this.startedAt)), ...progress,
+      ...(pauseReason === undefined ? {} : { pauseReason }),
       ...(capacity === undefined ? {} : {
         availableBytes: capacity.availableBytes.toString(), totalBytes: capacity.totalBytes.toString(),
         reservedBytes: capacity.reservedBytes.toString(), outputBytes: capacity.outputBytes.toString(),
@@ -433,6 +435,7 @@ export class ArtifactStore {
     failureMessage?: string,
     emergency = false,
     resumeCheckpoint?: SensitiveScanInventory["resumeCheckpoint"],
+    pauseReason?: "signal" | "free-space-reserve" | "output-cap",
   ): Promise<{ bytes: number; sha256: string }> {
     const inventory = this.sensitiveInventory(status, failureMessage, resumeCheckpoint);
     const serialized = this.serializedInventory(inventory);
@@ -440,7 +443,7 @@ export class ArtifactStore {
     await this.writeChecked("final-report-redacted.md", renderMiningRedactedReport(inventory, progress), 0o644, !emergency);
     await this.writeChecked("manifest-redacted.json", `${JSON.stringify(this.redactedManifest(status, progress), null, 2)}\n`, 0o644, !emergency);
     await this.writeChecked("inventory-sensitive.json", serialized, 0o600, !emergency);
-    await this.progress(status, progress, true, !emergency);
+    await this.progress(status, progress, true, !emergency, pauseReason);
     return { bytes: Buffer.byteLength(serialized), sha256: sha256Hex(Buffer.from(serialized)) };
   }
 }
