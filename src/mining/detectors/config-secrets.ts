@@ -38,7 +38,9 @@ export function detectConfigurationSecrets(data: Buffer, context: DetectionConte
     return true;
   };
 
-  const wireGuard = /(?:^|\n)\s*PrivateKey\s*=\s*([A-Za-z0-9+/]{43}=)\s*(?=\r?$)/gm;
+  // Multiline anchors already allow starting after each CR/LF. Keep indentation
+  // on that line so blank runs are not rescanned from every preceding line.
+  const wireGuard = /(?:^|\n)[^\S\r\n]*PrivateKey\s*=\s*([A-Za-z0-9+/]{43}=)\s*(?=\r?$)/gm;
   for (const match of text.matchAll(wireGuard)) {
     const value = match[1];
     if (match.index === undefined || value === undefined) continue;
@@ -111,7 +113,7 @@ export function detectConfigurationSecrets(data: Buffer, context: DetectionConte
     }, context)) return output;
   }
 
-  const kubePrivateKey = /(?:^|\n)\s*client-key-data:\s*([A-Za-z0-9+/]{40,8388608}={0,2})\s*(?=\r?$)/gm;
+  const kubePrivateKey = /(?:^|\n)[^\S\r\n]*client-key-data:\s*([A-Za-z0-9+/]{40,8388608}={0,2})\s*(?=\r?$)/gm;
   for (const match of text.matchAll(kubePrivateKey)) {
     const encoded = match[1];
     if (match.index === undefined || encoded === undefined) continue;
