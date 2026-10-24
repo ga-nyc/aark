@@ -138,19 +138,91 @@ test("command runner escalates cancellation when a child ignores SIGTERM", async
   assert.ok(result.durationMs < 2_000);
 });
 
-test("command runner terminates a process when its safety invariant fails", async () => {
-  let checks = 0;
-  const started = Date.now();
-  await assert.rejects(captureCommand(process.execPath, ["-e", "process.on('SIGTERM',()=>{});setInterval(()=>{},1000)"], {
-    killGraceMs: 40,
-    safetyCheckIntervalMs: 20,
+for (const checkOption of ["safetyCheck", "backgroundSafetyCheck"] as const) {
+  test(`command runner terminates a process when ${checkOption} fails`, async () => {
+    let checks = 0;
+    const started = Date.now();
+    await assert.rejects(captureCommand(process.execPath, ["-e", "process.on('SIGTERM',()=>{});setInterval(()=>{},1000)"], {
+      killGraceMs: 40,
+      safetyCheckIntervalMs: 20,
+      [checkOption]: async () => {
+        checks += 1;
+        throw new Error("synthetic safety failure");
+      },
+    }), /command safety invariant failed during execution/);
+    assert.equal(checks, 1);
+    assert.ok(Date.now() - started < 2_000);
+  });
+}
+
+test("a pending accounting walk cannot delay the free-space guard or process termination", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "aark-command-independent-guard-"));
+  const ready = path.join(root, "ready");
+  let releaseAccounting!: () => void;
+  const pendingAccounting = new Promise<void>((resolve) => { releaseAccounting = resolve; });
+  let accountingStarted = false;
+  let accountingActive = 0;
+  let accountingPeak = 0;
+  let accountingCalls = 0;
+  const quotaError = new Error("synthetic free-space reserve reached");
+  const controller = new AbortController();
+  const command = captureCommand(process.execPath, ["-e", [
+    "const fs=require('node:fs');",
+    `fs.writeFileSync(${JSON.stringify(ready)},String(process.pid));`,
+    "setInterval(()=>{},1000);",
+  ].join("")], {
+    signal: controller.signal,
+    safetyCheckIntervalMs: 10,
+    killGraceMs: 1_000,
     safetyCheck: async () => {
-      checks += 1;
-      throw new Error("synthetic safety failure");
+      if (!accountingStarted) return;
+      try { await access(ready); } catch { return; }
+      throw quotaError;
     },
-  }), /command safety invariant failed during execution/);
-  assert.equal(checks, 1);
-  assert.ok(Date.now() - started < 2_000);
+    backgroundSafetyCheck: async () => {
+      accountingStarted = true;
+      accountingCalls += 1;
+      accountingActive += 1;
+      accountingPeak = Math.max(accountingPeak, accountingActive);
+      try { await pendingAccounting; } finally { accountingActive -= 1; }
+    },
+  });
+  // Attach the rejection handler before yielding, including on the failure path.
+  const rejected = assert.rejects(command, (error: unknown) => {
+    assert.ok(error instanceof Error);
+    assert.match(error.message, /command safety invariant failed during execution/);
+    assert.ok(error.cause instanceof Error);
+    assert.equal(error.cause.cause, quotaError);
+    return true;
+  });
+  let stoppedDuringAccounting = false;
+  let writerPid: number | undefined;
+  try {
+    for (let attempt = 0; attempt < 200; attempt += 1) {
+      if (writerPid === undefined) {
+        try {
+          const candidate = Number(await readFile(ready, "utf8"));
+          if (Number.isSafeInteger(candidate) && candidate > 0) writerPid = candidate;
+        } catch { /* Child is still starting. */ }
+      }
+      if (writerPid !== undefined && Number.isSafeInteger(writerPid) && writerPid > 0) {
+        try { process.kill(writerPid, 0); } catch (error) {
+          if (!(error instanceof Error) || !("code" in error) || error.code !== "ESRCH") throw error;
+          stoppedDuringAccounting = accountingActive === 1;
+          break;
+        }
+      }
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+  } finally {
+    if (!stoppedDuringAccounting) controller.abort();
+    releaseAccounting();
+  }
+  await rejected;
+  assert.equal(stoppedDuringAccounting, true);
+  assert.equal(accountingCalls, 1);
+  assert.equal(accountingPeak, 1);
+  assert.equal(accountingActive, 0);
 });
 
 test("command runner reports bounded capture truncation", async () => {
@@ -163,23 +235,25 @@ test("command runner reports bounded capture truncation", async () => {
   assert.equal(result.stderrTruncated, true);
 });
 
-test("a safety check that finishes after process exit still invalidates the command", async () => {
-  let markStarted: (() => void) | undefined;
-  const started = new Promise<void>((resolve) => { markStarted = resolve; });
-  let rejectSafety: ((error: Error) => void) | undefined;
-  const pendingSafety = new Promise<void>((_resolve, reject) => { rejectSafety = reject; });
-  const command = captureCommand(process.execPath, ["-e", "setTimeout(() => {}, 40)"], {
-    safetyCheckIntervalMs: 10,
-    safetyCheck: async () => {
-      markStarted?.();
-      await pendingSafety;
-    },
+for (const checkOption of ["safetyCheck", "backgroundSafetyCheck"] as const) {
+  test(`a ${checkOption} that finishes after process exit still invalidates the command`, async () => {
+    let markStarted: (() => void) | undefined;
+    const started = new Promise<void>((resolve) => { markStarted = resolve; });
+    let rejectSafety: ((error: Error) => void) | undefined;
+    const pendingSafety = new Promise<void>((_resolve, reject) => { rejectSafety = reject; });
+    const command = captureCommand(process.execPath, ["-e", "setTimeout(() => {}, 40)"], {
+      safetyCheckIntervalMs: 10,
+      [checkOption]: async () => {
+        markStarted?.();
+        await pendingSafety;
+      },
+    });
+    await started;
+    await new Promise((resolve) => setTimeout(resolve, 80));
+    rejectSafety?.(new Error("late synthetic safety failure"));
+    await assert.rejects(command, /command safety invariant failed during execution/);
   });
-  await started;
-  await new Promise((resolve) => setTimeout(resolve, 80));
-  rejectSafety?.(new Error("late synthetic safety failure"));
-  await assert.rejects(command, /command safety invariant failed during execution/);
-});
+}
 
 test("command cancellation terminates descendants in the isolated process group", async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), "agetnic-command-tree-"));

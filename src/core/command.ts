@@ -29,6 +29,9 @@ export interface CommandOptions {
   maxCaptureBytes?: number;
   signal?: AbortSignal;
   safetyCheck?: () => Promise<void>;
+  // Runs independently so expensive accounting cannot delay the primary guard.
+  // Each callback is serialized with itself; both must settle before success.
+  backgroundSafetyCheck?: () => Promise<void>;
   safetyCheckIntervalMs?: number;
 }
 
@@ -229,8 +232,8 @@ export async function captureCommand(
     let stderrTruncated = false;
     let timer: NodeJS.Timeout | undefined;
     let killTimer: NodeJS.Timeout | undefined;
-    let safetyTimer: NodeJS.Timeout | undefined;
-    let safetyCheckPromise: Promise<void> | undefined;
+    const safetyTimers = new Set<NodeJS.Timeout>();
+    const safetyCheckPromises = new Set<Promise<void>>();
     let descendantCleanupPromise: Promise<void> | undefined;
     let settled = false;
     let runtimeError: unknown;
@@ -266,11 +269,13 @@ export async function captureCommand(
       timer = setTimeout(() => terminate("timeout"), options.timeoutMs);
       timer.unref();
     }
-    const scheduleSafetyCheck = (): void => {
-      if (options.safetyCheck === undefined || settled || terminationReason !== null) return;
-      safetyTimer = setTimeout(() => {
-        safetyCheckPromise = Promise.resolve()
-          .then(async () => options.safetyCheck?.())
+    const scheduleSafetyCheck = (check: () => Promise<void>): void => {
+      if (settled || terminationReason !== null) return;
+      const safetyTimer = setTimeout(() => {
+        safetyTimers.delete(safetyTimer);
+        if (settled || terminationReason !== null) return;
+        const checkPromise: Promise<void> = Promise.resolve()
+          .then(check)
           .catch((error: unknown) => {
             if (runtimeError !== undefined) return;
             runtimeError = new Error("command safety check failed", { cause: error });
@@ -278,13 +283,16 @@ export async function captureCommand(
             else if (settled && terminationReason === null) terminationReason = "safety-check";
           })
           .finally(() => {
-            safetyCheckPromise = undefined;
-            scheduleSafetyCheck();
+            safetyCheckPromises.delete(checkPromise);
+            scheduleSafetyCheck(check);
           });
+        safetyCheckPromises.add(checkPromise);
       }, safetyCheckIntervalMs);
+      safetyTimers.add(safetyTimer);
       safetyTimer.unref();
     };
-    scheduleSafetyCheck();
+    if (options.safetyCheck !== undefined) scheduleSafetyCheck(options.safetyCheck);
+    if (options.backgroundSafetyCheck !== undefined) scheduleSafetyCheck(options.backgroundSafetyCheck);
     if (options.stdin !== undefined) {
       child.stdin?.on("error", () => undefined);
       child.stdin?.end(options.stdin);
@@ -321,7 +329,8 @@ export async function captureCommand(
       settled = true;
       if (timer !== undefined) clearTimeout(timer);
       if (killTimer !== undefined) clearTimeout(killTimer);
-      if (safetyTimer !== undefined) clearTimeout(safetyTimer);
+      for (const safetyTimer of safetyTimers) clearTimeout(safetyTimer);
+      safetyTimers.clear();
       options.signal?.removeEventListener("abort", abort);
       await cleanupUnstartedOutputs();
       reject(error);
@@ -331,7 +340,8 @@ export async function captureCommand(
       settled = true;
       if (timer !== undefined) clearTimeout(timer);
       if (killTimer !== undefined) clearTimeout(killTimer);
-      if (safetyTimer !== undefined) clearTimeout(safetyTimer);
+      for (const safetyTimer of safetyTimers) clearTimeout(safetyTimer);
+      safetyTimers.clear();
       options.signal?.removeEventListener("abort", abort);
       let persistenceError: unknown;
       // Recovery commands have no persistent-helper contract. Even after a
@@ -345,7 +355,7 @@ export async function captureCommand(
           persistenceError = error;
         }
       }
-      await safetyCheckPromise?.catch(() => undefined);
+      await Promise.all(safetyCheckPromises);
       const protectedOutputs = [
         ...(outputHandle !== undefined && options.stdoutFile !== undefined && outputIdentity !== undefined
           ? [{ handle: outputHandle, filename: options.stdoutFile, identity: outputIdentity }]

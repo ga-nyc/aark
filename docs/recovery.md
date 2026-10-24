@@ -132,3 +132,9 @@ Keep the encrypted physical source read-only. Use dislocker or another audited i
 ## “All and only deleted” limitation
 
 No recovery engine can make that guarantee on real media. TRIM can zero SSD cells before acquisition; overwritten clusters no longer contain the old bytes; metadata can be reused; and signature carving can mistake random or embedded data for standalone files. The toolkit addresses this by retaining provenance, separating markers from validated structures, comparing against allocated references, and never silently relabeling historical data as deleted.
+
+## Capacity planning and monitoring
+
+During an engine run, the free-space reserve and destination/source safety checks run independently of full-tree logical-size accounting. A large case inventory therefore cannot hold up the next free-space check. Neither check overlaps another invocation of itself, and any in-flight check must finish before command outputs are accepted. A logical-size cap can still overshoot while its inventory is in progress; the independent free-space reserve remains enforced during that walk. These guards preserve headroom but do not estimate how much output a recovery stage will produce.
+
+Budget for all enabled stages before starting: an evidence image, an unallocated-space stream, outputs from multiple metadata-recovery engines, and signature-carved files can coexist. Their combined size can exceed the source volume's size. Filesystems with large allocation units can also use much more physical space than the sum of small files' logical sizes. Check actual free space between stages and allow room for later mining outputs; a case's logical-size cap does not bound physical allocation.

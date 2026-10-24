@@ -731,8 +731,10 @@ export async function runRecoveryPlan(
           temporaryDirectory,
           ...(signal === undefined ? {} : { signal }),
           safetyCheck: async () => {
+            // Check free space on every tick without waiting for the full case
+            // inventory, which may take minutes on a wide recovery tree.
+            await assertStorageCapacity(plan.destination, storagePolicy);
             await assertDestinationControlCurrent();
-            await assertRecoveryCapacity();
             const now = Date.now();
             if (now - lastExtendedSafetyCheck >= 5_000) {
               lastExtendedSafetyCheck = now;
@@ -751,6 +753,9 @@ export async function runRecoveryPlan(
               }
             }
           },
+          ...(storagePolicy.maximumOutputBytes === undefined ? {} : {
+            backgroundSafetyCheck: assertRecoveryCapacity,
+          }),
           safetyCheckIntervalMs: 1_000,
           maxCaptureBytes: 64 * 1024,
         });
