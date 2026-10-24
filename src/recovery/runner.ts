@@ -4,7 +4,7 @@ import path from "node:path";
 import { captureCommand, commandExists } from "../core/command.js";
 import { acquireExclusiveLock, assertNoSymlinkComponents, atomicWriteFile, atomicWriteJson, ensurePrivateDirectory, nearestExistingParent, readDirectoryNamesBounded, readJson, safeJoin } from "../core/fs-safe.js";
 import type { ExclusiveLock } from "../core/fs-safe.js";
-import { filesystemEnforcesUnixModes, mountForPath, mountForPathFrom, mountIsNetworkBacked, mountIsReadOnly, mounts } from "../core/mounts.js";
+import { assertSupportedOutputMount, filesystemEnforcesUnixModes, mountForPath, mountForPathFrom, mountIsNetworkBacked, mountIsReadOnly, mounts } from "../core/mounts.js";
 import type { MountRecord } from "../core/mounts.js";
 import type { JsonValue } from "../core/types.js";
 import { assertStorageCapacity, directoryLogicalBytes, StorageQuotaError, storagePolicyFromGiB } from "../core/storage.js";
@@ -453,7 +453,9 @@ export async function runRecoveryPlan(
     throw new Error("refusing to execute a recovery plan that does not exactly match the supplied configuration");
   }
   const storagePolicy = storagePolicyFromGiB(plan.storage.minFreeGiB, plan.storage.minFreePercent, plan.storage.maxOutputGiB);
-  await assertStorageCapacity(await nearestExistingParent(plan.destination), storagePolicy);
+  const destinationParent = await nearestExistingParent(plan.destination);
+  assertSupportedOutputMount(await mountForPath(destinationParent));
+  await assertStorageCapacity(destinationParent, storagePolicy);
   const safety = await inspectSourceSafety(config.source, plan.destination);
   if (inside(plan.destination, safety.resolvedSource)) {
     throw new Error("the canonical recovery source must not be stored inside its case destination");

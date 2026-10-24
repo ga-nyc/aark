@@ -6,7 +6,7 @@ import { performance } from "node:perf_hooks";
 import type { Candidate } from "../core/types.js";
 import { acquireExclusiveLock, nearestExistingParent, readDirectoryNamesBounded, stableHandleStat, stableLstat, walkRegularFiles } from "../core/fs-safe.js";
 import type { ExclusiveLock, FilesystemIdentity, StableStat, WalkedFile } from "../core/fs-safe.js";
-import { filesystemIsNetwork, mountForPathFrom, mountIsNetworkBacked, mounts } from "../core/mounts.js";
+import { assertSupportedOutputMount, filesystemIsNetwork, mountForPath, mountForPathFrom, mountIsNetworkBacked, mounts } from "../core/mounts.js";
 import type { MountRecord } from "../core/mounts.js";
 import {
   assertStorageCapacity,
@@ -1667,6 +1667,7 @@ async function mountSetup(inputs: string[], outputParent: string): Promise<{
   }
   const outputMount = mountForPathFrom(mountSnapshot, outputParent);
   if (outputMount === undefined) throw new Error("could not determine the mount backing the mining output");
+  assertSupportedOutputMount(outputMount);
   if (await isNetworkMount(outputMount)) throw new Error("network-mounted mining outputs are not allowed");
   return { inputSafety, isNetworkMount };
 }
@@ -1844,6 +1845,7 @@ export async function resumeSensitiveMaterial(input: MiningResumeOptions): Promi
   if (metadata.isSymbolicLink() || !metadata.isDirectory() || await realpath(output) !== output) {
     throw new Error("resume output must be an existing canonical directory");
   }
+  assertSupportedOutputMount(await mountForPath(output));
   const locks = await acquireMiningLocks(output);
   const lock = locks.find((candidate) => path.basename(candidate.path) === MINING_LOCK_FILENAME);
   if (lock === undefined) {

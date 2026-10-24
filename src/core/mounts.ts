@@ -1,4 +1,4 @@
-import { readFile, stat } from "node:fs/promises";
+import fs, { stat } from "node:fs/promises";
 import path from "node:path";
 import { captureCommand, WINDOWS_MOUNTVOL } from "./command.js";
 
@@ -69,7 +69,7 @@ async function windowsMounts(): Promise<MountRecord[]> {
 export async function mounts(): Promise<MountRecord[]> {
   if (process.platform === "win32") return await windowsMounts();
   const records: MountRecord[] = [];
-  for (const line of (await readFile("/proc/self/mounts", "utf8")).split("\n")) {
+  for (const line of (await fs.readFile("/proc/self/mounts", "utf8")).split("\n")) {
     const fields = line.split(" ");
     if (fields.length < 4) continue;
     records.push({
@@ -102,6 +102,12 @@ export async function mountForPath(input: string): Promise<MountRecord | undefin
 
 export function mountIsReadOnly(record: MountRecord | undefined): boolean {
   return record !== undefined && record.options.includes("ro") && !record.options.includes("rw");
+}
+
+export function assertSupportedOutputMount(record: MountRecord | undefined): void {
+  if (record?.filesystem.toLowerCase() === "ntfs3") {
+    throw new Error("ntfs3 output mounts are unsupported for write-intensive recovery and mining; use ntfs-3g or a native Linux filesystem");
+  }
 }
 
 export function filesystemIsNetwork(record: MountRecord | undefined): boolean {

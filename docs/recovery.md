@@ -6,6 +6,47 @@ After every completed, paused, failed, or interrupted plan whose destination rem
 
 A quota-paused ddrescue run is an explicit retry state, distinct from an interrupted or failed engine.
 
+## Destination drivers and live-session recovery
+
+Linux recovery and mining reject output mounts whose filesystem type is
+`ntfs3`, before creating output directories, files, or operation locks. This is
+a conservative output policy following a bulk-carving incident where MFT
+extension reentered `ntfs_look_free_mft` and deadlocked the kernel driver. It
+does not claim that every NTFS3 kernel or workload has the same bug. Sources
+mounted read-only with NTFS3 remain readable; native Windows mining is unaffected.
+
+For an existing NTFS destination, explicitly select the userspace `ntfs-3g`
+driver rather than relying on automatic mount selection. Its usual Linux mount
+type is `fuseblk` or `fuse.ntfs-3g`. A native Linux filesystem is another suitable
+destination. AARK does not unmount, remount, repair, or reformat media itself.
+Do not mount a volume through two drivers at once. A kernel filesystem deadlock
+may require an OS restart before another driver can safely mount the volume;
+process existence and an active service do not establish forward progress.
+
+Before ending a live Linux session, keep the case configuration, image and
+mapfile, complete recovery/mining outputs, and tool revision on persistent
+storage. Keep a separate persistent handoff with device identities, mount
+instructions, completed stages, quotas, and the next commands. Do not rely on
+the live root filesystem or transient services surviving a reboot. Preserve
+completed results and verify the selected device and filesystem after boot;
+kernel read-only flags must be reapplied to source devices.
+
+Disk state determines which work can continue:
+
+- A completed stable image can be used as the source for subsequent recovery
+  and mining, without acquiring the original device again.
+- An explicitly quota-paused ddrescue case can be retried through the existing
+  recovery command and its mapfile, subject to the case's normal identity checks.
+- Only a mining checkpoint explicitly marked `paused` and `resumable: true`
+  may use `mine resume`. The CLI must still verify the frozen inputs, mount and
+  file identities, inventory, and artifacts; do not rewrite them to pass checks
+  after a remount or reboot.
+- A kernel hang, hard kill, or reboot of an in-progress scan is not a clean
+  pause. Retain that output and start a new mining output directory. Interrupted
+  PhotoRec and other non-resumable recovery stages need a new case directory.
+- Completed scans remain completed results; neither partial artifacts nor an
+  old progress counter establish complete coverage of unfinished work.
+
 ## Recommended sequence
 
 1. Identify the exact source and destination devices with `aark recover inventory`.
