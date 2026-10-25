@@ -43,6 +43,43 @@ a filesystem with large allocation units can consume far more disk space than
 their combined lengths. The reserve is physical headroom; the case cap counts
 logical sizes. Neither is a complete forecast of the remaining workflow.
 
+## File-backed local workspaces
+
+A Linux filesystem inside a new workspace file can reduce small-file allocation
+overhead without reformatting its hosting disk. For example, an ext4 workspace
+with 4 KiB blocks can use substantially less space for millions of small carved
+files than a hosting exFAT filesystem with 256 KiB allocation units. Choose both
+the workspace size and its inode count for the expected file count. Unknown
+carving output still requires headroom.
+
+AARK accepts an already mounted loop-backed workspace only when it can trace
+every block-device parent to physical disks. `losetup` from `util-linux` supplies
+the kernel backing-file inode and filesystem device; the canonical single-link
+regular file must match both. The binding includes file size, offset, size limit,
+and host mount identity. Network filesystems/transports, deleted or replaced
+backing paths, unknown parent branches, cycles, and inaccessible identities are
+refused. An output container on the source disk remains on the source disk and
+fails the independence check.
+An ext4 workspace also cannot hide an unsupported NTFS3 host from output-driver
+checks. Carving follow-ups reject shared container views and backing files
+stored inside the other case.
+
+Recovery and mining enforce the configured free-space reserve on the mounted
+workspace and on every filesystem hosting its loop backing files. The case's
+logical output cap applies to case outputs, not to container sizes. Binding
+checks continue during execution and are frozen into mining resume controls and
+cleanup approval tokens. Output writes may change backing-file timestamps;
+replacement, resizing, re-offsetting, or remounting invalidates the binding.
+
+AARK does not create, format, resize, or mount workspace containers. Prepare a
+new dedicated file on the authorized destination with enough host headroom,
+then assess the mounted destination before starting recovery. Preallocating the
+container makes its host cost visible before carving. Keep it mounted and
+preserve the file while any case, mining result, or retained source inside it is
+still needed. Formatting a new workspace file never authorizes formatting the
+hosting disk. Older AARK versions cannot resume or clean up scans that use the
+new loop-binding identities.
+
 ## Checks before each stage
 
 Recovery refreshes available space and records the next stage's known additional

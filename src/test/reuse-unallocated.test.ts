@@ -7,7 +7,8 @@ import { mkdtemp } from "./helpers.js";
 import { loadRecoveryConfig } from "../recovery/config.js";
 import { buildRecoveryPlan } from "../recovery/plan.js";
 import { redactedPlan, runRecoveryPlan } from "../recovery/runner.js";
-import { acquireReusedUnallocatedStream, assessReusedUnallocatedStream } from "../recovery/reuse-unallocated.js";
+import { acquireReusedUnallocatedStream, assessReusedUnallocatedStream, assertSeparateCaseMountViews } from "../recovery/reuse-unallocated.js";
+import type { LoopBackingIdentity } from "../core/mounts.js";
 import type { RecoveryConfig } from "../recovery/types.js";
 
 async function fixture(): Promise<{
@@ -223,4 +224,23 @@ test("reuse detects a newly nested control mount while its locks are held", { sk
     await held.release();
   }
   assert.equal((await readdir(root)).some(name => name.endsWith(".lock")), false);
+});
+
+test("loop-backed cases cannot hide overlap through container paths or repeated filesystem views", () => {
+  const root = path.join(os.tmpdir(), "synthetic-case-mount-views");
+  const source = { path: path.join(root, "earlier", "case"), filesystemDevice: "1", mountTarget: path.join(root, "earlier"),
+    loopBackings: [] as LoopBackingIdentity[] };
+  const destination = { path: path.join(root, "new", "case"), filesystemDevice: "2", mountTarget: path.join(root, "new"),
+    loopBackings: [] as LoopBackingIdentity[] };
+  const backing: LoopBackingIdentity = { device: "/dev/loop7", backingFile: path.join(root, "containers", "workspace"),
+    fileDevice: "3", fileInode: "4", bytes: "4096", modifiedNs: "0", changedNs: "0", offset: "0", sizeLimit: "0", mount: "synthetic" };
+  destination.loopBackings = [backing];
+  assert.doesNotThrow(() => assertSeparateCaseMountViews(source, destination));
+  assert.throws(() => assertSeparateCaseMountViews(source, { ...destination,
+    loopBackings: [{ ...backing, backingFile: path.join(source.path, "workspace") }] }), /backing files/);
+  assert.throws(() => assertSeparateCaseMountViews({ ...source,
+    loopBackings: [{ ...backing, backingFile: path.join(destination.path, "workspace") }] }, destination), /backing files/);
+  assert.throws(() => assertSeparateCaseMountViews({ ...source, loopBackings: [{ ...backing, device: "/dev/loop8" }] }, destination), /mount views/);
+  assert.doesNotThrow(() => assertSeparateCaseMountViews({ ...source, loopBackings: [backing] },
+    { ...destination, filesystemDevice: source.filesystemDevice, mountTarget: source.mountTarget }));
 });

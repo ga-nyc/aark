@@ -22,7 +22,7 @@ import {
   walkRegularFiles,
 } from "./core/fs-safe.js";
 import type { ExclusiveLock, FilesystemIdentity, StableStat, WalkedFile } from "./core/fs-safe.js";
-import { filesystemIsNetwork, mountForPathFrom, mountIsNetworkBacked, mounts } from "./core/mounts.js";
+import { filesystemIsNetwork, mountForPathFrom, mountIsNetworkBacked, mounts, protectedMountBacking } from "./core/mounts.js";
 import type { MountRecord } from "./core/mounts.js";
 import {
   loadCompletedInventory,
@@ -109,6 +109,7 @@ interface RootSnapshot {
   device: FilesystemIdentity;
   inode: FilesystemIdentity;
   mount: string;
+  loopBinding?: string;
 }
 
 interface DirectoryIdentity {
@@ -387,14 +388,17 @@ async function rootSnapshot(
     const target = path.resolve(record.target);
     return target !== canonical && inside(canonical, target);
   })) throw new Error(`${label} must not contain nested mounts`);
-  return { path: canonical, device: metadata.device, inode: metadata.inode, mount: identity };
+  const backing = await protectedMountBacking(mounted);
+  return { path: canonical, device: metadata.device, inode: metadata.inode, mount: identity,
+    ...(backing.loopBackings.length === 0 ? {} : { loopBinding: backing.identity }) };
 }
 
 async function assertRootCurrent(expected: RootSnapshot): Promise<void> {
   const records = await mounts();
   const cache = new Map<string, Promise<boolean>>();
   const current = await rootSnapshot(expected.path, records, cache, "protected cleanup directory");
-  if (current.device !== expected.device || current.inode !== expected.inode || current.mount !== expected.mount) {
+  if (current.device !== expected.device || current.inode !== expected.inode || current.mount !== expected.mount
+    || current.loopBinding !== expected.loopBinding) {
     throw new Error("a protected cleanup directory or its mount changed during verification");
   }
 }
@@ -422,7 +426,8 @@ function sameRootSnapshot(left: RootSnapshot, right: RootSnapshot): boolean {
   return left.path === right.path
     && left.device === right.device
     && left.inode === right.inode
-    && left.mount === right.mount;
+    && left.mount === right.mount
+    && left.loopBinding === right.loopBinding;
 }
 
 async function directoryContainsIdentity(ancestor: DirectoryIdentity, candidate: DirectoryIdentity): Promise<boolean> {
@@ -739,7 +744,7 @@ function assertCompletedInventoryMatchesState(inventory: SensitiveScanInventory,
 
 async function assertInputRootsCurrent(state: ScanState, signal?: AbortSignal): Promise<void> {
   const records = await mounts();
-  const networkCache = new Map<string, Promise<boolean>>();
+  const identityCache = new Map<string, ReturnType<typeof protectedMountBacking>>();
   for (const expected of state.inputRoots) {
     interrupted(signal);
     if (path.resolve(expected.path) !== expected.path) throw new Error("completed mining input root is not canonical");
@@ -751,16 +756,16 @@ async function assertInputRootsCurrent(state: ScanState, signal?: AbortSignal): 
     const mounted = mountForPathFrom(records, expected.path);
     if (mounted === undefined) throw new Error("could not determine the mount backing a completed mining input");
     const identity = mountIdentity(mounted);
-    let network = networkCache.get(identity);
-    if (network === undefined) {
-      network = filesystemIsNetwork(mounted) ? Promise.resolve(true) : mountIsNetworkBacked(mounted);
-      networkCache.set(identity, network);
+    let backing = identityCache.get(identity);
+    if (backing === undefined) {
+      backing = protectedMountBacking(mounted);
+      identityCache.set(identity, backing);
     }
+    const currentIdentity = (await backing).identity;
     if (
       metadata.device !== expected.device
       || metadata.inode !== expected.inode
-      || identity !== expected.mount
-      || await network
+      || currentIdentity !== expected.mount
     ) throw new Error("completed mining input root identity or mount changed after scanning");
   }
 }

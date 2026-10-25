@@ -86,6 +86,8 @@ Assessment reports known minimum storage requirements and explicitly unknown
 output sizes. It does not promise the entire workflow will fit. Use
 `recover plan --assess-storage` to include the live assessment in a plan display.
 See [storage assessment and live progress](docs/storage-planning.md).
+For destinations with large allocation units, see
+[file-backed local workspaces](docs/storage-planning.md#file-backed-local-workspaces).
 
 To restart carving on another disk after a later stage failed, a fresh case can
 set `unallocatedStreamFromCase` to reuse a verified completed extraction. This

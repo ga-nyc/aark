@@ -4,7 +4,7 @@ import path from "node:path";
 import { captureCommand, commandExists } from "../core/command.js";
 import { acquireExclusiveLock, assertNoSymlinkComponents, atomicWriteFile, atomicWriteJson, ensurePrivateDirectory, nearestExistingParent, readDirectoryNamesBounded, readJson, safeJoin } from "../core/fs-safe.js";
 import type { ExclusiveLock } from "../core/fs-safe.js";
-import { assertSupportedOutputMount, filesystemEnforcesUnixModes, mountForPath, mountForPathFrom, mountIsNetworkBacked, mountIsReadOnly, mounts } from "../core/mounts.js";
+import { assertLoopBackingCapacity, assertSupportedOutputMount, filesystemEnforcesUnixModes, mountForPath, mountForPathFrom, mountIsNetworkBacked, mountIsReadOnly, mounts, stableLoopBackingIdentity } from "../core/mounts.js";
 import type { MountRecord } from "../core/mounts.js";
 import type { JsonValue } from "../core/types.js";
 import { assertStorageCapacity, directoryLogicalBytes, StorageQuotaError, storageCapacity, storagePolicyFromGiB } from "../core/storage.js";
@@ -174,6 +174,10 @@ async function assertSourceSafetyCurrent(
     || current.bytes !== expected.bytes
     || !sameStrings(current.sourceTopDevices, expected.sourceTopDevices)
     || !sameStrings(current.destinationDevices, expected.destinationDevices)
+    || stableLoopBackingIdentity(current.destinationLoopBackings) !== stableLoopBackingIdentity(expected.destinationLoopBackings)
+    || (current.kind === "block-device" && !allowDestinationResident
+      ? JSON.stringify(current.sourceLoopBackings) !== JSON.stringify(expected.sourceLoopBackings)
+      : stableLoopBackingIdentity(current.sourceLoopBackings) !== stableLoopBackingIdentity(expected.sourceLoopBackings))
     || current.destinationFilesystemDevice !== expected.destinationFilesystemDevice
     || current.destinationMountSource !== expected.destinationMountSource
     || current.destinationBackingKind !== expected.destinationBackingKind
@@ -493,6 +497,7 @@ async function runRecoveryPlanWithSource(
   assertSupportedOutputMount(await mountForPath(destinationParent));
   await assertStorageCapacity(destinationParent, storagePolicy);
   const safety = await inspectSourceSafety(config.source, plan.destination);
+  await assertLoopBackingCapacity(safety.destinationLoopBackings, storagePolicy);
   if (inside(plan.destination, safety.resolvedSource)) {
     throw new Error("the canonical recovery source must not be stored inside its case destination");
   }
@@ -593,6 +598,7 @@ async function runRecoveryPlanWithSource(
     // so a very large recovery tree cannot delay reserve enforcement until the
     // walk has finished.
     await assertStorageCapacity(plan.destination, storagePolicy);
+    await assertLoopBackingCapacity(safety.destinationLoopBackings, storagePolicy);
     if (storagePolicy.maximumOutputBytes !== undefined) {
       const outputBytes = await directoryLogicalBytes(plan.destination, signal);
       await assertStorageCapacity(plan.destination, storagePolicy, outputBytes);
@@ -826,6 +832,7 @@ async function runRecoveryPlanWithSource(
             // Check free space on every tick without waiting for the full case
             // inventory, which may take minutes on a wide recovery tree.
             await assertStorageCapacity(plan.destination, storagePolicy);
+            await assertLoopBackingCapacity(safety.destinationLoopBackings, storagePolicy);
             await assertDestinationControlCurrent();
             const now = Date.now();
             if (now - lastExtendedSafetyCheck >= 5_000) {

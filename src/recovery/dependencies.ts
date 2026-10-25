@@ -11,6 +11,7 @@ export interface Dependency {
 
 export const DEPENDENCIES: Dependency[] = [
   { executable: "lsblk", ubuntuPackage: "util-linux", layer: "core", purpose: "block-device inventory and read-only checks", required: true },
+  { executable: "losetup", ubuntuPackage: "util-linux", layer: "core", purpose: "kernel backing-file identity checks for loop-mounted local filesystems", required: false },
   { executable: "findmnt", ubuntuPackage: "util-linux", layer: "core", purpose: "mount and destination safety checks", required: true },
   { executable: "ddrescue", ubuntuPackage: "gddrescue", layer: "recovery", purpose: "resumable evidence imaging", required: false },
   { executable: "fls", ubuntuPackage: "sleuthkit", layer: "recovery", purpose: "deleted filesystem metadata indexing", required: false },
