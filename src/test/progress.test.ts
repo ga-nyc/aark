@@ -1,16 +1,34 @@
 import assert from "node:assert/strict";
-import { mkdir, readFile, symlink, writeFile } from "node:fs/promises";
+import { mkdir, open, readFile, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { captureCommand } from "../core/command.js";
 import { PROGRESS_FILENAME, readProgress, redactedProgress } from "../core/progress.js";
 import { scanSensitiveMaterial } from "../mining/scanner.js";
+import { ArtifactStore } from "../mining/artifacts.js";
 import { mkdtemp } from "./helpers.js";
 
 function header(layer: "mining" | "recovery") {
   return { version: 1, tool: "aark", layer, status: "running", sourcePathsRedacted: true, updatedAt: new Date().toISOString() };
 }
+
+test("live mining progress avoids sync and terminal progress remains durable", async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "aark-progress-durability-"));
+  const store = new ArtifactStore(root, [], false);
+  await store.initialize();
+  const probe = await open(path.join(root, "probe"), "w");
+  const prototype = Object.getPrototypeOf(probe);
+  await probe.close();
+  const sync = t.mock.method(prototype, "sync", async () => {});
+  const progress = { filesVisited: 1, filesScanned: 0, bytesScanned: 1024, uniqueFindings: 0, occurrences: 0, scanErrors: 0 };
+  await store.progress("in-progress", progress, true);
+  assert.equal(sync.mock.callCount(), 0);
+  assert.equal((await readProgress(root, "mining")).bytesScanned, 1024);
+  await store.progress("complete", { ...progress, filesScanned: 1 }, true);
+  assert.ok(sync.mock.callCount() >= 1);
+  assert.equal((await readProgress(root, "mining")).status, "complete");
+});
 
 test("progress readers return only validated aggregates and never extra local fields", () => {
   const report = redactedProgress({ ...header("recovery"), currentStage: "signature-carving", availableBytes: "123456789",

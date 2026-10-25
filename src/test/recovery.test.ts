@@ -1,5 +1,7 @@
 import assert from "node:assert/strict";
-import { access, readFile, readdir, unlink, writeFile } from "node:fs/promises";
+import { readFileSync } from "node:fs";
+import { access, open, readFile, readdir, readlink, unlink, writeFile } from "node:fs/promises";
+import type { FileHandle } from "node:fs/promises";
 import { mkdtemp } from "./helpers.js";
 import os from "node:os";
 import test from "node:test";
@@ -8,7 +10,7 @@ import { loadRecoveryConfig } from "../recovery/config.js";
 import { buildRecoveryPlan } from "../recovery/plan.js";
 import { renderRecoveryRedactedReport, renderRecoverySensitiveReport } from "../recovery/report.js";
 import { recoveryStepStatus, redactedPlan, redactedStorageStop, runRecoveryPlan } from "../recovery/runner.js";
-import { readProgress } from "../core/progress.js";
+import { PROGRESS_FILENAME, readProgress } from "../core/progress.js";
 import { StorageQuotaError } from "../core/storage.js";
 import type { SourceSafety } from "../recovery/source-safety.js";
 import type { RecoveryConfig } from "../recovery/types.js";
@@ -244,6 +246,71 @@ test("recovery config rejects typos, coercion, and allocated-space carving", asy
 
   await writeFile(filename, JSON.stringify({ ...valid, photoRecCommand: "partition_none,search", stages: { signatureCarving: true, unallocatedStream: false } }));
   await assert.rejects(loadRecoveryConfig(filename), /signatureCarving requires unallocatedStream/);
+});
+
+test("recovery running publications avoid fsync while complete and interrupted progress remain durable", { skip: process.platform !== "linux" }, async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "aark-recovery-progress-durability-"));
+  const source = path.join(root, "source.img");
+  await writeFile(source, Buffer.alloc(4096));
+  const probe = await open(path.join(root, "probe"), "w");
+  const prototype = Object.getPrototypeOf(probe) as FileHandle;
+  const originalWriteFile = prototype.writeFile;
+  const originalSync = prototype.sync;
+  await probe.close();
+
+  let progressPath = "";
+  let publicationStatus: unknown;
+  let publicationSyncs: string[] = [];
+  // Identify only real progress writes: authoritative case state and reports
+  // must keep their flushes without being counted as live progress flushes.
+  t.mock.method(prototype, "writeFile", async function (this: FileHandle, ...args: Parameters<FileHandle["writeFile"]>) {
+    await originalWriteFile.apply(this, args);
+    const filename = await readlink(`/proc/self/fd/${this.fd}`);
+    if (filename.startsWith(`${progressPath}.tmp-`)) {
+      assert.equal(publicationStatus, undefined);
+      publicationStatus = (JSON.parse(await readFile(filename, "utf8")) as Record<string, unknown>).status;
+      publicationSyncs = [];
+    }
+  });
+  t.mock.method(prototype, "sync", async function (this: FileHandle) {
+    if (publicationStatus !== undefined) publicationSyncs.push(await readlink(`/proc/self/fd/${this.fd}`));
+    await originalSync.call(this);
+  });
+
+  for (const terminalStatus of ["complete", "interrupted"] as const) {
+    const destination = path.join(root, `${terminalStatus}-case`);
+    progressPath = path.join(destination, PROGRESS_FILENAME);
+    const input: RecoveryConfig = {
+      ...config(), source, destination, execute: true, sectorOffset: 0,
+      storage: { minFreeGiB: 0, minFreePercent: 0 },
+      image: { enabled: false, path: path.join(destination, "evidence", "source.img"), mapfile: path.join(destination, "evidence", "source.map"), retryPasses: 0 },
+      stages: { deletedMetadata: false, ntfsUndelete: false, unallocatedStream: false, signatureCarving: false,
+        volumeShadows: false, residualMemory: false, deletedRegistryCells: false },
+    };
+    const controller = new AbortController();
+    const publishedStatuses: unknown[] = [];
+    const run = runRecoveryPlan(input, buildRecoveryPlan(input), true, controller.signal, (snapshot) => {
+      assert.deepEqual(JSON.parse(readFileSync(progressPath, "utf8")), snapshot);
+      assert.equal(publicationStatus, snapshot.status);
+      publishedStatuses.push(snapshot.status);
+      if (snapshot.status === "running") {
+        assert.deepEqual(publicationSyncs, []);
+      } else {
+        assert.equal(snapshot.status, terminalStatus);
+        assert.equal(publicationSyncs.length, 2);
+        assert.ok(publicationSyncs[0]?.startsWith(`${progressPath}.tmp-`));
+        assert.equal(publicationSyncs[1], destination);
+      }
+      publicationStatus = undefined;
+      if (terminalStatus === "interrupted" && snapshot.status === "running") controller.abort();
+    });
+    if (terminalStatus === "interrupted") await assert.rejects(run, /interrupted/);
+    else assert.equal((await run).status, terminalStatus);
+    assert.deepEqual(publishedStatuses, ["running", terminalStatus]);
+    assert.equal((await readProgress(destination, "recovery")).status, terminalStatus);
+    await assert.rejects(access(path.join(destination, ".aark-recovery.lock")));
+    await assert.rejects(access(path.join(destination, ".agetnic-recovery.lock")));
+  }
 });
 
 test("recovery completion and interruption both produce sensitive and redacted final reports", { skip: process.platform === "win32" }, async () => {

@@ -1,10 +1,43 @@
 import assert from "node:assert/strict";
-import { access, link, lstat, mkdir, readFile, readdir, rm, symlink, writeFile } from "node:fs/promises";
+import { access, link, lstat, mkdir, open, readFile, readdir, rm, symlink, writeFile } from "node:fs/promises";
 import { mkdtemp } from "./helpers.js";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
-import { acquireExclusiveLock, assertNoSymlinkComponents, atomicWriteFile, ensurePrivateDirectory, filesystemIdentityValue, readDirectoryNamesBounded, readJson, renameWithHeldIdentity, stableLstat, walkRegularFiles } from "../core/fs-safe.js";
+import { acquireExclusiveLock, assertNoSymlinkComponents, atomicWriteFile, atomicWriteInformationalFile, ensurePrivateDirectory, filesystemIdentityValue, readDirectoryNamesBounded, readJson, renameWithHeldIdentity, stableLstat, walkRegularFiles } from "../core/fs-safe.js";
+
+test("informational publication avoids device flushes while authoritative writes remain durable", async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "aark-informational-test-"));
+  const probe = await open(path.join(root, "probe"), "w");
+  const prototype = Object.getPrototypeOf(probe);
+  await probe.close();
+  const sync = t.mock.method(prototype, "sync", async () => {});
+  const destination = path.join(root, "snapshot.json");
+  await atomicWriteInformationalFile(destination, '{"bytes":1}\n');
+  await atomicWriteInformationalFile(destination, '{"bytes":2}\n');
+  assert.equal(sync.mock.callCount(), 0);
+  assert.equal(await readFile(destination, "utf8"), '{"bytes":2}\n');
+  await atomicWriteFile(destination, '{"bytes":3}\n');
+  assert.ok(sync.mock.callCount() >= 1);
+  if (process.platform !== "win32") assert.equal(sync.mock.callCount(), 2);
+  assert.equal(await readFile(destination, "utf8"), '{"bytes":3}\n');
+  assert.deepEqual((await readdir(root)).sort(), ["probe", "snapshot.json"]);
+});
+
+test("informational publication preserves hard-link and symbolic-link protections", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "aark-informational-links-"));
+  const original = path.join(root, "original");
+  const alias = path.join(root, "alias");
+  await writeFile(original, "original synthetic content");
+  await link(original, alias);
+  await assert.rejects(atomicWriteInformationalFile(alias, "replacement"), /single-link/);
+  assert.equal(await readFile(original, "utf8"), "original synthetic content");
+  if (process.platform !== "win32") {
+    const redirected = path.join(root, "redirected");
+    await symlink(original, redirected);
+    await assert.rejects(atomicWriteInformationalFile(redirected, "replacement"));
+  }
+});
 
 test("Windows filesystem snapshots preserve signed representations of unsigned 64-bit identities", () => {
   assert.equal(filesystemIdentityValue(-1n, "win32"), "18446744073709551615");

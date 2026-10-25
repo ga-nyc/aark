@@ -23,6 +23,26 @@ Do not mount a volume through two drivers at once. A kernel filesystem deadlock
 may require an OS restart before another driver can safely mount the volume;
 process existence and an active service do not establish forward progress.
 
+For bulk carving, prefer an existing native Linux destination on a separate
+physical device when available. Reading a stream, creating many files, repeatedly
+walking their metadata, and publishing durable state on one rotating NTFS drive
+can compete for the same I/O path. NTFS-3G synchronizes the whole device for file
+and directory fsync. Live progress publications use atomic replacement without
+those flushes; authoritative and terminal records retain durability. See
+[WFL-002](backlog.md#wfl-002-keep-live-monitoring-from-stalling-bulk-carving) for the
+publication change and remaining accounting and monitoring work. This is not a
+reason to bypass NTFS3 output rejection, weaken quotas, reformat existing evidence
+storage, or restart an interrupted engine into its old case.
+
+Diagnose slow runs with bounded aggregate samples: engine byte counters, block
+device throughput and request latency, and process wait stacks. Avoid repeated
+recursive file inventories solely for status. Keep supervision state on a
+separate local filesystem and treat an unresponsive status probe as stale
+observation. A filesystem worker waiting inside a device flush and an engine
+waiting on that filesystem are different from a busy detector; additional CPU
+workers cannot resolve that I/O wait. Neither condition alone proves hardware
+failure or establishes a remaining-time estimate.
+
 Before ending a live Linux session, keep the case configuration, image and
 mapfile, complete recovery/mining outputs, and tool revision on persistent
 storage. Keep a separate persistent handoff with device identities, mount

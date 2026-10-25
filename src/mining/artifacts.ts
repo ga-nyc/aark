@@ -11,6 +11,7 @@ import { PROGRESS_FILENAME, redactedProgress } from "../core/progress.js";
 import {
   assertNoSymlinkComponents,
   atomicWriteFile,
+  atomicWriteInformationalFile,
   ensurePrivateDirectory,
   safeJoin,
   stableHandleStat,
@@ -368,7 +369,10 @@ export class ArtifactStore {
     };
   }
 
-  private async writeChecked(filename: string, data: Uint8Array | string, mode = 0o600, enforceCapacity = true): Promise<void> {
+  private async writeChecked(filename: string, data: Uint8Array | string, mode = 0o600, enforceCapacity = true, informational = false): Promise<void> {
+    if (informational && (filename !== PROGRESS_FILENAME || typeof data !== "string")) {
+      throw new Error("only live progress may use informational publication");
+    }
     await this.assertOutputSafe?.();
     const destination = safeJoin(this.output, filename);
     await assertNoSymlinkComponents(this.output, destination);
@@ -383,7 +387,8 @@ export class ArtifactStore {
     }
     const newBytes = BigInt(typeof data === "string" ? Buffer.byteLength(data) : data.byteLength);
     if (enforceCapacity) await this.storageBudget?.beforeWrite(newBytes, replacingBytes);
-    await atomicWriteFile(destination, data, mode);
+    if (informational) await atomicWriteInformationalFile(destination, data as string, mode);
+    else await atomicWriteFile(destination, data, mode);
     this.storageBudget?.committedWrite(newBytes, replacingBytes);
     await this.assertOutputSafe?.();
   }
@@ -413,7 +418,7 @@ export class ArtifactStore {
         maximumOutputBytes: this.storageBudget?.policy.maximumOutputBytes?.toString() ?? null,
       }),
     }, "mining");
-    await this.writeChecked(PROGRESS_FILENAME, `${JSON.stringify(snapshot, null, 2)}\n`, 0o644, enforceCapacity);
+    await this.writeChecked(PROGRESS_FILENAME, `${JSON.stringify(snapshot, null, 2)}\n`, 0o644, enforceCapacity, status === "in-progress");
     this.progressUpdatedAt = now;
   }
 

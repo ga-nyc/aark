@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { lstat, opendir, realpath, statfs } from "node:fs/promises";
 import path from "node:path";
 import { captureCommand, commandExists } from "../core/command.js";
-import { acquireExclusiveLock, assertNoSymlinkComponents, atomicWriteFile, atomicWriteJson, ensurePrivateDirectory, nearestExistingParent, readDirectoryNamesBounded, readJson, safeJoin } from "../core/fs-safe.js";
+import { acquireExclusiveLock, assertNoSymlinkComponents, atomicWriteFile, atomicWriteInformationalFile, atomicWriteJson, ensurePrivateDirectory, nearestExistingParent, readDirectoryNamesBounded, readJson, safeJoin } from "../core/fs-safe.js";
 import type { ExclusiveLock } from "../core/fs-safe.js";
 import { assertLoopBackingCapacity, assertSupportedOutputMount, filesystemEnforcesUnixModes, mountForPath, mountForPathFrom, mountIsNetworkBacked, mountIsReadOnly, mounts, stableLoopBackingIdentity } from "../core/mounts.js";
 import type { MountRecord } from "../core/mounts.js";
@@ -655,7 +655,15 @@ async function runRecoveryPlanWithSource(
       ...(sensitiveRun.currentStep === null ? {} : { nextStageCapacity }),
       ...(progressStorageStop === undefined ? {} : { storageStop: progressStorageStop }),
     }, "recovery");
-    await writeCaseJson(safeJoin(plan.destination, PROGRESS_FILENAME), snapshot, 0o644);
+    if (sensitiveRun.status === "running") {
+      // A live snapshot is observational, not an authoritative checkpoint.
+      // On NTFS-3G even a tiny fsync flushes the whole backing device.
+      await assertDestinationControlCurrent();
+      await atomicWriteInformationalFile(safeJoin(plan.destination, PROGRESS_FILENAME), `${JSON.stringify(snapshot, null, 2)}\n`);
+      await assertDestinationControlCurrent();
+    } else {
+      await writeCaseJson(safeJoin(plan.destination, PROGRESS_FILENAME), snapshot, 0o644);
+    }
     onProgress?.(snapshot);
   };
   const persistState = async (): Promise<void> => {
