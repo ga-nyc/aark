@@ -170,6 +170,7 @@ export interface BlockBacking {
 }
 
 export interface BlockBackingProbe {
+  canonicalDevice?: (device: string) => Promise<string>;
   topology: (device: string) => Promise<LsblkTransportNode[]>;
   loop: (device: string) => Promise<{ identity: LoopBackingIdentity; mountSource: string; networkBacked: boolean }>;
 }
@@ -186,6 +187,7 @@ export async function resolveBlockBackingFrom(input: string, probe: BlockBacking
   let networkBacked = false;
   let visited = 0;
   async function resolve(device: string, ancestors: Set<string>, depth: number): Promise<void> {
+    device = await probe.canonicalDevice?.(device) ?? device;
     if (depth > 16 || ancestors.has(device)) throw new Error("cyclic or excessively deep block backing topology");
     const nodes = await probe.topology(device);
     if (nodes.length === 0 || nodes.some((node) => node.path !== device)) {
@@ -323,6 +325,10 @@ async function loopBacking(device: string): ReturnType<BlockBackingProbe["loop"]
     }
     const mounted = await mountForPath(before.file);
     if (mounted === undefined) throw new Error("could not identify the mount hosting a loop backing file");
+    if (mounted.source.startsWith("/dev/")) {
+      const host = await fs.stat(mounted.source.replace(/\[[^\]]*\]$/, ""), { bigint: true });
+      if (!host.isBlockDevice() || host.rdev !== metadata.dev) throw new Error("loop backing mount does not match its actual filesystem device");
+    }
     if (JSON.stringify(before) !== JSON.stringify(await loopStatus(device))) throw new Error("loop binding changed during inspection");
     return {
       identity: { device, backingFile: before.file, fileDevice: metadata.dev.toString(), fileInode: metadata.ino.toString(),
@@ -339,7 +345,21 @@ async function loopBacking(device: string): ReturnType<BlockBackingProbe["loop"]
 
 /** Resolve file-backed loops to their actual host disks, never to a guessed disk. */
 export async function resolveBlockBacking(input: string): Promise<BlockBacking> {
-  return await resolveBlockBackingFrom(await fs.realpath(input), { topology: blockTopology, loop: loopBacking });
+  return await resolveBlockBackingFrom(input, { canonicalDevice: kernelBlockDevice, topology: blockTopology, loop: loopBacking });
+}
+
+async function kernelBlockDevice(input: string): Promise<string> {
+  const metadata = await fs.stat(input, { bigint: true });
+  if (!metadata.isBlockDevice()) throw new Error("protected mount source is not a block device");
+  // /dev/root can be a separately created block node, rather than a symlink.
+  // realpath alone cannot normalize it to the KNAME reported by lsblk.
+  const kernelPath = await fs.realpath(`/sys/dev/block/${linuxMajorMinor(metadata.rdev)}`);
+  const name = path.basename(kernelPath);
+  if (!/^[A-Za-z0-9_.!+-]+$/.test(name)) throw new Error("invalid kernel block-device name");
+  const device = `/dev/${name}`;
+  const canonical = await fs.stat(device, { bigint: true });
+  if (!canonical.isBlockDevice() || canonical.rdev !== metadata.rdev) throw new Error("kernel block-device alias does not match its requested identity");
+  return device;
 }
 
 /** Output writes legitimately change backing-file timestamps, never its binding. */

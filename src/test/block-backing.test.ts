@@ -64,6 +64,14 @@ test("nested loops behind device-mapper resolve every parent and deduplicate dis
   assert.deepEqual(result.loopBackings.map((item) => item.device), ["/dev/loop7", "/dev/loop8"]);
 });
 
+test("copied block-node aliases normalize by device identity at the root and inside loops", async () => {
+  const { probe, bindings } = fixture();
+  probe.canonicalDevice = async (device) => device === "/dev/root" ? "/dev/external1" : device;
+  assert.deepEqual((await resolveBlockBackingFrom("/dev/root", probe)).devices, ["/dev/external"]);
+  bindings.get("/dev/loop7")!.mountSource = "/dev/root";
+  assert.deepEqual((await resolveBlockBackingFrom("/dev/loop7", probe)).devices, ["/dev/external"]);
+});
+
 test("unknown topology branches and non-block loop hosts cannot be treated as local disks", async () => {
   const { probe, graphs, bindings } = fixture();
   graphs.set("/dev/mixed", [{ path: "/dev/mixed", type: "dm", children: [disk(), { path: "/dev/opaque", type: "unknown" }] }]);
