@@ -110,6 +110,14 @@ remains unknown: enough space for the raw input does not promise enough space fo
 reconstructed files. Existing partial outputs may already exceed the capacity of
 a proposed replacement destination.
 
+The earlier case must not contain nested mounts, including mounts over its
+control directories. Different mount views of the same filesystem are rejected
+when they could hide overlap between the cases; ordinary sibling case directories
+on one mount remain supported. These topology checks also run while carving.
+Because acquiring the earlier case's operation locks writes to that filesystem,
+execution requires a supported output driver there too: NTFS3 is rejected before
+any lock is created. Read-only assessment can still inspect an NTFS3 case.
+
 This starts PhotoRec again in fresh output directories. It does not resume an
 interrupted PhotoRec session, move old outputs, delete data, or turn the earlier
 failed case into a successful one. A completed follow-up records the earlier

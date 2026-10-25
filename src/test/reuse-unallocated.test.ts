@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { access, link, mkdir, readFile, readdir, symlink, unlink, writeFile } from "node:fs/promises";
+import fs, { access, link, mkdir, readFile, readdir, symlink, unlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -157,4 +157,70 @@ test("an interrupted follow-up records its own status and releases both cases wi
   for (const root of [f.config.destination, f.config.unallocatedStreamFromCase!]) {
     assert.equal((await readdir(root)).some((name) => name.endsWith(".lock")), false);
   }
+});
+
+test("reuse rejects nested mounts before trusting earlier case controls", { skip: process.platform !== "linux" }, async (context) => {
+  const f = await fixture();
+  const root = f.config.unallocatedStreamFromCase!;
+  const originalRead = fs.readFile;
+  context.mock.method(fs, "readFile", async (...args: Parameters<typeof fs.readFile>) => {
+    if (args[0] === "/proc/self/mounts") {
+      return `tmpfs / tmpfs rw 0 0\nremote-host:/controls ${path.join(root, "runs")} nfs rw 0 0\n`;
+    }
+    return await originalRead(...args);
+  });
+  await assert.rejects(assessReusedUnallocatedStream(f.config), /nested mount/);
+  await assert.rejects(acquireReusedUnallocatedStream(f.config), /nested mount/);
+  assert.equal((await readdir(root)).some(name => name.endsWith(".lock")), false);
+});
+
+test("reuse lock writes obey the NTFS3 output policy while read-only assessment remains allowed", { skip: process.platform !== "linux" }, async (context) => {
+  const f = await fixture();
+  const originalRead = fs.readFile;
+  context.mock.method(fs, "readFile", async (...args: Parameters<typeof fs.readFile>) => {
+    if (args[0] === "/proc/self/mounts") return "synthetic-device / ntfs3 rw 0 0\n";
+    return await originalRead(...args);
+  });
+  assert.equal((await assessReusedUnallocatedStream(f.config)).bytes, "2048");
+  await assert.rejects(acquireReusedUnallocatedStream(f.config), /ntfs3 output mounts/);
+  assert.equal((await readdir(f.config.unallocatedStreamFromCase!)).some(name => name.endsWith(".lock")), false);
+});
+
+test("reuse refuses different mount views of the same filesystem when overlap is ambiguous", { skip: process.platform !== "linux" }, async (context) => {
+  const f = await fixture();
+  const otherView = path.join(f.root, "other-view");
+  await mkdir(otherView);
+  f.config.destination = path.join(otherView, "new-case");
+  const originalRead = fs.readFile;
+  context.mock.method(fs, "readFile", async (...args: Parameters<typeof fs.readFile>) => {
+    if (args[0] === "/proc/self/mounts") {
+      return `tmpfs / tmpfs rw 0 0\nsynthetic-bind ${otherView} tmpfs rw 0 0\n`;
+    }
+    return await originalRead(...args);
+  });
+  await assert.rejects(assessReusedUnallocatedStream(f.config), /mount views/);
+  await assert.rejects(acquireReusedUnallocatedStream(f.config), /mount views/);
+  assert.equal((await readdir(f.config.unallocatedStreamFromCase!)).some(name => name.endsWith(".lock")), false);
+});
+
+test("reuse detects a newly nested control mount while its locks are held", { skip: process.platform !== "linux" }, async (context) => {
+  const f = await fixture();
+  const root = f.config.unallocatedStreamFromCase!;
+  let nested = false;
+  const originalRead = fs.readFile;
+  context.mock.method(fs, "readFile", async (...args: Parameters<typeof fs.readFile>) => {
+    if (args[0] === "/proc/self/mounts") {
+      return `tmpfs / tmpfs rw 0 0\n${nested ? `synthetic-control ${path.join(root, "runs")} tmpfs rw 0 0\n` : ""}`;
+    }
+    return await originalRead(...args);
+  });
+  const held = await acquireReusedUnallocatedStream(f.config);
+  try {
+    await held.assertCurrent();
+    nested = true;
+    await assert.rejects(held.assertCurrent(), /nested mount/);
+  } finally {
+    await held.release();
+  }
+  assert.equal((await readdir(root)).some(name => name.endsWith(".lock")), false);
 });

@@ -1,9 +1,9 @@
 import { lstat, realpath } from "node:fs/promises";
 import path from "node:path";
 import { isDeepStrictEqual } from "node:util";
-import { acquireExclusiveLock, assertNoSymlinkComponents, readJson, stableLstat } from "../core/fs-safe.js";
+import { acquireExclusiveLock, assertNoSymlinkComponents, nearestExistingParent, readJson, stableLstat } from "../core/fs-safe.js";
 import type { ExclusiveLock, StableStat } from "../core/fs-safe.js";
-import { mountForPath, mountIsNetworkBacked } from "../core/mounts.js";
+import { assertSupportedOutputMount, mountForPath, mountForPathFrom, mountIsNetworkBacked, mounts } from "../core/mounts.js";
 import type { RecoveryConfig } from "./types.js";
 
 const LOCKS = [".aark-recovery.lock", ".agetnic-recovery.lock"] as const;
@@ -40,8 +40,25 @@ async function validateRoot(config: RecoveryConfig): Promise<string> {
   }
   await assertNoSymlinkComponents(path.parse(root).root, root);
   if (await realpath(root) !== root || !(await lstat(root)).isDirectory()) throw new Error("the earlier recovery case must be a canonical directory");
-  const mount = await mountForPath(root);
+  const snapshot = await mounts();
+  const mount = mountForPathFrom(snapshot, root);
   if (mount === undefined || await mountIsNetworkBacked(mount)) throw new Error("the earlier recovery case must be on a verifiable local mount");
+  if (snapshot.some(item => path.resolve(item.target) !== root && overlaps(root, path.resolve(item.target)))) {
+    throw new Error("the earlier recovery case must not contain a nested mount");
+  }
+  const destinationParent = await nearestExistingParent(config.destination);
+  await assertNoSymlinkComponents(path.parse(destinationParent).root, destinationParent);
+  const destinationMount = mountForPathFrom(snapshot, destinationParent);
+  if (destinationMount === undefined) throw new Error("the follow-up destination must have a verifiable mount");
+  const [sourceMetadata, destinationMetadata] = await Promise.all([
+    lstat(root, { bigint: true }), lstat(destinationParent, { bigint: true }),
+  ]);
+  // Bind mounts and repeated mounts can hide directory overlap from realpath.
+  // Allow ordinary sibling cases, but require an unambiguous filesystem view.
+  if (sourceMetadata.dev === destinationMetadata.dev
+    && path.resolve(mount.target) !== path.resolve(destinationMount.target)) {
+    throw new Error("separate mount views of the same filesystem cannot prove that the cases do not overlap");
+  }
   return root;
 }
 
@@ -121,6 +138,7 @@ async function loadStream(config: RecoveryConfig, root: string, locks: Exclusive
   const mountIdentity = JSON.stringify(inputMount);
   const assertCurrent = async (): Promise<void> => {
     for (const lock of locks) await lock.assertHeld();
+    await validateRoot(config);
     if (locks.length === 0) {
       for (const name of LOCKS) {
         try { await lstat(path.join(root, name)); }
@@ -158,6 +176,8 @@ export async function assessReusedUnallocatedStream(config: RecoveryConfig): Pro
 /** Hold both compatibility locks until the new carving run has finished. */
 export async function acquireReusedUnallocatedStream(config: RecoveryConfig): Promise<ReusedUnallocatedStream> {
   const root = await validateRoot(config);
+  // These locks are writes, even though the reused recovery data is read-only.
+  assertSupportedOutputMount(await mountForPath(root));
   const locks: ExclusiveLock[] = [];
   try {
     for (const name of [...LOCKS].sort()) locks.push(await acquireExclusiveLock(root, name));
