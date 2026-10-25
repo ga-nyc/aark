@@ -7,6 +7,7 @@ import { StorageQuotaError, storageCapacity, storagePolicyFromGiB } from "../cor
 import type { StorageCapacity } from "../core/storage.js";
 import { inspectSourceSafety } from "./source-safety.js";
 import type { RecoveryConfig, RecoveryStep } from "./types.js";
+import { assessReusedUnallocatedStream } from "./reuse-unallocated.js";
 
 export interface CapacityFacts {
   sourceBytes: bigint;
@@ -133,6 +134,7 @@ export function storageAssessment(config: RecoveryConfig, facts: CapacityFacts):
 
 export async function assessRecoveryStorage(config: RecoveryConfig): Promise<Record<string, unknown>> {
   if (process.platform !== "linux") throw new Error("recovery storage assessment requires Linux");
+  const reused = config.unallocatedStreamFromCase === undefined ? undefined : await assessReusedUnallocatedStream(config);
   const existing = await nearestExistingParent(config.destination);
   assertSupportedOutputMount(await mountForPath(existing));
   const source = await inspectSourceSafety(config.source, config.destination);
@@ -165,8 +167,9 @@ export async function assessRecoveryStorage(config: RecoveryConfig): Promise<Rec
     throw new Error("source or destination changed during storage assessment");
   }
   const [capacity, filesystem] = await Promise.all([storageCapacity(existing, policy), statfs(existing, { bigint: true })]);
-  return storageAssessment(config, { sourceBytes, unallocatedBytes, allocationUnitBytes: filesystem.bsize,
-    capacity, ...(policy.maximumOutputBytes === undefined ? {} : { maximumOutputBytes: policy.maximumOutputBytes }) });
+  return { ...storageAssessment(config, { sourceBytes, unallocatedBytes, allocationUnitBytes: filesystem.bsize,
+    capacity, ...(policy.maximumOutputBytes === undefined ? {} : { maximumOutputBytes: policy.maximumOutputBytes }) }),
+    ...(reused === undefined ? {} : { reusedUnallocatedStream: reused }) };
 }
 
 /** Forecast only known bulk writes; unknown engine output remains explicit. */

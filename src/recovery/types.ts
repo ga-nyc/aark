@@ -30,6 +30,7 @@ export interface RecoveryConfig {
   caseId: string;
   source: string;
   analysisSource?: string;
+  unallocatedStreamFromCase?: string;
   mountedReadOnlyRoot?: string;
   destination: string;
   requireReadOnlySource: boolean;
@@ -63,6 +64,7 @@ export interface RecoveryPlan {
   caseId: string;
   source: string;
   analysisSource: string;
+  unallocatedStreamFromCase?: string;
   destination: string;
   requireReadOnlySource: boolean;
   storage: RecoveryStorageConfig;

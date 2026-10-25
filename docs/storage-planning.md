@@ -64,6 +64,57 @@ A preflight refusal can still leave the case terminal-failed. Preserve completed
 outputs and use the normal fresh-destination rules; do not edit case controls to
 force a retry.
 
+## Restart carving on a separate destination
+
+When extraction completed but a later engine failed, a fresh case can reuse the
+existing unallocated stream instead of repeating imaging and `blkls`. Set
+`unallocatedStreamFromCase` to the earlier case's absolute path, keep the same
+authorized `source`, and use a separate, non-overlapping `destination`. Enable
+`signatureCarving` and disable `unallocatedStream`; disable other stages unless
+they are intentionally part of the new run. For example:
+
+```json
+{
+  "version": 1,
+  "caseId": "carving-followup",
+  "source": "/dev/disk/by-id/your-authorized-source-partition",
+  "destination": "/mnt/another-disk/carving-followup",
+  "unallocatedStreamFromCase": "/mnt/recovery/earlier-case",
+  "requireReadOnlySource": true,
+  "execute": false,
+  "storage": { "minFreeGiB": 20, "minFreePercent": 5 },
+  "image": { "enabled": false },
+  "stages": {
+    "deletedMetadata": false,
+    "ntfsUndelete": false,
+    "unallocatedStream": false,
+    "signatureCarving": true
+  }
+}
+```
+
+Run `recover assess --config ...` and `recover plan --config ...` first, then use
+the normal two execution confirmations. The assessment remains read-only. It
+checks that the earlier run is terminal, its controls match their per-run copies,
+and both sensitive and redacted results record a successful `blkls -A` extraction.
+An arbitrary image, incomplete extraction, foreign source, symlink, hard link,
+or active operation lock cannot serve as the reused stream.
+
+Execution holds both recovery compatibility locks in the earlier case. It checks
+the stream's frozen file identity, size, timestamps, local mount, and controls
+throughout the new run. Those checks detect changes after validation; they do not
+establish a historical content hash for a legacy extraction. A source-case lock
+must be writable, but its recovery data and terminal reports remain untouched.
+The new case has its own reserve, cap, logs, and progress. Carving output size
+remains unknown: enough space for the raw input does not promise enough space for
+reconstructed files. Existing partial outputs may already exceed the capacity of
+a proposed replacement destination.
+
+This starts PhotoRec again in fresh output directories. It does not resume an
+interrupted PhotoRec session, move old outputs, delete data, or turn the earlier
+failed case into a successful one. A completed follow-up records the earlier
+case's status in `reusedUnallocatedStream`; cleanup requirements are unchanged.
+
 ## Local progress
 
 ```bash
