@@ -78,14 +78,19 @@ Create a case configuration and review its execution plan:
 
 ```bash
 cp examples/recovery-case.example.json recovery-case.json
-    aark recover assess --config recovery-case.json
+aark recover assess --config recovery-case.json
 aark recover plan --config recovery-case.json
+```
 
 Assessment reports known minimum storage requirements and explicitly unknown
 output sizes. It does not promise the entire workflow will fit. Use
 `recover plan --assess-storage` to include the live assessment in a plan display.
 See [storage assessment and live progress](docs/storage-planning.md).
-```
+
+To restart carving on another disk after a later stage failed, a fresh case can
+set `unallocatedStreamFromCase` to reuse a verified completed extraction. This
+preserves the earlier case and partial outputs; see
+[carving follow-ups](docs/storage-planning.md#restart-carving-on-a-separate-destination).
 
 The generated plan defaults to dry-run behavior. Execution requires both a configuration that says `execute: true` and an explicit CLI confirmation flag:
 

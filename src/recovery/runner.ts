@@ -16,6 +16,8 @@ import { buildRecoveryPlan } from "./plan.js";
 import { inspectSourceSafety } from "./source-safety.js";
 import type { SourceSafety } from "./source-safety.js";
 import { renderRecoveryRedactedReport, renderRecoverySensitiveReport } from "./report.js";
+import { acquireReusedUnallocatedStream } from "./reuse-unallocated.js";
+import type { ReusedUnallocatedStream } from "./reuse-unallocated.js";
 
 const PHOTOREC_SWITCHES = new Set(["/log", "/logname", "/d", "/cmd"]);
 const MAX_RECOVERY_OUTPUT_TREE_DEPTH = 256;
@@ -115,6 +117,7 @@ export function redactedPlan(plan: RecoveryPlan): Record<string, JsonValue> {
     caseId: "<CASE_ID>",
     source: "<SOURCE>",
     analysisSource: "<ANALYSIS_SOURCE>",
+    ...(plan.unallocatedStreamFromCase === undefined ? {} : { reusesCompletedUnallocatedStream: true }),
     destination: "<CASE_ROOT>",
     requireReadOnlySource: plan.requireReadOnlySource,
     storage: {
@@ -452,12 +455,41 @@ export async function runRecoveryPlan(
   onProgress?: (snapshot: Record<string, unknown>) => void,
 ): Promise<Record<string, JsonValue>> {
   if (!config.execute || !cliExecute) throw new Error("execution requires execute=true in the case config and --execute on the CLI");
+  if (JSON.stringify(plan) !== JSON.stringify(buildRecoveryPlan(config))) {
+    throw new Error("refusing to execute a recovery plan that does not exactly match the supplied configuration");
+  }
+  const reused = config.unallocatedStreamFromCase === undefined ? undefined : await acquireReusedUnallocatedStream(config);
+  let failure: unknown;
+  try {
+    return await runRecoveryPlanWithSource(config, plan, cliExecute, signal, onProgress, reused);
+  } catch (error) {
+    failure = error;
+    throw error;
+  } finally {
+    try { await reused?.release(); }
+    catch (releaseError) {
+      if (failure !== undefined) throw new AggregateError([failure, releaseError], "recovery failed and its reused-source locks could not be released");
+      throw releaseError;
+    }
+  }
+}
+
+async function runRecoveryPlanWithSource(
+  config: RecoveryConfig,
+  plan: RecoveryPlan,
+  cliExecute: boolean,
+  signal?: AbortSignal,
+  onProgress?: (snapshot: Record<string, unknown>) => void,
+  reused?: ReusedUnallocatedStream,
+): Promise<Record<string, JsonValue>> {
+  if (!config.execute || !cliExecute) throw new Error("execution requires execute=true in the case config and --execute on the CLI");
   const canonicalPlan = buildRecoveryPlan(config);
   if (JSON.stringify(plan) !== JSON.stringify(canonicalPlan)) {
     throw new Error("refusing to execute a recovery plan that does not exactly match the supplied configuration");
   }
   const storagePolicy = storagePolicyFromGiB(plan.storage.minFreeGiB, plan.storage.minFreePercent, plan.storage.maxOutputGiB);
   const destinationParent = await nearestExistingParent(plan.destination);
+  await reused?.assertCurrent();
   assertSupportedOutputMount(await mountForPath(destinationParent));
   await assertStorageCapacity(destinationParent, storagePolicy);
   const safety = await inspectSourceSafety(config.source, plan.destination);
@@ -584,6 +616,7 @@ export async function runRecoveryPlan(
     results: [] as Array<Record<string, JsonValue>>,
     currentStep: null as string | null,
     failure: null as null | { name: string; message: string },
+    ...(reused === undefined ? {} : { reusedUnallocatedStream: reused.summary }),
   };
   const redactedResults: Array<Record<string, JsonValue>> = [];
   const writeCaseFile = async (filename: string, data: Uint8Array | string, mode = 0o600): Promise<void> => {
@@ -673,6 +706,7 @@ export async function runRecoveryPlan(
       caseId: "<CASE_ID>",
       sourcePathsAndToolLogsRedacted: true,
       sourceReadOnlyRequired: config.requireReadOnlySource,
+      ...(reused === undefined ? {} : { reusedUnallocatedStream: reused.summary }),
       destinationUnixPermissionsEnforced: permissionsEnforced,
       reports: {
         sensitive: "final-report-sensitive.md",
@@ -695,6 +729,7 @@ export async function runRecoveryPlan(
   try {
     for (const recoveryStep of plan.steps) {
       if (signal?.aborted === true) throw new Error("recovery interrupted");
+      await reused?.assertCurrent();
       await assertDestinationControlCurrent();
       await assertSourceSafetyCurrent(config.source, plan.destination, safety, config.requireReadOnlySource, "source");
       if (config.mountedReadOnlyRoot !== undefined && mountedReadOnlyRoot !== undefined) {
@@ -795,6 +830,7 @@ export async function runRecoveryPlan(
             const now = Date.now();
             if (now - lastExtendedSafetyCheck >= 5_000) {
               lastExtendedSafetyCheck = now;
+              await reused?.assertCurrent();
               await assertSourceSafetyCurrent(config.source, plan.destination, safety, config.requireReadOnlySource, "source");
               if (analysisSafety !== undefined) {
                 await assertSourceSafetyCurrent(plan.analysisSource, plan.destination, analysisSafety, config.requireReadOnlySource, "analysisSource", analysisDestinationResident);
@@ -816,6 +852,7 @@ export async function runRecoveryPlan(
           safetyCheckIntervalMs: 1_000,
           maxCaptureBytes: 64 * 1024,
         });
+        await reused?.assertCurrent();
         await assertDestinationControlCurrent();
         await assertSourceSafetyCurrent(config.source, plan.destination, safety, config.requireReadOnlySource, "source");
         if (analysisSafety !== undefined) {
@@ -903,6 +940,7 @@ export async function runRecoveryPlan(
       }
     }
     if (signal?.aborted === true) throw new Error("recovery interrupted");
+    await reused?.assertCurrent();
     await assertSourceSafetyCurrent(config.source, plan.destination, safety, config.requireReadOnlySource, "source");
     if (analysisSafety !== undefined) {
       await assertSourceSafetyCurrent(plan.analysisSource, plan.destination, analysisSafety, config.requireReadOnlySource, "analysisSource", analysisDestinationResident);

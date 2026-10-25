@@ -81,7 +81,7 @@ export async function loadRecoveryConfig(filename: string): Promise<RecoveryConf
   const document = record(await readJson<unknown>(filename), "configuration");
   knownKeys(document, [
     "version", "caseId", "source", "analysisSource", "mountedReadOnlyRoot", "destination",
-    "requireReadOnlySource", "execute", "sectorOffset", "photoRecCommand", "image", "stages", "storage",
+    "requireReadOnlySource", "execute", "sectorOffset", "photoRecCommand", "image", "stages", "storage", "unallocatedStreamFromCase",
   ], "configuration");
   if (document.version !== 1) throw new Error("configuration version must be 1");
   const stagesInput = document.stages === undefined ? {} : record(document.stages, "stages");
@@ -147,7 +147,15 @@ export async function loadRecoveryConfig(filename: string): Promise<RecoveryConf
   const stages = Object.fromEntries(
     Object.entries(DEFAULT_STAGES).map(([key, fallback]) => [key, boolean(stagesInput[key], fallback, `stages.${key}`)]),
   ) as unknown as RecoveryStages;
-  if (stages.signatureCarving && !stages.unallocatedStream) {
+  const unallocatedStreamFromCase = document.unallocatedStreamFromCase === undefined
+    ? undefined : absolute(document.unallocatedStreamFromCase, "unallocatedStreamFromCase");
+  if (unallocatedStreamFromCase !== undefined && (
+    within(destination, unallocatedStreamFromCase) || within(unallocatedStreamFromCase, destination)
+    || stages.unallocatedStream || !stages.signatureCarving
+  )) {
+    throw new Error("unallocatedStreamFromCase requires a separate non-overlapping case, signatureCarving=true, and unallocatedStream=false");
+  }
+  if (stages.signatureCarving && !stages.unallocatedStream && unallocatedStreamFromCase === undefined) {
     throw new Error("signatureCarving requires unallocatedStream so PhotoRec never scans allocated source data");
   }
   const photoRecCommand = document.photoRecCommand === undefined
@@ -168,6 +176,7 @@ export async function loadRecoveryConfig(filename: string): Promise<RecoveryConf
     caseId,
     source,
     ...(analysisSource === undefined ? {} : { analysisSource }),
+    ...(unallocatedStreamFromCase === undefined ? {} : { unallocatedStreamFromCase }),
     ...(mountedReadOnlyRoot === undefined ? {} : { mountedReadOnlyRoot }),
     destination,
     requireReadOnlySource: boolean(document.requireReadOnlySource, true, "requireReadOnlySource"),

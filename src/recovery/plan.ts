@@ -111,7 +111,7 @@ export function buildRecoveryPlan(config: RecoveryConfig): RecoveryPlan {
     }));
   }
   if (config.stages.signatureCarving) {
-    const unallocatedInput = path.join(root, "recovery", "unallocated", "free-space.raw");
+    const unallocatedInput = path.join(config.unallocatedStreamFromCase ?? root, "recovery", "unallocated", "free-space.raw");
     const carveRoot = path.join(root, "recovery", "carved");
     steps.push(step({
       id: "signature-carving",
@@ -126,7 +126,8 @@ export function buildRecoveryPlan(config: RecoveryConfig): RecoveryPlan {
       provenance: "unallocated-carve",
       destinationWritesExpected: true,
       optional: true,
-      notes: ["The input was produced by blkls from filesystem-unallocated units; PhotoRec never receives the allocated source.", "PhotoRec output has reconstructed names and needs strict downstream validation."],
+      notes: ["The input was produced by blkls from filesystem-unallocated units; PhotoRec never receives the allocated source.", "PhotoRec output has reconstructed names and needs strict downstream validation.",
+        ...(config.unallocatedStreamFromCase === undefined ? [] : ["Reuse requires a verified completed extraction from an inactive earlier case. Carving restarts in this fresh case; the earlier case and partial outputs are preserved."])],
     }));
   }
   if (config.stages.volumeShadows) {
@@ -187,6 +188,7 @@ export function buildRecoveryPlan(config: RecoveryConfig): RecoveryPlan {
     caseId: config.caseId,
     source: config.source,
     analysisSource,
+    ...(config.unallocatedStreamFromCase === undefined ? {} : { unallocatedStreamFromCase: config.unallocatedStreamFromCase }),
     destination: root,
     requireReadOnlySource: config.requireReadOnlySource,
     storage,
@@ -195,6 +197,7 @@ export function buildRecoveryPlan(config: RecoveryConfig): RecoveryPlan {
       "Never write recovery output to the source device.",
       "TRIM, overwrite, fragmentation, and metadata reuse can make deleted data unrecoverable.",
       "Carved and residual-memory artifacts need validation and do not prove an original deleted pathname.",
+      ...(config.unallocatedStreamFromCase === undefined ? [] : ["Completion of this follow-up does not relabel or complete the earlier recovery case."]),
     ],
   };
 }
