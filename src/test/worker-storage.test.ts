@@ -169,11 +169,15 @@ test("raw CNG magic strings do not consume the expensive crypto budget", async (
 
 test("plausible CNG keys still enforce the original expensive crypto limit", async () => {
   const ecdh = createECDH("prime256v1");
-  ecdh.generateKeys();
+  // CNG stores fixed-width integers; getPrivateKey() drops leading zeroes.
+  // A small deterministic test scalar exercises the required zero padding.
+  const scalar = Buffer.alloc(32);
+  scalar[31] = 1;
+  ecdh.setPrivateKey(scalar);
   const header = Buffer.alloc(8);
   header.write("ECS2", "ascii");
   header.writeUInt32LE(32, 4);
-  const blob = Buffer.concat([header, ecdh.getPublicKey().subarray(1), ecdh.getPrivateKey()]);
+  const blob = Buffer.concat([header, ecdh.getPublicKey().subarray(1), scalar]);
   const data = Buffer.concat(Array.from({ length: MAX_EXPENSIVE_CRYPTO_VALIDATIONS_PER_DETECTOR_JOB + 1 }, () => blob));
   const pool = new DetectorWorkerPool(1);
   try {
