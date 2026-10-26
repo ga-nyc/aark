@@ -7,8 +7,8 @@ import { PROGRESS_FILENAME } from "../core/progress.js";
 import type { Candidate } from "../core/types.js";
 import { acquireExclusiveLock, nearestExistingParent, readDirectoryNamesBounded, stableHandleStat, stableLstat, walkRegularFiles } from "../core/fs-safe.js";
 import type { ExclusiveLock, FilesystemIdentity, StableStat, WalkedFile } from "../core/fs-safe.js";
-import { assertSupportedOutputMount, filesystemIsNetwork, mountForPath, mountForPathFrom, mountIsNetworkBacked, mounts } from "../core/mounts.js";
-import type { MountRecord } from "../core/mounts.js";
+import { assertLoopBackingCapacity, assertLoopBackingsOutside, assertSupportedLoopOutputBackings, assertSupportedOutputMount, filesystemIsNetwork, mountForPath, mountForPathFrom, mountIsNetworkBacked, mounts, outputLoopBinding, protectedMountBacking } from "../core/mounts.js";
+import type { LoopBackingIdentity, MountRecord } from "../core/mounts.js";
 import {
   assertStorageCapacity,
   directoryLogicalBytes,
@@ -77,6 +77,7 @@ interface OutputSafetySnapshot extends PathSafetySnapshot {
   kind: "directory";
   lockDevice: FilesystemIdentity;
   lockInode: FilesystemIdentity;
+  loopBackings: LoopBackingIdentity[];
 }
 
 interface NormalizedMiningOptions extends MiningOptions {
@@ -242,7 +243,19 @@ function sameCanonicalPath(left: string, right: string): boolean {
     : left === right;
 }
 
-async function pathSafetySnapshot(input: string, records: MountRecord[]): Promise<PathSafetySnapshot> {
+type MountSafetyCache = Map<string, Promise<{ identity: string; loopBackings: LoopBackingIdentity[] }>>;
+
+async function miningMountIdentity(record: MountRecord, cache: MountSafetyCache): Promise<{ identity: string; loopBackings: LoopBackingIdentity[] }> {
+  const base = mountIdentity(record);
+  let pending = cache.get(base);
+  if (pending === undefined) {
+    pending = protectedMountBacking(record);
+    cache.set(base, pending);
+  }
+  return await pending;
+}
+
+async function pathSafetySnapshot(input: string, records: MountRecord[], cache: MountSafetyCache = new Map()): Promise<PathSafetySnapshot> {
   const stable = await stableLstat(input);
   const metadata = stable.raw;
   if (metadata.isSymbolicLink() || (!metadata.isDirectory() && !metadata.isFile())) {
@@ -257,7 +270,7 @@ async function pathSafetySnapshot(input: string, records: MountRecord[]): Promis
     device: stable.device,
     inode: stable.inode,
     kind: metadata.isDirectory() ? "directory" : "file",
-    mount: mountIdentity(mounted),
+    mount: (await miningMountIdentity(mounted, cache)).identity,
   };
 }
 
@@ -266,10 +279,11 @@ async function inspectRuntimeInputRoots(
   recordChangedFileRoot: (snapshot: PathSafetySnapshot, error: unknown) => void,
 ): Promise<{ records: MountRecord[]; changedFileRoots: Set<string> }> {
   const records = await mounts();
+  const cache: MountSafetyCache = new Map();
   const changedFileRoots = new Set<string>();
   for (const snapshot of expected) {
     try {
-      const current = await pathSafetySnapshot(snapshot.path, records);
+      const current = await pathSafetySnapshot(snapshot.path, records, cache);
       if (
         current.device !== snapshot.device
         || current.inode !== snapshot.inode
@@ -296,7 +310,8 @@ async function assertPauseInputRootsCurrent(expected: PathSafetySnapshot[]): Pro
 
 async function outputSafetySnapshot(output: string, lockPath: string): Promise<OutputSafetySnapshot> {
   const records = await mounts();
-  const current = await pathSafetySnapshot(output, records);
+  const cache: MountSafetyCache = new Map();
+  const current = await pathSafetySnapshot(output, records, cache);
   if (current.kind !== "directory") throw new Error("mining output must remain a real directory");
   const mounted = mountForPathFrom(records, output);
   if (mounted === undefined || path.resolve(mounted.target) === output) {
@@ -308,7 +323,8 @@ async function outputSafetySnapshot(output: string, lockPath: string): Promise<O
   })) throw new Error("nested mounts inside the mining output are not allowed");
   const lock = await stableLstat(lockPath);
   if (lock.raw.isSymbolicLink() || !lock.raw.isFile()) throw new Error("mining output lock changed after acquisition");
-  return { ...current, kind: "directory", lockDevice: lock.device, lockInode: lock.inode };
+  return { ...current, kind: "directory", lockDevice: lock.device, lockInode: lock.inode,
+    loopBackings: (await miningMountIdentity(mounted, cache)).loopBackings };
 }
 
 async function assertOutputSafetyCurrent(expected: OutputSafetySnapshot, lockPath: string): Promise<void> {
@@ -341,9 +357,10 @@ async function assertOutputIdentityCurrent(expected: OutputSafetySnapshot, lockP
   ) throw new Error("mining output or exclusive lock changed after preflight");
 }
 
-async function assertRuntimeOutputCurrent(runtime: Pick<ScanRuntime, "outputSafety" | "lockPath" | "locks">): Promise<void> {
+async function assertRuntimeOutputCurrent(runtime: Pick<ScanRuntime, "outputSafety" | "lockPath" | "locks" | "policy">): Promise<void> {
   for (const lock of runtime.locks) await lock.assertHeld();
   await assertOutputSafetyCurrent(runtime.outputSafety, runtime.lockPath);
+  await assertLoopBackingCapacity(runtime.outputSafety.loopBackings, runtime.policy);
 }
 
 async function acquireMiningLocks(directory: string): Promise<ExclusiveLock[]> {
@@ -1054,6 +1071,7 @@ function inventoryCheckpoint(state: ScanState): NonNullable<SensitiveScanInvento
     inventoryComplete: state.inventoryComplete,
     semantic: { ...state.semantic, inputs: [...state.semantic.inputs] },
     inputRoots: state.inputRoots.map((root) => ({ ...root })),
+    ...(state.outputLoopBinding === undefined ? {} : { outputLoopBinding: state.outputLoopBinding }),
     manifest: { ...state.manifest },
     cursor: { ...state.cursor },
     progress: { ...state.progress },
@@ -1654,7 +1672,7 @@ async function runManifest(runtime: ScanRuntime): Promise<Record<string, unknown
   }
 }
 
-async function mountSetup(inputs: string[], outputParent: string): Promise<{
+async function mountSetup(inputs: string[], output: string): Promise<{
   inputSafety: PathSafetySnapshot[];
   isNetworkMount: (record: MountRecord) => Promise<boolean>;
 }> {
@@ -1670,15 +1688,22 @@ async function mountSetup(inputs: string[], outputParent: string): Promise<{
     return await result;
   };
   const inputSafety: PathSafetySnapshot[] = [];
+  const identityCache: MountSafetyCache = new Map();
   for (const inputRoot of inputs) {
     const inputMount = mountForPathFrom(mountSnapshot, inputRoot);
     if (inputMount === undefined) throw new Error("could not determine the mount backing a mining input");
     if (await isNetworkMount(inputMount)) throw new Error("network-mounted mining inputs are not allowed");
-    inputSafety.push(await pathSafetySnapshot(inputRoot, mountSnapshot));
+    inputSafety.push(await pathSafetySnapshot(inputRoot, mountSnapshot, identityCache));
   }
-  const outputMount = mountForPathFrom(mountSnapshot, outputParent);
+  const outputMount = mountForPathFrom(mountSnapshot, output);
   if (outputMount === undefined) throw new Error("could not determine the mount backing the mining output");
   assertSupportedOutputMount(outputMount);
+  const outputBacking = await miningMountIdentity(outputMount, identityCache);
+  assertSupportedLoopOutputBackings(outputBacking.loopBackings);
+  await assertLoopBackingsOutside(outputBacking.loopBackings, inputs, "mining input");
+  for (const pending of identityCache.values()) {
+    await assertLoopBackingsOutside((await pending).loopBackings, [output], "mining output");
+  }
   if (await isNetworkMount(outputMount)) throw new Error("network-mounted mining outputs are not allowed");
   return { inputSafety, isNetworkMount };
 }
@@ -1691,7 +1716,7 @@ export async function scanSensitiveMaterial(input: MiningOptions): Promise<Recor
   const policy = storagePolicyFromGiB(options.minimumFreeGiB, options.minimumFreePercent, options.maximumOutputGiB);
   const outputParent = await nearestExistingParent(options.output);
   await assertStorageCapacity(outputParent, policy);
-  const setup = await mountSetup(options.inputs, outputParent);
+  const setup = await mountSetup(options.inputs, options.output);
   const locks = await acquireMiningLocks(options.output);
   const lock = locks.find((candidate) => path.basename(candidate.path) === MINING_LOCK_FILENAME);
   if (lock === undefined) {
@@ -1702,10 +1727,12 @@ export async function scanSensitiveMaterial(input: MiningOptions): Promise<Recor
   try {
     await assertLockedFreshOutput(options.output);
     const outputSafety = await outputSafetySnapshot(options.output, lock.path);
+    await assertLoopBackingCapacity(outputSafety.loopBackings, policy);
     const assertSafeOutput = async (): Promise<void> => {
       for (const held of locks) await held.assertHeld();
       if (process.platform === "win32") await assertOutputIdentityCurrent(outputSafety, lock.path);
       else await assertOutputSafetyCurrent(outputSafety, lock.path);
+      await assertLoopBackingCapacity(outputSafety.loopBackings, policy);
     };
     // A fresh output contains only the operation locks at this point. Do not
     // let an already-aborted signal prevent creation of the clean, resumable
@@ -1742,7 +1769,7 @@ export async function scanSensitiveMaterial(input: MiningOptions): Promise<Recor
         filename: "inventory-sensitive.json",
         bytes: 0,
         sha256: "0".repeat(64),
-      }, progress, setup.inputSafety);
+      }, progress, setup.inputSafety, outputLoopBinding({ identity: outputSafety.mount, loopBackings: outputSafety.loopBackings }));
       state.inventoryComplete = false;
       if (reason !== undefined) return await finalizeInventoryPause(options, state, store, budget, progress, reason, metrics);
       store.recordError("<scan>", "input-inventory", failure);
@@ -1766,7 +1793,7 @@ export async function scanSensitiveMaterial(input: MiningOptions): Promise<Recor
       filename: "inventory-sensitive.json",
       bytes: 0,
       sha256: "0".repeat(64),
-    }, progress, setup.inputSafety);
+    }, progress, setup.inputSafety, outputLoopBinding({ identity: outputSafety.mount, loopBackings: outputSafety.loopBackings }));
     let pool: DetectorWorkerPool;
     try {
       const inventory = await store.checkpoint(progress, inventoryCheckpoint(state));
@@ -1856,7 +1883,10 @@ export async function resumeSensitiveMaterial(input: MiningResumeOptions): Promi
   if (metadata.isSymbolicLink() || !metadata.isDirectory() || await realpath(output) !== output) {
     throw new Error("resume output must be an existing canonical directory");
   }
-  assertSupportedOutputMount(await mountForPath(output));
+  const outputMount = await mountForPath(output);
+  if (outputMount === undefined) throw new Error("could not determine the mount backing the resume output");
+  assertSupportedOutputMount(outputMount);
+  assertSupportedLoopOutputBackings((await protectedMountBacking(outputMount)).loopBackings);
   const locks = await acquireMiningLocks(output);
   const lock = locks.find((candidate) => path.basename(candidate.path) === MINING_LOCK_FILENAME);
   if (lock === undefined) {
@@ -1873,10 +1903,15 @@ export async function resumeSensitiveMaterial(input: MiningResumeOptions): Promi
     const setup = await mountSetup(options.inputs, output);
     if (!sameRootSnapshots(setup.inputSafety, state.inputRoots)) throw new Error("input root identity or mount changed since the paused scan");
     const outputSafety = await outputSafetySnapshot(output, lock.path);
+    if (state.outputLoopBinding !== outputLoopBinding({ identity: outputSafety.mount, loopBackings: outputSafety.loopBackings })) {
+      throw new Error("output loop binding changed since the paused scan");
+    }
+    await assertLoopBackingCapacity(outputSafety.loopBackings, policy);
     const assertSafeOutput = async (): Promise<void> => {
       for (const held of locks) await held.assertHeld();
       if (process.platform === "win32") await assertOutputIdentityCurrent(outputSafety, lock.path);
       else await assertOutputSafetyCurrent(outputSafety, lock.path);
+      await assertLoopBackingCapacity(outputSafety.loopBackings, policy);
     };
     const budget = new StorageBudget(output, policy, await directoryLogicalBytes(output, options.signal));
     const inventory: SensitiveScanInventory = await loadResumeInventory(output, state.inventory, options.signal);

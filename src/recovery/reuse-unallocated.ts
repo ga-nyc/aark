@@ -3,7 +3,7 @@ import path from "node:path";
 import { isDeepStrictEqual } from "node:util";
 import { acquireExclusiveLock, assertNoSymlinkComponents, nearestExistingParent, readJson, stableLstat } from "../core/fs-safe.js";
 import type { ExclusiveLock, StableStat } from "../core/fs-safe.js";
-import { assertSupportedOutputMount, mountForPath, mountForPathFrom, mountIsNetworkBacked, mounts } from "../core/mounts.js";
+import { assertSupportedLoopOutputBackings, assertSupportedOutputMount, mountForPath, mountForPathFrom, mountIsNetworkBacked, mounts, protectedMountBacking, type LoopBackingIdentity } from "../core/mounts.js";
 import type { RecoveryConfig } from "./types.js";
 
 const LOCKS = [".aark-recovery.lock", ".agetnic-recovery.lock"] as const;
@@ -31,6 +31,27 @@ function sameFile(left: StableStat, right: StableStat): boolean {
     && right.raw.isFile() && right.raw.nlink === 1n;
 }
 
+interface CaseMountView {
+  path: string;
+  filesystemDevice: string;
+  mountTarget: string;
+  loopBackings: LoopBackingIdentity[];
+}
+
+export function assertSeparateCaseMountViews(source: CaseMountView, destination: CaseMountView): void {
+  if (destination.loopBackings.some(item => overlaps(source.path, item.backingFile))
+    || source.loopBackings.some(item => overlaps(destination.path, item.backingFile))) {
+    throw new Error("case paths must not contain the other case's loop backing files");
+  }
+  const sharedContainer = source.loopBackings.some(left => destination.loopBackings.some(right => (
+    left.fileDevice === right.fileDevice && left.fileInode === right.fileInode
+  )));
+  if ((source.filesystemDevice === destination.filesystemDevice || sharedContainer)
+    && path.resolve(source.mountTarget) !== path.resolve(destination.mountTarget)) {
+    throw new Error("separate mount views of the same filesystem cannot prove that the cases do not overlap");
+  }
+}
+
 async function validateRoot(config: RecoveryConfig): Promise<string> {
   if (process.platform !== "linux") throw new Error("reusing a recovery stream requires Linux");
   const root = config.unallocatedStreamFromCase;
@@ -53,12 +74,14 @@ async function validateRoot(config: RecoveryConfig): Promise<string> {
   const [sourceMetadata, destinationMetadata] = await Promise.all([
     lstat(root, { bigint: true }), lstat(destinationParent, { bigint: true }),
   ]);
+  const [sourceBacking, destinationBacking] = await Promise.all([
+    protectedMountBacking(mount), protectedMountBacking(destinationMount),
+  ]);
   // Bind mounts and repeated mounts can hide directory overlap from realpath.
   // Allow ordinary sibling cases, but require an unambiguous filesystem view.
-  if (sourceMetadata.dev === destinationMetadata.dev
-    && path.resolve(mount.target) !== path.resolve(destinationMount.target)) {
-    throw new Error("separate mount views of the same filesystem cannot prove that the cases do not overlap");
-  }
+  assertSeparateCaseMountViews({ path: root, filesystemDevice: sourceMetadata.dev.toString(), mountTarget: mount.target,
+    loopBackings: sourceBacking.loopBackings }, { path: config.destination, filesystemDevice: destinationMetadata.dev.toString(),
+    mountTarget: destinationMount.target, loopBackings: destinationBacking.loopBackings });
   return root;
 }
 
@@ -136,6 +159,7 @@ async function loadStream(config: RecoveryConfig, root: string, locks: Exclusive
   if (inputMount === undefined || await mountIsNetworkBacked(inputMount)) throw new Error("the reused stream must stay on a local mount");
   const rootIdentity = await lstat(root);
   const mountIdentity = JSON.stringify(inputMount);
+  const backingIdentity = (await protectedMountBacking(inputMount)).identity;
   const assertCurrent = async (): Promise<void> => {
     for (const lock of locks) await lock.assertHeld();
     await validateRoot(config);
@@ -151,8 +175,10 @@ async function loadStream(config: RecoveryConfig, root: string, locks: Exclusive
     }
     await assertNoSymlinkComponents(path.parse(root).root, input);
     const currentRoot = await lstat(root);
+    const currentMount = await mountForPath(input);
     if (currentRoot.dev !== rootIdentity.dev || currentRoot.ino !== rootIdentity.ino || !currentRoot.isDirectory()
-      || await realpath(root) !== root || JSON.stringify(await mountForPath(input)) !== mountIdentity
+      || await realpath(root) !== root || currentMount === undefined || JSON.stringify(currentMount) !== mountIdentity
+      || (await protectedMountBacking(currentMount)).identity !== backingIdentity
       || !sameFile(inputMetadata, await stableLstat(input))) {
       throw new Error("the reused stream, earlier case, or source mount changed");
     }
@@ -177,7 +203,10 @@ export async function assessReusedUnallocatedStream(config: RecoveryConfig): Pro
 export async function acquireReusedUnallocatedStream(config: RecoveryConfig): Promise<ReusedUnallocatedStream> {
   const root = await validateRoot(config);
   // These locks are writes, even though the reused recovery data is read-only.
-  assertSupportedOutputMount(await mountForPath(root));
+  const sourceMount = await mountForPath(root);
+  assertSupportedOutputMount(sourceMount);
+  if (sourceMount === undefined) throw new Error("the earlier recovery case lost its source mount");
+  assertSupportedLoopOutputBackings((await protectedMountBacking(sourceMount)).loopBackings);
   const locks: ExclusiveLock[] = [];
   try {
     for (const name of [...LOCKS].sort()) locks.push(await acquireExclusiveLock(root, name));

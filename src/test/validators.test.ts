@@ -131,9 +131,12 @@ test("PEM, DPAPI, CNG, and age validators require complete structures", () => {
   assert.equal(parseDpapiMasterKeyFile(masterKey.subarray(0, -1)), null);
 
   const ecdh = createECDH("prime256v1");
-  ecdh.generateKeys();
+  // Preserve the fixed CNG width even for a scalar with leading zero bytes.
+  const scalar = Buffer.alloc(32);
+  scalar[31] = 1;
+  ecdh.setPrivateKey(scalar);
   const point = ecdh.getPublicKey(undefined, "uncompressed");
-  const ecc = Buffer.concat([Buffer.from("ECS2"), u32(32), point.subarray(1, 33), point.subarray(33), ecdh.getPrivateKey()]);
+  const ecc = Buffer.concat([Buffer.from("ECS2"), u32(32), point.subarray(1, 33), point.subarray(33), scalar]);
   const parsed = parseCngPrivateBlob(ecc);
   assert.equal(parsed?.category, "cng-ecc-private-key");
   assert.equal(parsed?.confidence, "authenticated");

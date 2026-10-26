@@ -2,7 +2,7 @@ import { lstat, statfs } from "node:fs/promises";
 import path from "node:path";
 import { captureCommand, commandExists } from "../core/command.js";
 import { nearestExistingParent } from "../core/fs-safe.js";
-import { assertSupportedOutputMount, mountForPath } from "../core/mounts.js";
+import { assertLoopBackingCapacity, assertSupportedOutputMount, mountForPath, stableLoopBackingIdentity } from "../core/mounts.js";
 import { StorageQuotaError, storageCapacity, storagePolicyFromGiB } from "../core/storage.js";
 import type { StorageCapacity } from "../core/storage.js";
 import { inspectSourceSafety } from "./source-safety.js";
@@ -150,6 +150,7 @@ export async function assessRecoveryStorage(config: RecoveryConfig): Promise<Rec
   }
   if (!Number.isSafeInteger(source.bytes) || source.bytes < 0) throw new Error("source size cannot be represented safely");
   const policy = storagePolicyFromGiB(config.storage?.minFreeGiB, config.storage?.minFreePercent, config.storage?.maxOutputGiB);
+  await assertLoopBackingCapacity(source.destinationLoopBackings, policy);
   const sourceBytes = BigInt(source.bytes);
   // An explicitly different analysis view may have a different layout/size.
   // Do not silently apply the primary source's free-space map to that view.
@@ -160,6 +161,10 @@ export async function assessRecoveryStorage(config: RecoveryConfig): Promise<Rec
   if (current.resolvedSource !== source.resolvedSource || current.bytes !== source.bytes
     || JSON.stringify(current.regularFileIdentity) !== JSON.stringify(source.regularFileIdentity)
     || JSON.stringify(current.blockDeviceIdentity) !== JSON.stringify(source.blockDeviceIdentity)
+    || stableLoopBackingIdentity(current.destinationLoopBackings) !== stableLoopBackingIdentity(source.destinationLoopBackings)
+    || (source.kind === "block-device"
+      ? JSON.stringify(current.sourceLoopBackings) !== JSON.stringify(source.sourceLoopBackings)
+      : stableLoopBackingIdentity(current.sourceLoopBackings) !== stableLoopBackingIdentity(source.sourceLoopBackings))
     || current.kernelReadOnly !== source.kernelReadOnly || current.destinationFilesystemDevice !== source.destinationFilesystemDevice
     || current.destinationBackingKind !== source.destinationBackingKind
     || (current.kind === "block-device" && (!current.deviceComparisonCertain
