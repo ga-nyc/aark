@@ -22,7 +22,7 @@ import {
   walkRegularFiles,
 } from "./core/fs-safe.js";
 import type { ExclusiveLock, FilesystemIdentity, StableStat, WalkedFile } from "./core/fs-safe.js";
-import { filesystemIsNetwork, mountForPathFrom, mountIsNetworkBacked, mounts, protectedMountBacking } from "./core/mounts.js";
+import { assertLoopBackingsOutside, filesystemIsNetwork, mountForPathFrom, mountIsNetworkBacked, mounts, outputLoopBinding, protectedMountBacking } from "./core/mounts.js";
 import type { MountRecord } from "./core/mounts.js";
 import {
   loadCompletedInventory,
@@ -647,6 +647,7 @@ function checkpointForState(state: ScanState): NonNullable<SensitiveScanInventor
     inventoryComplete: state.inventoryComplete,
     semantic: { ...state.semantic, inputs: [...state.semantic.inputs] },
     inputRoots: state.inputRoots.map((root) => ({ ...root })),
+    ...(state.outputLoopBinding === undefined ? {} : { outputLoopBinding: state.outputLoopBinding }),
     manifest: { ...state.manifest },
     cursor: { ...state.cursor },
     progress: { ...state.progress },
@@ -849,6 +850,10 @@ async function verifyMiningOutput(
     "final-report-redacted.md",
   ]) await assertRegularControlFile(root.path, filename);
   const state = await loadScanState(root.path, signal);
+  const currentMount = mountForPathFrom(await mounts(), root.path);
+  if (currentMount === undefined || state.outputLoopBinding !== outputLoopBinding(await protectedMountBacking(currentMount))) {
+    throw new Error("completed mining output loop binding changed after scanning");
+  }
   const inventory = await loadCompletedInventory(root.path, state.inventory, signal);
   assertCompletedInventoryMatchesState(inventory, state);
   await verifyResumeArtifacts(root.path, inventory, signal);
@@ -1140,6 +1145,12 @@ async function buildInternalPlan(options: CleanupOptions, heldLocks?: ExclusiveL
   const miningRoots: RootSnapshot[] = [];
   for (const output of normalized.miningOutputs) {
     miningRoots.push(await rootSnapshot(output, records, networkCache, "mining output"));
+  }
+  const deletionPaths = ["recovery", "evidence", "logs", "runs"].map(name => safeJoin(caseRoot.path, name));
+  for (const root of [caseRoot, ...miningRoots]) {
+    const mounted = mountForPathFrom(records, root.path);
+    if (mounted === undefined) throw new Error("a protected cleanup directory lost its mount");
+    await assertLoopBackingsOutside((await protectedMountBacking(mounted)).loopBackings, deletionPaths, "cleanup deletion target");
   }
   for (const root of miningRoots) {
     if (inside(retainedSourceBasePath, root.path) || inside(root.path, retainedSourceBasePath)) {

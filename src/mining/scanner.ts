@@ -7,7 +7,7 @@ import { PROGRESS_FILENAME } from "../core/progress.js";
 import type { Candidate } from "../core/types.js";
 import { acquireExclusiveLock, nearestExistingParent, readDirectoryNamesBounded, stableHandleStat, stableLstat, walkRegularFiles } from "../core/fs-safe.js";
 import type { ExclusiveLock, FilesystemIdentity, StableStat, WalkedFile } from "../core/fs-safe.js";
-import { assertLoopBackingCapacity, assertSupportedLoopOutputBackings, assertSupportedOutputMount, filesystemIsNetwork, mountForPath, mountForPathFrom, mountIsNetworkBacked, mounts, protectedMountBacking } from "../core/mounts.js";
+import { assertLoopBackingCapacity, assertLoopBackingsOutside, assertSupportedLoopOutputBackings, assertSupportedOutputMount, filesystemIsNetwork, mountForPath, mountForPathFrom, mountIsNetworkBacked, mounts, outputLoopBinding, protectedMountBacking } from "../core/mounts.js";
 import type { LoopBackingIdentity, MountRecord } from "../core/mounts.js";
 import {
   assertStorageCapacity,
@@ -1071,6 +1071,7 @@ function inventoryCheckpoint(state: ScanState): NonNullable<SensitiveScanInvento
     inventoryComplete: state.inventoryComplete,
     semantic: { ...state.semantic, inputs: [...state.semantic.inputs] },
     inputRoots: state.inputRoots.map((root) => ({ ...root })),
+    ...(state.outputLoopBinding === undefined ? {} : { outputLoopBinding: state.outputLoopBinding }),
     manifest: { ...state.manifest },
     cursor: { ...state.cursor },
     progress: { ...state.progress },
@@ -1671,7 +1672,7 @@ async function runManifest(runtime: ScanRuntime): Promise<Record<string, unknown
   }
 }
 
-async function mountSetup(inputs: string[], outputParent: string): Promise<{
+async function mountSetup(inputs: string[], output: string): Promise<{
   inputSafety: PathSafetySnapshot[];
   isNetworkMount: (record: MountRecord) => Promise<boolean>;
 }> {
@@ -1694,10 +1695,15 @@ async function mountSetup(inputs: string[], outputParent: string): Promise<{
     if (await isNetworkMount(inputMount)) throw new Error("network-mounted mining inputs are not allowed");
     inputSafety.push(await pathSafetySnapshot(inputRoot, mountSnapshot, identityCache));
   }
-  const outputMount = mountForPathFrom(mountSnapshot, outputParent);
+  const outputMount = mountForPathFrom(mountSnapshot, output);
   if (outputMount === undefined) throw new Error("could not determine the mount backing the mining output");
   assertSupportedOutputMount(outputMount);
-  assertSupportedLoopOutputBackings((await miningMountIdentity(outputMount, identityCache)).loopBackings);
+  const outputBacking = await miningMountIdentity(outputMount, identityCache);
+  assertSupportedLoopOutputBackings(outputBacking.loopBackings);
+  await assertLoopBackingsOutside(outputBacking.loopBackings, inputs, "mining input");
+  for (const pending of identityCache.values()) {
+    await assertLoopBackingsOutside((await pending).loopBackings, [output], "mining output");
+  }
   if (await isNetworkMount(outputMount)) throw new Error("network-mounted mining outputs are not allowed");
   return { inputSafety, isNetworkMount };
 }
@@ -1710,7 +1716,7 @@ export async function scanSensitiveMaterial(input: MiningOptions): Promise<Recor
   const policy = storagePolicyFromGiB(options.minimumFreeGiB, options.minimumFreePercent, options.maximumOutputGiB);
   const outputParent = await nearestExistingParent(options.output);
   await assertStorageCapacity(outputParent, policy);
-  const setup = await mountSetup(options.inputs, outputParent);
+  const setup = await mountSetup(options.inputs, options.output);
   const locks = await acquireMiningLocks(options.output);
   const lock = locks.find((candidate) => path.basename(candidate.path) === MINING_LOCK_FILENAME);
   if (lock === undefined) {
@@ -1763,7 +1769,7 @@ export async function scanSensitiveMaterial(input: MiningOptions): Promise<Recor
         filename: "inventory-sensitive.json",
         bytes: 0,
         sha256: "0".repeat(64),
-      }, progress, setup.inputSafety);
+      }, progress, setup.inputSafety, outputLoopBinding({ identity: outputSafety.mount, loopBackings: outputSafety.loopBackings }));
       state.inventoryComplete = false;
       if (reason !== undefined) return await finalizeInventoryPause(options, state, store, budget, progress, reason, metrics);
       store.recordError("<scan>", "input-inventory", failure);
@@ -1787,7 +1793,7 @@ export async function scanSensitiveMaterial(input: MiningOptions): Promise<Recor
       filename: "inventory-sensitive.json",
       bytes: 0,
       sha256: "0".repeat(64),
-    }, progress, setup.inputSafety);
+    }, progress, setup.inputSafety, outputLoopBinding({ identity: outputSafety.mount, loopBackings: outputSafety.loopBackings }));
     let pool: DetectorWorkerPool;
     try {
       const inventory = await store.checkpoint(progress, inventoryCheckpoint(state));
@@ -1877,7 +1883,10 @@ export async function resumeSensitiveMaterial(input: MiningResumeOptions): Promi
   if (metadata.isSymbolicLink() || !metadata.isDirectory() || await realpath(output) !== output) {
     throw new Error("resume output must be an existing canonical directory");
   }
-  assertSupportedOutputMount(await mountForPath(output));
+  const outputMount = await mountForPath(output);
+  if (outputMount === undefined) throw new Error("could not determine the mount backing the resume output");
+  assertSupportedOutputMount(outputMount);
+  assertSupportedLoopOutputBackings((await protectedMountBacking(outputMount)).loopBackings);
   const locks = await acquireMiningLocks(output);
   const lock = locks.find((candidate) => path.basename(candidate.path) === MINING_LOCK_FILENAME);
   if (lock === undefined) {
@@ -1894,6 +1903,9 @@ export async function resumeSensitiveMaterial(input: MiningResumeOptions): Promi
     const setup = await mountSetup(options.inputs, output);
     if (!sameRootSnapshots(setup.inputSafety, state.inputRoots)) throw new Error("input root identity or mount changed since the paused scan");
     const outputSafety = await outputSafetySnapshot(output, lock.path);
+    if (state.outputLoopBinding !== outputLoopBinding({ identity: outputSafety.mount, loopBackings: outputSafety.loopBackings })) {
+      throw new Error("output loop binding changed since the paused scan");
+    }
     await assertLoopBackingCapacity(outputSafety.loopBackings, policy);
     const assertSafeOutput = async (): Promise<void> => {
       for (const held of locks) await held.assertHeld();

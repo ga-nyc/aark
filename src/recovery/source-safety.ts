@@ -3,7 +3,7 @@ import { access, realpath, stat } from "node:fs/promises";
 import path from "node:path";
 import { captureCommand } from "../core/command.js";
 import { nearestExistingParent } from "../core/fs-safe.js";
-import { blockTransportIsNetwork, filesystemIsNetwork, mountForPath, mountIsNetworkBacked, mountIsReadOnly, resolveBlockBacking, type LoopBackingIdentity } from "../core/mounts.js";
+import { assertLoopBackingsOutside, blockTransportIsNetwork, filesystemIsNetwork, mountForPath, mountIsNetworkBacked, mountIsReadOnly, resolveBlockBacking, type LoopBackingIdentity } from "../core/mounts.js";
 
 interface LsblkNode {
   path?: string;
@@ -138,6 +138,8 @@ export async function inspectSourceSafety(source: string, destination: string): 
   }
 
   const destinationInfo = await destinationBacking(destination);
+  if (metadata.isFile()) await assertLoopBackingsOutside(destinationInfo.loopBackings, [resolvedSource], "recovery source image");
+  await assertLoopBackingsOutside(sourceLoopBackings, [destination], "recovery destination");
   const destinationDevices = destinationInfo.devices;
   const deviceComparisonCertain = destinationInfo.kind === "local-non-block"
     || (sourceTopDevices.length > 0 && destinationInfo.kind === "block-device" && destinationDevices.length > 0);

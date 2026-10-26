@@ -109,6 +109,7 @@ export interface SensitiveScanInventory {
       cryptoOnly?: boolean;
     };
     inputRoots: Array<{ path: string; device: FilesystemIdentity; inode: FilesystemIdentity; kind: "file" | "directory"; mount: string }>;
+    outputLoopBinding?: string;
     manifest: { filename: string; entries: number; bytes: number; sha256: string };
     cursor: { fileIndex: number; phase: "stream" | "whole-file"; nextOffset: number };
     progress: MiningProgress;

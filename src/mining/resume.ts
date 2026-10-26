@@ -106,6 +106,7 @@ export interface ScanState {
   semantic: ScanSemanticOptions;
   operational: ScanOperationalOptions;
   inputRoots: Array<{ path: string; device: FilesystemIdentity; inode: FilesystemIdentity; kind: "file" | "directory"; mount: string }>;
+  outputLoopBinding?: string;
   manifest: { filename: typeof SCAN_FILES_FILENAME; entries: number; bytes: number; sha256: string };
   inventory: { filename: "inventory-sensitive.json"; bytes: number; sha256: string };
   cursor: ScanCursor;
@@ -586,6 +587,7 @@ export async function loadScanState(output: string, signal?: AbortSignal): Promi
     || inventory.filename !== "inventory-sensitive.json"
     || !nonNegativeSafe(inventory.bytes)
     || !hash(inventory.sha256)
+    || (stateRecord.outputLoopBinding !== undefined && !hash(stateRecord.outputLoopBinding))
     || !nonNegativeSafe(cursor.fileIndex)
     || Number(cursor.fileIndex) > Number(manifest.entries)
     || !["stream", "whole-file"].includes(String(cursor.phase))
@@ -682,6 +684,7 @@ async function loadMiningInventory(
     || !isBoundedJsonValue(checkpointSemantic)
     || !Array.isArray(checkpoint.inputRoots)
     || !isBoundedJsonValue(checkpoint.inputRoots)
+    || (checkpoint.outputLoopBinding !== undefined && !hash(checkpoint.outputLoopBinding))
     || checkpointManifest.filename !== SCAN_FILES_FILENAME
     || !nonNegativeSafe(checkpointManifest.entries)
     || !nonNegativeSafe(checkpointManifest.bytes)
@@ -847,6 +850,7 @@ export function newScanState(
   inventory: ScanState["inventory"],
   progress: MiningProgress,
   inputRoots: ScanState["inputRoots"],
+  outputLoopBinding?: string,
 ): ScanState {
   const now = new Date().toISOString();
   return {
@@ -862,6 +866,7 @@ export function newScanState(
     semantic,
     operational,
     inputRoots,
+    ...(outputLoopBinding === undefined ? {} : { outputLoopBinding }),
     manifest,
     inventory,
     cursor: { fileIndex: 0, phase: "stream", nextOffset: 0 },

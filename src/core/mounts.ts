@@ -1,5 +1,6 @@
 import fs, { stat } from "node:fs/promises";
 import { constants } from "node:fs";
+import { createHash } from "node:crypto";
 import path from "node:path";
 import { captureCommand, WINDOWS_MOUNTVOL } from "./command.js";
 import { assertStorageCapacity, type StoragePolicy } from "./storage.js";
@@ -367,6 +368,43 @@ export function stableLoopBackingIdentity(backings: LoopBackingIdentity[]): stri
   return JSON.stringify(backings.map(({ modifiedNs: _modified, changedNs: _changed, ...identity }) => identity));
 }
 
+/** Bind output containers across checkpoints without changing direct-mount controls. */
+export function outputLoopBinding(backing: { identity: string; loopBackings: LoopBackingIdentity[] }): string | undefined {
+  return backing.loopBackings.length === 0 ? undefined : createHash("sha256").update(backing.identity).digest("hex");
+}
+
+/** A result must not write into its source image or depend on a deleted container. */
+export async function assertLoopBackingsOutside(backings: LoopBackingIdentity[], protectedPaths: string[], label: string): Promise<void> {
+  if (backings.length === 0) return;
+  const protectedIdentities = new Set<string>();
+  for (const filename of protectedPaths) {
+    try {
+      const metadata = await fs.lstat(filename, { bigint: true });
+      protectedIdentities.add(`${metadata.dev}:${metadata.ino}`);
+    } catch (error) {
+      // Fixed cleanup targets may not exist; no live container can be inside
+      // an absent directory. Other filesystem errors must still fail closed.
+      if (!(error instanceof Error && "code" in error && error.code === "ENOENT")) throw error;
+    }
+  }
+  if (protectedIdentities.size === 0) return;
+  for (const backing of backings) {
+    let cursor = backing.backingFile;
+    let depth = 0;
+    while (true) {
+      if (++depth > 256) throw new Error("loop backing ancestry exceeded its bounded safety limit");
+      const metadata = await fs.lstat(cursor, { bigint: true });
+      if (metadata.isSymbolicLink()) throw new Error("loop backing ancestry changed to a symbolic link");
+      if (protectedIdentities.has(`${metadata.dev}:${metadata.ino}`)) {
+        throw new Error(`${label} must not contain or alias a required loop backing file`);
+      }
+      const parent = path.dirname(cursor);
+      if (parent === cursor) break;
+      cursor = parent;
+    }
+  }
+}
+
 /** Preserve legacy identities for direct mounts; bind file-backed mount layers. */
 export async function protectedMountBacking(record: MountRecord): Promise<{ identity: string; loopBackings: LoopBackingIdentity[] }> {
   if (record.options.includes("windows-inaccessible") || filesystemIsNetwork(record)) {
@@ -378,7 +416,7 @@ export async function protectedMountBacking(record: MountRecord): Promise<{ iden
   const backing = await resolveBlockBacking(record.source.replace(/\[[^\]]*\]$/, ""));
   if (backing.networkBacked) throw new Error("protected path moved to a network block transport");
   return { identity: backing.loopBackings.length === 0 ? base : JSON.stringify({ mount: base,
-    loopBackings: stableLoopBackingIdentity(backing.loopBackings) }), loopBackings: backing.loopBackings };
+    loopBackings: createHash("sha256").update(stableLoopBackingIdentity(backing.loopBackings)).digest("hex") }), loopBackings: backing.loopBackings };
 }
 
 export async function assertLoopBackingCapacity(backings: LoopBackingIdentity[], policy: StoragePolicy): Promise<void> {

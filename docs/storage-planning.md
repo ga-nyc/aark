@@ -63,6 +63,10 @@ fails the independence check.
 An ext4 workspace also cannot hide an unsupported NTFS3 host from output-driver
 checks. Carving follow-ups reject shared container views and backing files
 stored inside the other case.
+An image being recovered or mined must not itself back the output workspace;
+mining directory inputs must also exclude output containers. Cleanup refuses
+to remove any container required by the case or a retained mining result,
+including containers reached through another mount view of a directory.
 
 Recovery and mining enforce the configured free-space reserve on the mounted
 workspace and on every filesystem hosting its loop backing files. The case's
@@ -70,6 +74,8 @@ logical output cap applies to case outputs, not to container sizes. Binding
 checks continue during execution and are frozen into mining resume controls and
 cleanup approval tokens. Output writes may change backing-file timestamps;
 replacement, resizing, re-offsetting, or remounting invalidates the binding.
+The output binding is integrity-linked to both mining checkpoint documents,
+even when every input is on a direct mount, and is checked again for cleanup.
 
 AARK does not create, format, resize, or mount workspace containers. Prepare a
 new dedicated file on the authorized destination with enough host headroom,
