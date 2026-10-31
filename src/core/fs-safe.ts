@@ -303,6 +303,17 @@ export async function acquireExclusiveLock(directory: string, filename: string):
 }
 
 export async function atomicWriteFile(destination: string, data: Uint8Array | string, mode = 0o600): Promise<void> {
+  await publishAtomicFile(destination, data, mode, true);
+}
+
+/** Informational snapshots only: atomic replacement, without crash durability.
+ * Never use for artifacts, locks, checkpoints, manifests, or authoritative state.
+ */
+export async function atomicWriteInformationalFile(destination: string, data: string, mode = 0o644): Promise<void> {
+  await publishAtomicFile(destination, data, mode, false);
+}
+
+async function publishAtomicFile(destination: string, data: Uint8Array | string, mode: number, durable: boolean): Promise<void> {
   const parent = path.dirname(destination);
   await ensurePrivateDirectory(parent);
   await assertNoSymlinkComponents(parent, destination);
@@ -354,7 +365,7 @@ export async function atomicWriteFile(destination: string, data: Uint8Array | st
       if (!unsupportedModeOperation(error)) throw error;
       // Non-Unix destination filesystems may not implement chmod; the manifest warns about mode enforcement.
     }
-    await handle.sync();
+    if (durable) await handle.sync();
     const currentTemporary = await stableLstat(temporary);
     if (
       currentTemporary.raw.isSymbolicLink()
@@ -386,7 +397,7 @@ export async function atomicWriteFile(destination: string, data: Uint8Array | st
       await handle?.close();
       handle = undefined;
     }
-    await syncDirectory(parent);
+    if (durable) await syncDirectory(parent);
   } finally {
     await handle?.close().catch(() => undefined);
     if (!renamed && identity !== undefined) {

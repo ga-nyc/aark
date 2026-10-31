@@ -191,7 +191,13 @@ and the next-stage forecast. On Linux, engine-process read/write counters and CP
 ticks show observed activity between samples. Descendant work is not included;
 unavailable counters remain null. Process liveness and activity are not a
 completion percentage or proof that the engine will finish. Progress writes run
-independently of case-size accounting and use the existing protected case writer.
+independently of case-size accounting. Running snapshots retain protected atomic
+replacement and directory, mount, and lock checks, but do not request file or
+directory fsync. NTFS-3G turns those calls into full-device synchronization,
+which can block bulk carving behind an informational status write. Running
+snapshots may therefore be stale or absent after a crash; they are not resume
+checkpoints. Authoritative case state, checkpoints, artifacts, manifests, reports,
+and terminal progress snapshots retain durable publication.
 Terminal quota snapshots retain the redacted storage-stop reason and byte counts;
 paused mining snapshots retain whether the cause was a signal, reserve, or cap.
 
@@ -204,6 +210,16 @@ file/byte counts, findings, errors, and output headroom. A long detector operati
 may leave the last committed snapshot unchanged; an old timestamp alone does not
 prove a kernel or process stall. These small control files are charged to the
 normal output budget and use the existing reserved-space terminal-report path.
+Running mining progress follows the same atomic-only publication policy;
+terminal snapshots remain durable.
+
+After building, `node scripts/benchmark-progress.mjs /absolute/scratch` compares
+the previous durable running publications with informational atomic publications
+under an identical synthetic many-file workload. Add `--reverse` to check order
+effects. It creates and retains fresh synthetic subdirectories, requires 256 MiB
+free, prints aggregate timings and sync counts, and includes a durable terminal
+write for both variants. Use a separate scratch filesystem while recovery runs;
+do not infer a real-case ETA or whole-workflow speedup from this small benchmark.
 
 If the destination or lock becomes untrustworthy, AARK refuses further progress
 writes along with its other protected output. Preserve all partial results and
