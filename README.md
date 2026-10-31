@@ -68,6 +68,11 @@ The legacy `agetnic` and `agetnic-tools` executable names remain available as co
 
 ## Quick start
 
+For a reviewed sequence that automatically reaches verified and packaged final
+results, use [`aark workflow`](docs/workflows.md). It drives recovery, mining,
+verification, and local results packaging in one invocation, with native pause
+checkpoints and separate cleanup approval.
+
 An authorized person or agent can run the complete workflow. First inventory the machine without changing anything:
 
 ```bash

@@ -1,0 +1,17 @@
+{
+  "version": 1,
+  "execute": false,
+  "output": "/mnt/results/workflow-001",
+  "recoveryConfig": "/mnt/separate-recovery-disk/recovery-case.json",
+  "scans": [
+    {
+      "inputs": ["/mnt/separate-recovery-disk/old-drive-001/recovery/carved"],
+      "provenance": "unallocated-carve"
+    }
+  ],
+  "mining": {
+    "workers": 4,
+    "storage": {"minFreeGiB": 5, "minFreePercent": 5}
+  },
+  "finalizationStorage": {"minFreeGiB": 5, "minFreePercent": 5}
+}

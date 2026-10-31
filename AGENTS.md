@@ -18,6 +18,17 @@ Deletion is intentionally outside that standing authorization. Even if the origi
 
 ## Safe delegated workflow
 
+Use [`aark workflow`](docs/workflows.md) when the authorized recovery and scan
+selection are known up front. It drives the complete success path through
+verification, deduplication, and local results packaging without requiring a
+later agent turn. Review `workflow plan`, require its configuration and CLI
+execution confirmations, monitor `workflow status`, and resume only an explicit
+clean pause. Treat finalization as part of completion; do not stop supervision
+at a successful recovery or scan. Cleanup still requires the separate approval
+steps below. Failed-case harvesting remains the deferred WFL-001 scope.
+For unattended work, use a persistent local process host rather than relying on
+a later agent turn; preserve explicit pauses and failures without blind restarts.
+
 1. Run `aark recover inventory --json` and identify the exact source and a destination on a different physical device.
 2. Create the strict case JSON. Keep `requireReadOnlySource: true`; set a storage policy explicitly when the defaults are not appropriate.
 3. Run `aark recover assess --config <case.json>`, then `aark recover plan --config <case.json>` and verify that every command, source, destination, and enabled stage stays inside the authorization. Assessment counts only known bulk minimums: unknown output sizes and physical allocation overhead require headroom; `knownMinimumFits` is not a promise that the whole workflow fits. See [storage assessment and progress](docs/storage-planning.md).
