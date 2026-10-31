@@ -2,6 +2,11 @@
 
 ## WFL-001: scan completed outputs after a later recovery failure
 
+The native `workflow` supervisor now automates successful recovery and selected
+scans through verified final results. This item remains deferred for failed or
+interrupted recovery and explicitly selected partial outputs; the success-path
+supervisor does not implement or weaken these gates.
+
 Status: deferred follow-up. Storage assessment, next-stage capacity checks, and
 redacted progress reporting should land first.
 

@@ -12,6 +12,8 @@ import { resumeSensitiveMaterial, scanSensitiveMaterial } from "./mining/scanner
 import { readValidatedRevealArtifact } from "./mining/reveal.js";
 import { planCleanup, runCleanup } from "./cleanup.js";
 import type { Provenance } from "./core/types.js";
+import { loadWorkflowConfig } from "./workflow/config.js";
+import { resumeWorkflow, runWorkflow, workflowPlan, workflowStatus } from "./workflow/runner.js";
 
 const VERSION = "0.1.0";
 const PROVENANCE: Provenance[] = [
@@ -88,6 +90,38 @@ program.command("doctor")
       }
     }
   });
+
+const workflow = program.command("workflow").description("Run reviewed local recovery and scans through verified final results");
+
+workflow.command("plan")
+  .requiredOption("-c, --config <path>", "workflow configuration JSON")
+  .action(async (options: {config: string}) => json(workflowPlan(await loadWorkflowConfig(options.config))));
+
+for (const mode of ["run", "resume"] as const) {
+  const command = workflow.command(mode)
+    .option("--execute", "confirm the reviewed workflow execution", false)
+    .option("--quiet", "suppress aggregate workflow progress", false);
+  if (mode === "run") command.requiredOption("-c, --config <path>", "workflow configuration JSON");
+  else command.requiredOption("-o, --output <directory>", "explicitly paused workflow directory");
+  command.action(async (options: {config: string; output: string; execute: boolean; quiet: boolean}) => {
+    const controller = new AbortController();
+    const interrupt = (): void => controller.abort();
+    process.on("SIGINT", interrupt); process.on("SIGTERM", interrupt);
+    try {
+      const execution = {execute: options.execute, signal: controller.signal,
+        ...(options.quiet ? {} : {progress: (snapshot: Record<string, unknown>) => { process.stderr.write(`workflow=${JSON.stringify(snapshot)}\n`); }})};
+      const result = mode === "run" ? await runWorkflow(options.config, execution) : await resumeWorkflow(options.output, execution);
+      json(result);
+      if (result.status === "paused") process.exitCode = 75;
+    } finally {
+      process.removeListener("SIGINT", interrupt); process.removeListener("SIGTERM", interrupt);
+    }
+  });
+}
+
+workflow.command("status")
+  .requiredOption("-o, --output <directory>", "workflow directory")
+  .action(async (options: {output: string}) => json(await workflowStatus(options.output)));
 
 const recover = program.command("recover").description("Plan and run read-only disk-recovery workflows");
 
