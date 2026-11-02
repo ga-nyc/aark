@@ -13,6 +13,15 @@ import { recoveryStepStatus, redactedPlan, redactedStorageStop, runRecoveryPlan 
 import { PROGRESS_FILENAME, readProgress } from "../core/progress.js";
 import { StorageQuotaError } from "../core/storage.js";
 import type { SourceSafety } from "../recovery/source-safety.js";
+import { selectSourceDevice } from "../recovery/source-safety.js";
+
+test("source safety selects an exact kernel identity for mapper aliases", () => {
+  const node = {path: "/dev/mapper/synthetic-volume", kname: "/dev/dm-7", ro: true};
+  assert.equal(selectSourceDevice([node], "/dev/dm-7"), node);
+  assert.equal(selectSourceDevice([node], "/dev/mapper/synthetic-volume"), node);
+  assert.equal(selectSourceDevice([node], "/dev/dm-8"), undefined);
+  assert.equal(selectSourceDevice([{path: "/dev/sda"}], "/dev/sda")?.path, "/dev/sda");
+});
 import type { RecoveryConfig } from "../recovery/types.js";
 
 function config(): RecoveryConfig {

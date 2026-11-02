@@ -32,6 +32,22 @@ code 75 as a pause and must not restart failed or interrupted work automatically
 The native workflow drives every configured success stage itself; it does not
 depend on scheduling another agent turn after a child stage exits.
 
+The process host must also provide a user-visible failure notification. An exit
+code in a log is not a notification. On Linux, configure systemd `OnFailure=`
+with a local desktop notification service, retain a durable redacted event, and
+watch the host independently for unexpected exits. Treat exit 75 as a pause
+requiring attention, not as success. Test notification delivery before starting
+long work, including a failure before the workflow output directory exists.
+Desktop delivery does not imply that a person acknowledged the event. A remote
+notification channel requires explicit authorization and must carry only fixed
+redacted status, never evidence, recovered values, or source paths.
+
+Workflow terminal snapshots and `workflow status` include a fixed `failureCode`
+for recognized failures. Unknown exceptions use `unclassified-failure`; their
+messages are never copied into redacted status. Failed workflows remain failed
+and cannot be resumed as though they were clean pauses. A reviewed correction
+requires a fresh output. Preserve prior outputs and do not change their seals.
+
 Execution retains the existing recovery confirmations, read-only source and
 independent-destination checks, local mount and loop-backing validation, mining
 worker limits, and native checkpoints. Recovery remains Linux-only; mining-only
