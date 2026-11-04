@@ -137,6 +137,7 @@ test("a later scan failure retains earlier outputs and reports workflow failure"
   assert.equal(status.status, "failed");
   assert.equal(status.scansCompleted, 1);
   assert.equal(status.resumable, false);
+  assert.equal(status.failureCode, "unclassified-failure");
   await access(path.join(f.output, "mining", "scan-000001", "inventory-sensitive.json"));
   await assert.rejects(access(path.join(f.output, "manifest-redacted.json")));
 });
@@ -155,13 +156,14 @@ test("workflow CLI completes the whole sequence and status filters injected fiel
   assert.equal(run.stdout.includes(Buffer.from(f.root)), false);
   await writeFile(path.join(f.output, "progress-redacted.json"), JSON.stringify({version: 1, tool: "aark", layer: "workflow",
     status: "running", sourcePathsRedacted: true, phase: "packaging", processId: 2147483647, scansCompleted: 1,
-    summary: {source: f.root, value: f.value}, phaseName: f.value, failureClass: f.value}));
+    summary: {source: f.root, value: f.value}, phaseName: f.value, failureClass: f.value, failureCode: f.value}));
   const status = await captureCommand(process.execPath, [cli, "workflow", "status", "--output", f.output]);
   assert.equal(status.exitCode, 0);
   assert.equal(JSON.parse(status.stdout.toString()).processObserved, false);
   assert.equal(JSON.parse(status.stdout.toString()).needsReview, true);
   assert.equal(status.stdout.includes(Buffer.from(f.value)), false);
   assert.equal(status.stdout.includes(Buffer.from(f.root)), false);
+  assert.equal(JSON.parse(status.stdout.toString()).failureCode, undefined);
   await assert.rejects(resumeWorkflow(f.output, {execute: true}), /explicitly paused/);
 });
 

@@ -7,6 +7,7 @@ import { assertLoopBackingsOutside, blockTransportIsNetwork, filesystemIsNetwork
 
 interface LsblkNode {
   path?: string;
+  kname?: string;
   type?: string;
   ro?: boolean | number;
   size?: number | string;
@@ -42,6 +43,12 @@ export interface SourceSafety {
 
 function flatten(nodes: LsblkNode[]): LsblkNode[] {
   return nodes.flatMap((node) => [node, ...flatten(node.children ?? [])]);
+}
+
+// PATH is the friendly mapper alias even when lsblk was passed /dev/dm-N.
+// --paths makes KNAME the exact kernel path resolved from the requested source.
+export function selectSourceDevice(nodes: LsblkNode[], resolvedSource: string): LsblkNode | undefined {
+  return nodes.find(node => node.path === resolvedSource || node.kname === resolvedSource);
 }
 
 export function blockDeviceIsNetworkBacked(device: string, transport?: string | null, subsystems?: string | null): boolean {
@@ -98,7 +105,7 @@ export async function inspectSourceSafety(source: string, destination: string): 
   if (metadata.isBlockDevice()) {
     const result = await captureCommand(
       "lsblk",
-      ["--json", "--bytes", "--output", "PATH,TYPE,RO,SIZE,FSTYPE,MOUNTPOINTS", resolvedSource],
+      ["--json", "--bytes", "--paths", "--output", "PATH,KNAME,TYPE,RO,SIZE,FSTYPE,MOUNTPOINTS", resolvedSource],
       { maxCaptureBytes: 1024 * 1024, timeoutMs: 30_000 },
     );
     if (result.exitCode !== 0) throw new Error("lsblk could not inspect the source device");
@@ -110,7 +117,7 @@ export async function inspectSourceSafety(source: string, destination: string): 
       throw new Error("lsblk returned invalid JSON while inspecting the source", { cause: error });
     }
     const nodes = flatten(document.blockdevices ?? []);
-    const selected = nodes.find((node) => node.path === resolvedSource);
+    const selected = selectSourceDevice(nodes, resolvedSource);
     if (selected === undefined) throw new Error("lsblk did not return the requested source device");
     kernelReadOnly = selected?.ro === true || selected?.ro === 1;
     const selectedBytes = typeof selected.size === "string" ? Number(selected.size) : selected.size;

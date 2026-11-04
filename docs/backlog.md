@@ -1,5 +1,40 @@
 # Workflow backlog
 
+## WFL-003: observable unattended failure and notification delivery
+
+Status: fixed diagnostic codes implemented; durable event delivery and a native
+multi-workflow host remain follow-up work.
+
+A process can correctly return failure while its user remains unaware. Generic
+exception classes are insufficient to diagnose a stopped workflow. Fixed codes
+now identify recognized failures without copying exception messages or evidence
+into progress, including device identity and verification failures. Linux source
+safety now requests kernel paths from lsblk so canonical dm-N devices match
+friendly mapper aliases without relaxing read-only or destination checks.
+
+Acceptance criteria for the remaining supervision work:
+
+- Emit bounded redacted failure/pause/completion events, including preflight
+  failures before an output directory exists. Use stable job and event IDs.
+- Make notification delivery an explicit host responsibility, record attempts
+  separately from delivery and user acknowledgement, and retry notification
+  transport without restarting failed recovery engines.
+- Support a tested local desktop/systemd adapter and independent watchdog for
+  process death, missing heartbeats, and supervisor failure. A stale heartbeat
+  alone must not authorize killing a busy forensic engine.
+- Show parent-case degradation immediately when an independent stage fails;
+  preserve successful coverage and continue only separately authorized stages.
+- Preflight every source view and destination before expensive scans. Keep
+  verification diagnostics specific enough to distinguish root, manifest,
+  inventory, and artifact failures without exposing paths or recovered values.
+- Keep corrected attempts in fresh outputs. Preserve exact pause/resume gates,
+  offline defaults, read-only protection, reserves, and separate deletion approval.
+- Test preflight failure, native failure, quota pause, SIGKILL, missing desktop
+  bus, failed notification delivery, duplicate events, and final success.
+
+These requirements also apply to external case supervisors. A systemd service
+and log alone do not constitute unattended user notification.
+
 ## WFL-001: scan completed outputs after a later recovery failure
 
 The native `workflow` supervisor now automates successful recovery and selected

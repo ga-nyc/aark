@@ -16,6 +16,7 @@ import { inspectSourceSafety } from "../recovery/source-safety.js";
 import { loadWorkflowConfig, MAX_WORKFLOW_CONFIG_BYTES, overlaps } from "./config.js";
 import type { WorkflowConfig } from "./config.js";
 import { finalizeWorkflow } from "./finalize.js";
+import { FAILURE_CODES, workflowFailureCode } from "./failure.js";
 import { controlIdentity, fileDigest, interrupted, miningDirectory, outputIdentity, samePath, verifyScan, workflowSourceIdentity } from "./verify.js";
 
 type Phase = "recovery" | "mining" | "verification" | "packaging" | "complete";
@@ -44,6 +45,7 @@ interface WorkflowState {
   recoveryProgress?: Record<string, unknown>;
   summary?: Record<string, unknown>;
   failureClass?: string;
+  failureCode?: string;
   pauseReason?: "signal" | "free-space-reserve" | "output-cap";
 }
 export interface WorkflowOptions {
@@ -93,6 +95,7 @@ function redacted(state: WorkflowState): Record<string, unknown> {
     ...(state.recoveryProgress === undefined ? {} : {recoveryProgress: state.recoveryProgress}),
     processId: state.status === "running" ? process.pid : null,
     cleanupAuthorized: false, ...(state.failureClass === undefined ? {} : {failureClass: state.failureClass}),
+    ...(state.failureCode === undefined ? {} : {failureCode: state.failureCode}),
     ...(state.pauseReason === undefined ? {} : {pauseReason: state.pauseReason}),
     ...(state.summary === undefined ? {} : {summary: state.summary})};
 }
@@ -213,7 +216,7 @@ async function execute(state: WorkflowState, options: WorkflowOptions, workflowL
     }
   };
   try {
-    state.status = "running"; delete state.failureClass; delete state.pauseReason;
+    state.status = "running"; delete state.failureClass; delete state.failureCode; delete state.pauseReason;
     await update();
     timer = setInterval(() => {
       if (heartbeat !== undefined) return;
@@ -317,11 +320,12 @@ async function execute(state: WorkflowState, options: WorkflowOptions, workflowL
     // A partial native recovery cannot be resumed unless its own quota checkpoint said so.
     if ((state.phase === "recovery" && state.recoveryProof === undefined) || state.phase === "mining") state.status = "failed";
     state.failureClass = error instanceof Error ? error.name : "Error";
+    state.failureCode = workflowFailureCode(error);
     if (state.status === "paused") state.pauseReason = error instanceof StorageQuotaError ? error.reason : "signal";
     delete state.summary;
     await save();
     if (state.status === "paused") return redacted(state);
-    throw new Error("workflow failed; retained local controls identify the stopped phase", {cause: error});
+    throw new Error(`workflow failed (${state.failureCode}); retained local controls identify the stopped phase`, {cause: error});
   } finally {
     if (timer !== undefined) clearInterval(timer);
     await heartbeat;
@@ -387,6 +391,7 @@ export async function workflowStatus(directory: string): Promise<Record<string, 
   for (const key of ["scansPlanned", "scansCompleted", "scansVerified", "filesVerified", "currentScanFilesScanned", "currentScanBytesScanned"] as const) if (Number.isSafeInteger(input[key]) && Number(input[key]) >= 0) result[key] = input[key];
   for (const key of ["startedAt", "updatedAt"] as const) if (typeof input[key] === "string" && /^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z$/.test(input[key])) result[key] = input[key];
   result.resumable = input.status === "paused"; result.cleanupAuthorized = false;
+  if (typeof input.failureCode === "string" && FAILURE_CODES.has(input.failureCode)) result.failureCode = input.failureCode;
   if (["signal", "free-space-reserve", "output-cap"].includes(String(input.pauseReason))) result.pauseReason = input.pauseReason;
   if (input.recoveryProgress !== undefined) {
     try { result.recoveryProgress = redactedProgress(input.recoveryProgress, "recovery"); } catch { /* Ignore untrusted extra progress. */ }
