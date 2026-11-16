@@ -42,6 +42,7 @@ interface WorkflowState {
   filesVerified?: number;
   currentScanFilesScanned?: number;
   currentScanBytesScanned?: number;
+  currentScanErrors?: number;
   recoveryProgress?: Record<string, unknown>;
   summary?: Record<string, unknown>;
   failureClass?: string;
@@ -92,6 +93,7 @@ function redacted(state: WorkflowState): Record<string, unknown> {
     scansVerified: state.scansVerified, resumable: state.status === "paused",
     ...(state.filesVerified === undefined ? {} : {filesVerified: state.filesVerified}),
     ...(state.currentScanFilesScanned === undefined ? {} : {currentScanFilesScanned: state.currentScanFilesScanned, currentScanBytesScanned: state.currentScanBytesScanned}),
+    ...(state.currentScanErrors === undefined ? {} : {currentScanErrors: state.currentScanErrors}),
     ...(state.recoveryProgress === undefined ? {} : {recoveryProgress: state.recoveryProgress}),
     processId: state.status === "running" ? process.pid : null,
     cleanupAuthorized: false, ...(state.failureClass === undefined ? {} : {failureClass: state.failureClass}),
@@ -211,6 +213,7 @@ async function execute(state: WorkflowState, options: WorkflowOptions, workflowL
   const miningProgress = (progress: MiningProgress) => {
     state.currentScanFilesScanned = progress.filesScanned;
     state.currentScanBytesScanned = progress.bytesScanned;
+    state.currentScanErrors = progress.scanErrors;
     if (Date.now() - lastMiningEvent >= 1000) {
       lastMiningEvent = Date.now(); observe(options, redacted(state));
     }
@@ -275,7 +278,8 @@ async function execute(state: WorkflowState, options: WorkflowOptions, workflowL
         for (const seal of current.seals) seals.set(seal.filename, seal.identity);
         continue;
       }
-      delete state.currentScanFilesScanned; delete state.currentScanBytesScanned;
+      delete state.currentScanFilesScanned; delete state.currentScanBytesScanned; delete state.currentScanErrors;
+      lastMiningEvent = 0;
       state.phase = "mining"; await update();
       const result = state.pausedScan === index
         ? await resumeSensitiveMaterial({output, signal: controller.signal, progress: miningProgress})
@@ -285,6 +289,11 @@ async function execute(state: WorkflowState, options: WorkflowOptions, workflowL
           deepKeySchedules: config.mining.deepKeySchedules, workers: config.mining.workers,
           minimumFreeGiB: config.mining.storage.minFreeGiB, minimumFreePercent: config.mining.storage.minFreePercent,
           ...(config.mining.storage.maxOutputGiB === undefined ? {} : {maximumOutputGiB: config.mining.storage.maxOutputGiB}), signal: controller.signal, progress: miningProgress});
+      // Native finalization can update counts after the last progress callback.
+      for (const [source, target] of [["filesScanned", "currentScanFilesScanned"], ["bytesScanned", "currentScanBytesScanned"], ["scanErrors", "currentScanErrors"]] as const) {
+        const value = result[source];
+        if (typeof value === "number" && Number.isSafeInteger(value) && value >= 0) state[target] = value;
+      }
       if (result.status === "paused") {
         if (guardFailure !== undefined && !(guardFailure instanceof StorageQuotaError)) throw guardFailure;
         const paused = await loadScanState(output);
@@ -388,7 +397,7 @@ export async function workflowStatus(directory: string): Promise<Record<string, 
     || !["running", "paused", "complete", "failed"].includes(String(input.status))) throw new Error("invalid workflow progress");
   const result: Record<string, unknown> = {version: 1, tool: "aark", layer: "workflow", sourcePathsRedacted: true, status: input.status};
   if (["recovery", "mining", "verification", "packaging", "complete"].includes(String(input.phase))) result.phase = input.phase;
-  for (const key of ["scansPlanned", "scansCompleted", "scansVerified", "filesVerified", "currentScanFilesScanned", "currentScanBytesScanned"] as const) if (Number.isSafeInteger(input[key]) && Number(input[key]) >= 0) result[key] = input[key];
+  for (const key of ["scansPlanned", "scansCompleted", "scansVerified", "filesVerified", "currentScanFilesScanned", "currentScanBytesScanned", "currentScanErrors"] as const) if (Number.isSafeInteger(input[key]) && Number(input[key]) >= 0) result[key] = input[key];
   for (const key of ["startedAt", "updatedAt"] as const) if (typeof input[key] === "string" && /^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z$/.test(input[key])) result[key] = input[key];
   result.resumable = input.status === "paused"; result.cleanupAuthorized = false;
   if (typeof input.failureCode === "string" && FAILURE_CODES.has(input.failureCode)) result.failureCode = input.failureCode;

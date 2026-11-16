@@ -4,6 +4,7 @@ import { workflowFailureCode } from "../workflow/failure.js";
 
 test("workflow diagnostics use bounded fixed codes without copying exception data", () => {
   assert.equal(workflowFailureCode(new Error("workflow input root changed after scanning")), "input-root-changed");
+  assert.equal(workflowFailureCode(new Error("workflow scan did not complete without errors")), "scan-completed-with-errors");
   assert.equal(workflowFailureCode(new Error("wrapper", {cause: new Error("lsblk did not return the requested source device")})), "source-device-identity-unresolved");
   const sensitive = new Error("synthetic confidential value at /private/source");
   sensitive.cause = sensitive;

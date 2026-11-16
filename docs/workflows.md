@@ -48,6 +48,34 @@ messages are never copied into redacted status. Failed workflows remain failed
 and cannot be resumed as though they were clean pauses. A reviewed correction
 requires a fresh output. Preserve prior outputs and do not change their seals.
 
+`currentScanErrors` reports the active scan's aggregate error count. A scan that
+finishes `complete-with-errors` stops its workflow with the fixed
+`scan-completed-with-errors` code; subsequent selected scans remain unstarted.
+Inspect the terminal scan without exposing source paths or exception text:
+
+```sh
+aark mine diagnose --output /mnt/results/workflow-001/mining/scan-000001
+```
+
+Diagnosis verifies the saved state and sealed inventory and emits only fixed
+error categories and counters. It does not reveal artifacts, modify controls,
+resume a failed run, or grant cleanup eligibility. Missing files, OS I/O errors,
+changed input snapshots, and detector resource limits remain distinct failures.
+Unknown messages remain `unclassified-scan-error`. Independently authorized
+follow-up scans may use fresh outputs; their success does not relabel the
+original degraded scan as clean or authorize deletion of its recovered copy.
+
+For a Linux host, `scripts/notify-local.py` is a local desktop adapter that
+accepts an explicit unit allowlist, session user and session-bus address. Install
+the script and host configuration on a protected filesystem, separate from
+evidence and scanner outputs. Configure `--unit` for a systemd `OnFailure=`
+handler or `--watch` for an independent timer. Run `--help` for arguments.
+The adapter deduplicates accepted notifications per unit/invocation/event,
+uses finite-expiry desktop notices, and retains a durable redacted journal.
+Notification transport failures can retry on later polls; scanner jobs are
+never restarted or signalled by this adapter. Desktop acceptance is recorded
+separately from user acknowledgement. Do not reset its state to repeat an alert.
+
 Execution retains the existing recovery confirmations, read-only source and
 independent-destination checks, local mount and loop-backing validation, mining
 worker limits, and native checkpoints. Recovery remains Linux-only; mining-only
