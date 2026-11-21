@@ -3,7 +3,7 @@ import { spawnSync } from "node:child_process";
 const candidates = process.platform === "win32"
   ? [["py", "-3"], ["python"], ["python3"]]
   : [["python3"], ["python"]];
-const code = "import ast,pathlib; [ast.parse(pathlib.Path(p).read_text(encoding='utf-8')) for p in ['optional/impacket/dpapi_bridge.py', 'scripts/notify-local.py', 'scripts/notify-local.test.py']]";
+const code = "import ast,pathlib; [ast.parse(pathlib.Path(p).read_text(encoding='utf-8')) for p in ['optional/impacket/dpapi_bridge.py', 'scripts/notify-local.py', 'scripts/notify-local.test.py', 'scripts/source-dm-digest.py', 'scripts/source-dm-digest.test.py']]";
 let found = false;
 for (const [command, ...prefix] of candidates) {
   const probe = spawnSync(command, [...prefix, "--version"], { shell: false, windowsHide: true, encoding: "utf8" });
@@ -15,6 +15,10 @@ for (const [command, ...prefix] of candidates) {
   else {
     const tests = spawnSync(command, [...prefix, "scripts/notify-local.test.py"], { shell: false, windowsHide: true, stdio: "inherit" });
     process.exitCode = tests.status ?? 1;
+    if (process.exitCode === 0) {
+      const digestTests = spawnSync(command, [...prefix, "scripts/source-dm-digest.test.py"], { shell: false, windowsHide: true, stdio: "inherit" });
+      process.exitCode = digestTests.status ?? 1;
+    }
   }
   break;
 }

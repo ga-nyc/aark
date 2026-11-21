@@ -14,6 +14,8 @@
     "optional",
     "docs",
     "examples",
+    "scripts/notify-local.py",
+    "scripts/source-dm-digest.py",
     "AGENTS.md",
     "README.md",
     "SECURITY.md",

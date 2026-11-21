@@ -823,6 +823,43 @@ class LocalNotifierTests(unittest.TestCase):
                 mock.patch.object(self.notifier, 'watch', return_value=[{'statusQueryError': 'OSError'}]):
             self.assertEqual(notify_local.main(options[:-2] + ['--watch']), 1)
 
+    def test_cli_forwards_explicit_stable_event_token(self):
+        options = ['--allow-unit', self.unit, '--session-user', 'fixtureuser',
+                   '--bus-address', 'unix:path=/run/user/4242/bus', '--unit', self.unit,
+                   '--event', 'paused', '--invocation-id', 'case-event-fixture']
+        with mock.patch.object(notify_local, 'LocalNotifier', return_value=self.notifier), \
+                mock.patch.object(self.notifier, 'alert', return_value=None) as deliver:
+            self.assertEqual(notify_local.main(options), 0)
+        deliver.assert_called_once_with(self.unit, 'paused', invocation_id='case-event-fixture')
+        self.assertEqual(self.all_commands, [])
+
+    def test_cli_stable_event_token_deduplicates_without_systemctl(self):
+        options = ['--allow-unit', self.unit, '--session-user', 'fixtureuser',
+                   '--bus-address', 'unix:path=/run/user/4242/bus', '--unit', self.unit,
+                   '--invocation-id', 'case-event-fixture']
+        with mock.patch.object(notify_local, 'LocalNotifier', return_value=self.notifier), \
+                contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(notify_local.main(options), 0)
+            self.assertEqual(notify_local.main(options), 0)
+        self.assertEqual(len(self.notification_commands), 1)
+        self.assertFalse(any(command[0] == 'systemctl' for command in self.all_commands))
+        self.assertEqual(self.journal()[0]['invocationId'], 'case-event-fixture')
+
+    def test_cli_event_token_cannot_be_combined_with_history_seed_or_watch(self):
+        common = ['--allow-unit', self.unit, '--session-user', 'fixtureuser',
+                  '--bus-address', 'unix:path=/run/user/4242/bus',
+                  '--invocation-id', 'case-event-fixture']
+        invalid = [common + ['--unit', self.unit, '--seed-accepted-history', 'fixture-history'],
+                   common + ['--watch']]
+        for options in invalid:
+            with self.subTest(options=options), \
+                    mock.patch.object(notify_local, 'LocalNotifier') as constructor, \
+                    contextlib.redirect_stderr(io.StringIO()):
+                with self.assertRaises(SystemExit) as stopped:
+                    notify_local.main(options)
+                self.assertEqual(stopped.exception.code, 2)
+                constructor.assert_not_called()
+
 
 if __name__ == '__main__':
     unittest.main()

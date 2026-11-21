@@ -2,7 +2,7 @@
 
 AARK (Agentic Artifact Recovery Kit) is an offline-first toolkit for recovering deleted data from disks and then mining the recovered material for private keys, cryptographic material, password-manager databases, wallet artifacts, and credentials.
 
-Its reviewed plans, bounded commands, structured manifests, resumable checkpoints, and deterministic reports are designed for both direct human operation and fully delegated agentic workflows. The current implementation remains fully local and does not bundle an autonomous agent. See [AGENTS.md](AGENTS.md) for the recommended authorization and automation contract.
+Its reviewed plans, bounded commands, structured manifests, resumable checkpoints, and deterministic reports support direct operation and delegated workflows. Native forensic processing stays local. The optional [`aark case` supervisor](docs/cases.md) hosts reviewed workflows persistently and connects to an explicitly configured Codex agent using redacted events. See [AGENTS.md](AGENTS.md) for the authorization and automation contract.
 
 The project is deliberately split into three layers:
 
@@ -17,7 +17,7 @@ The project is deliberately split into three layers:
 
 Node.js is a good fit for orchestration, streaming scans, manifests, validation, and a cross-tool CLI. It is not a good replacement for years of filesystem and forensic work in GNU ddrescue, The Sleuth Kit, TestDisk/PhotoRec, libvshadow, dislocker, bulk_extractor, or Impacket. AARK calls those projects with argument arrays instead of shell strings and keeps their output behind a consistent, auditable case layout.
 
-No telemetry, LLM/API integration, cloud validation, or network lookup is performed by the CLI. Recovered secret values never leave the machine.
+Native recovery, mining, verification, and cleanup perform no telemetry, cloud validation, or network lookup. The opt-in case bridge may use the configured Codex service for bounded orchestration decisions; it sends fixed status codes and opaque job IDs. Recovered values, source paths, sensitive controls, and tool logs are excluded from that bridge.
 
 ## Requirements
 
@@ -72,6 +72,13 @@ For a reviewed sequence that automatically reaches verified and packaged final
 results, use [`aark workflow`](docs/workflows.md). It drives recovery, mining,
 verification, and local results packaging in one invocation, with native pause
 checkpoints and separate cleanup approval.
+
+For unattended cases that need decisions after failure, use the
+[`case` supervisor](docs/cases.md). Its managed Node worker and independent
+notification watchdog are mandatory for `case run --autonomous`. It reconnects
+to existing engine units after a worker restart and enforces reviewed attempt,
+scope, permission, and concurrency limits. It does not automatically enroll
+existing outputs or turn failed workflows into resumable ones.
 
 An authorized person or agent can run the complete workflow. First inventory the machine without changing anything:
 

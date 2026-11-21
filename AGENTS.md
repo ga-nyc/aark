@@ -2,6 +2,12 @@
 
 AARK is designed to be invoked by an authorized software agent as well as by a person at a terminal. Agent operation is recommended for long, repetitive recovery and mining runs when the agent can remain inside the authorization, storage, and data-handling boundaries below. The CLI itself remains deterministic and local; it does not send evidence to an AI service.
 
+For unattended case continuation, use [`aark case`](docs/cases.md) with its managed
+worker and independent notification watchdog. Its explicitly configured Codex
+bridge sends only validated redacted orchestration events to a fresh dedicated thread.
+Native forensic commands remain offline. Keep configuration files, evidence,
+recovered outputs, and case controls outside the agent's readable roots.
+
 ## Authorization boundary
 
 Before changing disks or starting recovery, establish one explicit case-wide authorization that identifies:
@@ -28,6 +34,11 @@ at a successful recovery or scan. Cleanup still requires the separate approval
 steps below. Failed-case harvesting remains the deferred WFL-001 scope.
 For unattended work, use a persistent local process host rather than relying on
 a later agent turn; preserve explicit pauses and failures without blind restarts.
+The case host can select only listed fresh attempts with identical authorized
+scope, or explicitly permitted clean quota resumes. It must preserve user and
+signal pauses. Missing heartbeats and verification timeouts do not prove engine
+failure or authorize replacement work. An exhausted attempt/request budget or
+required permission must be recorded and notified rather than silently ignored.
 
 1. Run `aark recover inventory --json` and identify the exact source and a destination on a different physical device.
 2. Create the strict case JSON. Keep `requireReadOnlySource: true`; set a storage policy explicitly when the defaults are not appropriate.
@@ -47,6 +58,7 @@ Routine agent operation must not open, quote, summarize, attach, upload, or plac
 
 - `inventory-sensitive.json`, `scan-state-sensitive.json`, or `scan-files-sensitive.ndjson`;
 - `case-sensitive.json`, sensitive run state, or sensitive tool logs;
+- `case-state-sensitive.json`, `host-private.json`, or `agent-private/` supervision controls;
 - `final-report-sensitive.md` or `cleanup-final-report-sensitive.md`; or
 - anything under `artifacts/`, `evidence/`, `retained-sensitive-source-files/`, or raw recovery output directories.
 

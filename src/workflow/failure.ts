@@ -3,6 +3,7 @@ const FAILURES = new Map<string, string>([
   ["lsblk did not return the requested source device", "source-device-identity-unresolved"],
   ["mountedReadOnlyRoot is not on a read-only mount", "source-mount-not-read-only"],
   ["workflow recovery did not complete successfully", "recovery-stage-failed"],
+  ["recovery source identity differs from workflow authorization", "source-identity-changed"],
   ["a selected recovery output has no completed producing stage", "recovery-output-incomplete"],
   ["workflow scan did not complete without errors", "scan-completed-with-errors"],
   ["workflow requires the exact error-free completed scan selection", "scan-completion-mismatch"],
