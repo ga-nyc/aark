@@ -107,6 +107,7 @@ class DigestTests(unittest.TestCase):
             else:
                 write.assert_not_called()
 
+    @unittest.skipUnless(sys.platform == "linux", "Linux descriptor flag contract")
     def test_native_stdout_and_stderr_are_redirected_without_releasing_the_digest_descriptor(self):
         with mock.patch.object(helper.os, "dup", return_value=99), mock.patch.object(helper.os, "open", return_value=98), \
                 mock.patch.object(helper.os, "dup2") as redirect, mock.patch.object(helper.os, "close") as close:
