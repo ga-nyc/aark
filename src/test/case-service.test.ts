@@ -28,6 +28,10 @@ function result(stdout = "", changes: Partial<CommandResult> = {}): CommandResul
 }
 class FakeCommands {
   readonly calls: Call[] = [];
+  readonly pendingFailures = new Map<string, string>();
+  readonly retriedFailureTokens: string[] = [];
+  readonly acceptedDeliveryKeys = new Set<string>();
+  readonly acceptedDeliveryTokens: string[] = [];
   observation: CommandResult | Error = result(ACTIVE);
   delivery: CommandResult | Error = result();
   command = async (executable: string, args: string[], options: CommandOptions): Promise<CommandResult> => {
@@ -41,12 +45,42 @@ class FakeCommands {
     }
     if (executable === "/usr/bin/python3") {
       assert.equal(path.basename(args[0]!), "notify-local.py");
+      if (args.includes("--retry-pending-failure")) {
+        const pending = this.pendingFailures.entries().next().value;
+        if (pending === undefined) return result();
+        if (this.delivery instanceof Error) throw this.delivery;
+        const [token, unit] = pending;
+        this.retriedFailureTokens.push(token);
+        const accepted = this.delivery.exitCode === 0 && this.delivery.terminationReason === null;
+        if (accepted) {
+          this.pendingFailures.delete(token);
+          this.acceptedDeliveryKeys.add(`${unit}|${token}|failed`);
+          this.acceptedDeliveryTokens.push(token);
+        }
+        return result(JSON.stringify({version: 2, unit, event: "failed", invocationId: token,
+          deliveryKey: `${unit}|${token}|failed`, attempt: 2, desktopDeliveryAttempted: true,
+          desktopDeliveryAccepted: accepted, userAcknowledged: false}) + "\n", {exitCode: accepted ? 0 : 1});
+      }
+      const event = args[args.indexOf("--event") + 1]!;
+      const token = args[args.indexOf("--invocation-id") + 1]!;
+      const unit = args[args.indexOf("--unit") + 1]!.slice(0, -".service".length);
+      const key = `${unit}|${token}|${event}`;
+      if (this.acceptedDeliveryKeys.has(key)) return result();
       if (this.delivery instanceof Error) throw this.delivery;
+      if (this.delivery.exitCode === 0 && this.delivery.terminationReason === null) {
+        this.acceptedDeliveryKeys.add(key);
+        this.acceptedDeliveryTokens.push(token);
+      }
+      if (event === "failed") {
+        if (this.delivery.exitCode === 0 && this.delivery.terminationReason === null) this.pendingFailures.delete(token);
+        else this.pendingFailures.set(token, unit);
+      }
       return this.delivery;
     }
     assert.fail("Unexpected watchdog command: " + executable);
   };
-  notifications(): Call[] { return this.calls.filter((call) => call.executable === "/usr/bin/python3"); }
+  notifications(): Call[] { return this.calls.filter((call) => call.executable === "/usr/bin/python3" && call.args.includes("--unit")); }
+  pendingRetries(): Call[] { return this.calls.filter((call) => call.args.includes("--retry-pending-failure")); }
   token(index = this.notifications().length - 1): string {
     const args = this.notifications()[index]!.args;
     return args[args.indexOf("--invocation-id") + 1]!;
@@ -112,6 +146,8 @@ test("case watchdog leaves a healthy worker and fresh heartbeat quiet", linuxOnl
   assert.equal(status.deliveryAccepted, null);
   assert.equal(status.userAcknowledged, false);
   assert.equal(f.commands.notifications().length, 0);
+  assert.equal(f.commands.pendingRetries().length, 1);
+  assert.equal(f.commands.pendingRetries()[0]!.args.includes("--invocation-id"), false);
   assert.equal(await readFile(path.join(f.control, "case-state-sensitive.json"), "utf8"), before);
   assert.ok(f.commands.calls[0]!.args.includes("--property=ActiveState,SubState,MainPID,Result,ExecMainStatus,InvocationID"));
 });
@@ -395,6 +431,122 @@ test("case watchdog retries failed notification delivery using the same event to
   assert.equal(JSON.stringify(f.commands.calls).includes("synthetic-private-transport-error"), false);
 });
 
+test("case watchdog retries an undelivered failure after recovery and preserves its original receipt", linuxOnly, async context => {
+  const f = await fixture(context);
+  f.state.health = "degraded"; await f.save();
+  f.commands.delivery = result("", {exitCode: 1});
+  assert.equal((await watchCaseService(f.control, f.commands.command, NOW)).deliveryAccepted, false);
+  const originalToken = f.commands.token();
+  f.state.health = "healthy"; await f.save();
+  f.commands.delivery = result();
+  const recovered = await watchCaseService(f.control, f.commands.command, NOW + 1000);
+  assert.equal(recovered.workerObservedActive, true);
+  assert.equal(recovered.notificationRequired, true);
+  assert.equal(recovered.deliveryAccepted, true);
+  assert.deepEqual(f.commands.retriedFailureTokens, [originalToken]);
+  assert.deepEqual(await caseNotificationStatus(f.control), {recorded: true, event: "failed", deliveryAccepted: true,
+    userAcknowledged: false, checkedAt: new Date(NOW + 1000).toISOString()});
+  const quiet = await watchCaseService(f.control, f.commands.command, NOW + 2000);
+  assert.equal(quiet.notificationRequired, false);
+  assert.equal(quiet.deliveryAccepted, null);
+  assert.deepEqual(f.commands.retriedFailureTokens, [originalToken]);
+  f.state.health = "degraded"; await f.save();
+  await watchCaseService(f.control, f.commands.command, NOW + 3000);
+  assert.notEqual(f.commands.token(), originalToken, "a later incident still receives its own identity");
+  assert.equal(f.commands.notifications().length, 2);
+});
+
+test("case watchdog keeps retrying the old failure while healthy until desktop acceptance", linuxOnly, async context => {
+  const f = await fixture(context);
+  f.state.health = "degraded"; await f.save();
+  f.commands.delivery = result("", {exitCode: 1});
+  await watchCaseService(f.control, f.commands.command, NOW);
+  const originalToken = f.commands.token();
+  f.state.health = "healthy"; await f.save();
+  const rejected = await watchCaseService(f.control, f.commands.command, NOW + 1000);
+  assert.equal(rejected.workerObservedActive, true);
+  assert.equal(rejected.deliveryAccepted, false);
+  assert.equal((await caseNotificationStatus(f.control)).event, "failed");
+  f.commands.delivery = result();
+  assert.equal((await watchCaseService(f.control, f.commands.command, NOW + 2000)).deliveryAccepted, true);
+  assert.deepEqual(f.commands.retriedFailureTokens, [originalToken, originalToken]);
+  assert.equal(f.commands.notifications().length, 1, "recovery must not mint a replacement failure token");
+  const retryArguments = f.commands.pendingRetries()[0]!.args;
+  assert.equal(retryArguments[retryArguments.indexOf("--allow-unit") + 1], caseServiceUnit(f.control));
+  assert.equal(retryArguments.includes("--unit"), false);
+});
+
+test("case watchdog fairly retries an old failure after direct completion with one helper per poll", linuxOnly, async context => {
+  const f = await fixture(context);
+  f.state.health = "degraded"; await f.save();
+  f.commands.delivery = result("", {exitCode: 1});
+  await watchCaseService(f.control, f.commands.command, NOW);
+  const failedToken = f.commands.token();
+  verifiedComplete(f.state); f.state.health = "healthy"; await f.save();
+  f.commands.delivery = result();
+  for (let tick = 1; tick <= 4; tick++) {
+    const before = f.commands.calls.filter(call => call.executable === "/usr/bin/python3").length;
+    const status = await watchCaseService(f.control, f.commands.command, NOW + tick * 1000);
+    assert.equal(f.commands.calls.filter(call => call.executable === "/usr/bin/python3").length - before, 1);
+    assert.equal(status.deliveryAccepted, tick === 4 ? null : true);
+    const notice = await caseNotificationStatus(f.control);
+    assert.equal(notice.event, tick === 2 ? "failed" : "complete");
+  }
+  const completionToken = f.commands.token();
+  assert.equal(f.commands.event(), "complete");
+  assert.deepEqual(f.commands.retriedFailureTokens, [failedToken]);
+  assert.equal(f.commands.acceptedDeliveryTokens.filter(token => token === completionToken).length, 1);
+  assert.equal(f.commands.token(1), f.commands.token(2), "completion deduplication uses its original stable token");
+  assert.ok(f.commands.calls.filter(call => call.executable === "/usr/bin/python3")
+    .every(call => call.options.timeoutMs === 45_000));
+});
+
+test("case watchdog alternates user-pause notice with old failure retries without starving either", linuxOnly, async context => {
+  const f = await fixture(context);
+  f.state.health = "degraded"; await f.save();
+  f.commands.delivery = result("", {exitCode: 1});
+  await watchCaseService(f.control, f.commands.command, NOW);
+  const failedToken = f.commands.token();
+  f.state.health = "healthy"; f.state.desired = "user-paused";
+  f.state.jobs[0]!.attempts[0]!.status = "paused";
+  f.state.jobs[0]!.attempts[0]!.observation = {status: "paused", pauseReason: "signal"};
+  await f.save();
+  f.commands.delivery = result();
+  await watchCaseService(f.control, f.commands.command, NOW + 1000);
+  const pausedToken = f.commands.token();
+  f.commands.delivery = result("", {exitCode: 1});
+  for (let tick = 2; tick <= 5; tick++) {
+    const before = f.commands.calls.filter(call => call.executable === "/usr/bin/python3").length;
+    const status = await watchCaseService(f.control, f.commands.command, NOW + tick * 1000);
+    assert.equal(f.commands.calls.filter(call => call.executable === "/usr/bin/python3").length - before, 1);
+    assert.equal(status.deliveryAccepted, tick % 2 === 1);
+    assert.equal((await caseNotificationStatus(f.control)).event, tick % 2 === 1 ? "paused" : "failed");
+  }
+  assert.deepEqual(f.commands.retriedFailureTokens, [failedToken, failedToken]);
+  assert.equal(f.commands.acceptedDeliveryTokens.filter(token => token === pausedToken).length, 1);
+  f.commands.delivery = result();
+  assert.equal((await watchCaseService(f.control, f.commands.command, NOW + 6000)).deliveryAccepted, true);
+  assert.deepEqual(f.commands.retriedFailureTokens, [failedToken, failedToken, failedToken]);
+});
+
+test("case watchdog rejects malformed pending-retry receipts without copying their contents", linuxOnly, async context => {
+  const f = await fixture(context);
+  const invalid = ["synthetic-private-output", JSON.stringify({version: 2, event: "complete",
+    desktopDeliveryAccepted: true, secret: "synthetic-private-output"}), JSON.stringify({version: 2,
+    unit: "unrelated", event: "failed", invocationId: "old-token", deliveryKey: "unrelated|old-token|failed",
+    desktopDeliveryAttempted: true, desktopDeliveryAccepted: true, userAcknowledged: false})];
+  for (const output of invalid) {
+    const malformed = async (executable: string, args: string[], options: CommandOptions): Promise<CommandResult> =>
+      args.includes("--retry-pending-failure") ? result(output) : f.commands.command(executable, args, options);
+    const status = await watchCaseService(f.control, malformed, NOW);
+    assert.equal(status.notificationRequired, true);
+    assert.equal(status.deliveryAccepted, false);
+    const notice = await caseNotificationStatus(f.control);
+    assert.equal(notice.event, "failed");
+    assert.equal(JSON.stringify(notice).includes("synthetic-private-output"), false);
+  }
+});
+
 for (const accepted of [true, false]) {
   test(`case watchdog keeps one continuous incident token after ${accepted ? "accepted delivery" : "failed delivery"} despite changing observations`, linuxOnly, async context => {
     const f = await fixture(context);
@@ -451,6 +603,7 @@ test("case watchdog preserves verified completion after worker exit and stale he
   await watchCaseService(f.control, f.commands.command, NOW);
   f.commands.observation = result("ActiveState=inactive\nInvocationID=" + "1".repeat(32) + "\n");
   await watchCaseService(f.control, f.commands.command, NOW + 600_000);
+  await watchCaseService(f.control, f.commands.command, NOW + 601_000);
   assert.equal(f.commands.event(0), "complete");
   assert.equal(f.commands.event(1), "complete", "terminal success must not age into a failure alert");
   assert.equal(f.commands.token(0), f.commands.token(1), "worker exit must not create a second completion popup");

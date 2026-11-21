@@ -13,6 +13,7 @@ import { workflowStatus } from "../workflow/runner.js";
 import { controlIdentity, fileDigest, miningDirectory, outputIdentity, samePath, workflowSourceIdentity } from "../workflow/verify.js";
 import type { CompletionProof, PreparedAttempt } from "./types.js";
 import { assertSourceBindings, CaseSourceIdentityError } from "./sources.js";
+import { runCaseProbe } from "./probe.js";
 
 const hash = (value: string) => createHash("sha256").update(value).digest("hex");
 interface Artifact {path: string; bytes: number; sha256: string}
@@ -253,21 +254,23 @@ export async function verifyCompletedWorkflow(attempt: PreparedAttempt): Promise
 
 // A separate disposable process isolates blocked destination reads from the case worker.
 if (process.argv[1] !== undefined && pathToFileURL(path.resolve(process.argv[1])).href === import.meta.url) {
-  try {
-    const [operation, filename, configHash, bindings] = process.argv.slice(2);
-    if (operation === "status" && filename !== undefined) process.stdout.write(JSON.stringify(await workflowStatus(filename)) + "\n");
-    else if ((operation === "verify" || operation === "binding") && filename !== undefined && configHash !== undefined) {
-      const attempt = await verifyPreparedAttempt(filename, configHash);
-      if (operation === "binding" && bindings !== undefined) await assertSourceBindings(attempt.workflow, JSON.parse(bindings));
-      process.stdout.write(JSON.stringify(operation === "verify" ? await verifyCompletedWorkflow(attempt) : {valid: true}) + "\n");
-    } else throw new Error();
-  } catch (error) {
-    if (error instanceof CaseSourceIdentityError) {
-      process.stdout.write('{"valid":false,"reason":"source-identity-changed"}\n');
-      process.exitCode = 2;
-    } else {
-      process.stdout.write(JSON.stringify({status: "unknown"}) + "\n");
-      process.exitCode = 1;
+  await runCaseProbe(async () => {
+    try {
+      const [operation, filename, configHash, bindings] = process.argv.slice(2);
+      if (operation === "status" && filename !== undefined) process.stdout.write(JSON.stringify(await workflowStatus(filename)) + "\n");
+      else if ((operation === "verify" || operation === "binding") && filename !== undefined && configHash !== undefined) {
+        const attempt = await verifyPreparedAttempt(filename, configHash);
+        if (operation === "binding" && bindings !== undefined) await assertSourceBindings(attempt.workflow, JSON.parse(bindings));
+        process.stdout.write(JSON.stringify(operation === "verify" ? await verifyCompletedWorkflow(attempt) : {valid: true}) + "\n");
+      } else throw new Error();
+    } catch (error) {
+      if (error instanceof CaseSourceIdentityError) {
+        process.stdout.write('{"valid":false,"reason":"source-identity-changed"}\n');
+        process.exitCode = 2;
+      } else {
+        process.stdout.write(JSON.stringify({status: "unknown"}) + "\n");
+        process.exitCode = 1;
+      }
     }
-  }
+  });
 }

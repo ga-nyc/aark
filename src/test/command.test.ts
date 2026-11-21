@@ -1,10 +1,99 @@
 import assert from "node:assert/strict";
-import { access, readFile, writeFile } from "node:fs/promises";
+import { access, readFile, rm, writeFile } from "node:fs/promises";
 import { mkdtemp } from "./helpers.js";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
-import { captureCommand, commandExists, sanitizedEnvironment, WINDOWS_MOUNTVOL } from "../core/command.js";
+import { captureCommand, commandExists, processGroupHasLiveMembersFrom, sanitizedEnvironment, withInheritedCommandGroup,
+  WINDOWS_MOUNTVOL, type ProcessGroupProbe } from "../core/command.js";
+
+test("private-group liveness distinguishes live tasks from zombies without trusting unreadable metadata", async () => {
+  const row = (pid: string, state: string, group: number, threads = 1) => `${pid} (synthetic ) task) ${state} 1 ${group} ${group}` + " 0".repeat(13) + ` ${threads}`;
+  const values = new Map([["101", row("101", "D", 100)], ["102", row("102", "Z", 100)], ["103", row("103", "R", 200)]]);
+  const probe: ProcessGroupProbe = {processes: async () => [...values.keys(), "self"], stat: async pid => values.get(pid)!};
+  assert.equal(await processGroupHasLiveMembersFrom(100, probe), true);
+  values.delete("101");
+  assert.equal(await processGroupHasLiveMembersFrom(100, probe), false);
+  values.set("102", row("102", "Z", 100, 2));
+  assert.equal(await processGroupHasLiveMembersFrom(100, probe), true, "a zombie leader may still own a live thread");
+  values.set("102", row("102", "Z", 100));
+  values.set("101", "invalid incomplete stat");
+  await assert.rejects(processGroupHasLiveMembersFrom(100, probe), /observation unavailable/u);
+  values.set("101", "101 (synthetic) D 1 9007199254740993 100 0");
+  await assert.rejects(processGroupHasLiveMembersFrom(100, probe), /observation unavailable/u);
+  const unavailable: ProcessGroupProbe = {...probe, stat: async () => { throw Object.assign(new Error("synthetic unreadable stat"), {code: "EACCES"}); }};
+  await assert.rejects(processGroupHasLiveMembersFrom(100, unavailable));
+  const vanished: ProcessGroupProbe = {...probe, stat: async () => { throw Object.assign(new Error("synthetic vanished task"), {code: "ENOENT"}); }};
+  assert.equal(await processGroupHasLiveMembersFrom(100, vanished), false);
+});
+
+test("inherited command groups are scoped to the read-only probe async context", {skip: process.platform !== "linux"}, async () => {
+  const script = "const s=require('node:fs').readFileSync('/proc/self/stat','utf8');process.stdout.write(JSON.stringify({pid:process.pid,group:Number(s.slice(s.lastIndexOf(')')+1).trim().split(/\\s+/)[2])}))";
+  const [inherited, ordinary] = await Promise.all([
+    withInheritedCommandGroup(async () => { await Promise.resolve(); return await captureCommand(process.execPath, ["-e", script]); }),
+    captureCommand(process.execPath, ["-e", script]),
+  ]);
+  const inner = JSON.parse(inherited.stdout.toString()) as {pid: number; group: number};
+  const normal = JSON.parse(ordinary.stdout.toString()) as {pid: number; group: number};
+  assert.notEqual(inner.pid, inner.group);
+  assert.equal(normal.pid, normal.group);
+});
+
+test("an aggregate probe timeout also kills nested metadata commands before their delayed marker", {skip: process.platform !== "linux"}, async context => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "aark-command-nested-probe-"));
+  context.after(() => rm(root, {recursive: true, force: true}));
+  const ready = path.join(root, "ready"), survived = path.join(root, "survived");
+  const nested = ["const fs=require('node:fs');process.on('SIGTERM',()=>{});",
+    `fs.writeFileSync(${JSON.stringify(ready)},'ready');`,
+    `setTimeout(()=>fs.writeFileSync(${JSON.stringify(survived)},'unexpected'),1500);setInterval(()=>{},1000);`].join("");
+  const aggregate = `import {captureCommand} from ${JSON.stringify(new URL("../core/command.js", import.meta.url).href)};`
+    + `import {runCaseProbe} from ${JSON.stringify(new URL("../case/probe.js", import.meta.url).href)};`
+    + `await runCaseProbe(async()=>{await captureCommand(process.execPath,['-e',${JSON.stringify(nested)}],{timeoutMs:5000,killGraceMs:40})});`;
+  const result = await captureCommand(process.execPath, ["--input-type=module", "-e", aggregate], {timeoutMs: 1000, killGraceMs: 40, waitForGroupExit: true});
+  assert.equal(result.terminationReason, "timeout");
+  await access(ready);
+  await new Promise<void>(resolve => setTimeout(resolve, 800));
+  await assert.rejects(access(survived));
+});
+
+test("a probe command keeps its promise while live descendants remain after the leader exits", {skip: process.platform !== "linux"}, async context => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "aark-command-live-group-"));
+  context.after(() => rm(root, {recursive: true, force: true}));
+  const info = path.join(root, "info"), leaderExit = path.join(root, "leader-exit"), childExit = path.join(root, "child-exit");
+  const nested = `const fs=require('node:fs');setInterval(()=>{if(fs.existsSync(${JSON.stringify(childExit)}))process.exit(0)},10);`;
+  const leader = "const fs=require('node:fs');const {spawn}=require('node:child_process');"
+    + `const c=spawn(process.execPath,['-e',${JSON.stringify(nested)}],{stdio:'ignore'});`
+    + `fs.writeFileSync(${JSON.stringify(info)},JSON.stringify({group:process.pid,child:c.pid}));`
+    + `setInterval(()=>{if(fs.existsSync(${JSON.stringify(leaderExit)}))process.exit(0)},10);`;
+  let group: number | undefined, hold = true, settled = false;
+  const kill = process.kill.bind(process);
+  const intercepted = context.mock.method(process, "kill", (pid: number, signal?: string | number) => {
+    // Simulate an uninterruptible task without creating one or signaling any
+    // unrelated group. The synthetic child exits through its own marker.
+    if (hold && group !== undefined && pid === -group && signal === "SIGKILL") return true;
+    return kill(pid, signal as NodeJS.Signals | number | undefined);
+  });
+  const controller = new AbortController();
+  const command = captureCommand(process.execPath, ["-e", leader], {signal: controller.signal, killGraceMs: 40, waitForGroupExit: true})
+    .finally(() => { settled = true; });
+  void command.catch(() => undefined);
+  try {
+    for (let attempts = 0; group === undefined && attempts < 200; attempts++) {
+      try { group = (JSON.parse(await readFile(info, "utf8")) as {group: number}).group; }
+      catch { await new Promise<void>(resolve => setTimeout(resolve, 10)); }
+    }
+    assert.ok(group !== undefined);
+    await writeFile(leaderExit, "release leader");
+    await new Promise<void>(resolve => setTimeout(resolve, 200));
+    assert.equal(settled, false, "leader exit must not release a live group's helper slot");
+    await writeFile(childExit, "release synthetic child");
+    assert.equal((await command).exitCode, 0);
+  } finally {
+    hold = false; controller.abort();
+    await command.catch(() => undefined);
+    intercepted.mock.restore();
+  }
+});
 
 test("command discovery uses the fixed system path without an external which dependency", async () => {
   assert.equal(await commandExists("node"), process.platform !== "win32");

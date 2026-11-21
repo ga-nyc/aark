@@ -1,7 +1,9 @@
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
 import { createHash } from "node:crypto";
-import { chmod, mkdtemp, readFile, realpath, rm, stat, writeFile } from "node:fs/promises";
+import fs from "node:fs";
+import { access, chmod, mkdir, mkdtemp, readFile, realpath, rename, rm, stat, writeFile } from "node:fs/promises";
+import { syncBuiltinESMExports } from "node:module";
 import os from "node:os";
 import path from "node:path";
 import { PassThrough } from "node:stream";
@@ -126,6 +128,19 @@ function barrier() {
   return {promise, resolve};
 }
 const settle = async () => { await new Promise<void>(resolve => setImmediate(resolve)); };
+function onIntentSync(config: AgentConfig, action: () => Promise<void> | void): () => void {
+  const originalOpen = fs.promises.open;
+  fs.promises.open = async (filename, flags, mode) => {
+    const handle = await originalOpen(filename, flags, mode);
+    if (filename === path.join(config.stateDirectory, "codex-thread-intent.json")) {
+      const originalSync = handle.sync.bind(handle);
+      handle.sync = async () => { await originalSync(); await action(); };
+    }
+    return handle;
+  };
+  syncBuiltinESMExports();
+  return () => { fs.promises.open = originalOpen; syncBuiltinESMExports(); };
+}
 
 linuxTest("an already cancelled bridge operation creates no proxy or decision thread", async context => {
   const {bridge, server} = await fixture(context);
@@ -487,6 +502,91 @@ linuxTest("Codex ambiguous thread creation failure leaves an intent and refuses 
   context.after(() => next.close());
   await assert.rejects(next.preflight(), code("agent-unavailable"));
   assert.equal(server.calls("thread/start").length, 1);
+});
+linuxTest("a receipt write failure after thread submission retains the duplicate-thread guard", async context => {
+  const {bridge, config, server} = await fixture(context);
+  const originalRename = fs.promises.rename;
+  fs.promises.rename = async (source, destination) => {
+    if (destination === path.join(config.stateDirectory, "codex-thread.json")) throw Object.assign(new Error("synthetic receipt write failure"), {code: "EIO"});
+    await originalRename(source, destination);
+  };
+  syncBuiltinESMExports();
+  try { await assert.rejects(bridge.preflight(), code("agent-unavailable")); }
+  finally { fs.promises.rename = originalRename; syncBuiltinESMExports(); }
+  await access(path.join(config.stateDirectory, "codex-thread-intent.json"));
+  const next = new CodexAgentBridge(config, {spawn: server.spawn, validate: async () => ({uid: 4242, currentUid: 4242, home: "/home/fixtureuser"})});
+  context.after(() => next.close());
+  await assert.rejects(next.preflight(), code("agent-unavailable"));
+  assert.equal(server.calls("thread/start").length, 1);
+});
+for (const stop of ["abort", "write-failure"] as const) linuxTest(`a graceful ${stop} after syncing an owned intent permits one later thread creation`, async context => {
+  const {bridge, config, server} = await fixture(context);
+  const controller = new AbortController();
+  const restore = onIntentSync(config, () => {
+    if (stop === "abort") controller.abort();
+    else throw Object.assign(new Error("synthetic intent write failure"), {code: "EIO"});
+  });
+  try { await assert.rejects(bridge.preflight(controller.signal), code("agent-unavailable")); }
+  finally { restore(); }
+  assert.equal(server.calls("thread/start").length, 0);
+  await assert.rejects(access(path.join(config.stateDirectory, "codex-thread-intent.json")));
+  const next = new CodexAgentBridge(config, {spawn: server.spawn, validate: async () => ({uid: 4242, currentUid: 4242, home: "/home/fixtureuser"})});
+  context.after(() => next.close());
+  await next.preflight();
+  assert.equal(server.calls("thread/start").length, 1);
+});
+
+linuxTest("an existing unknown thread intent is never removed by an unsuccessful claimant", async context => {
+  const {bridge, config, server} = await fixture(context);
+  await mkdir(config.stateDirectory, {mode: 0o700});
+  const filename = path.join(config.stateDirectory, "codex-thread-intent.json");
+  const bytes = JSON.stringify({version: 1, bindingHash: "a".repeat(64)}) + "\n";
+  await writeFile(filename, bytes, {mode: 0o600});
+  await assert.rejects(bridge.preflight(), code("agent-unavailable"));
+  await bridge.close();
+  assert.equal(await readFile(filename, "utf8"), bytes);
+  assert.equal(server.calls("thread/start").length, 0);
+});
+
+linuxTest("a concurrent claimant cannot remove another bridge's exclusive thread guard", async context => {
+  const {bridge, config, server} = await fixture(context);
+  const entered = barrier(), release = barrier(), controller = new AbortController();
+  const restore = onIntentSync(config, async () => { entered.resolve(); await release.promise; });
+  const next = new CodexAgentBridge(config, {spawn: server.spawn, validate: async () => ({uid: 4242, currentUid: 4242, home: "/home/fixtureuser"})});
+  context.after(() => next.close());
+  const rejected = assert.rejects(bridge.preflight(controller.signal), code("agent-unavailable"));
+  try {
+    await entered.promise;
+    const filename = path.join(config.stateDirectory, "codex-thread-intent.json");
+    const original = await stat(filename);
+    await assert.rejects(next.preflight(), code("agent-unavailable"));
+    assert.equal((await stat(filename)).ino, original.ino);
+    assert.equal(server.calls("thread/start").length, 0);
+    controller.abort(); release.resolve(); await rejected;
+  } finally { controller.abort(); release.resolve(); restore(); }
+  await next.preflight();
+  assert.equal(server.calls("thread/start").length, 1);
+});
+
+for (const replacement of ["guard", "directory"] as const) linuxTest(`graceful intent cleanup preserves a replaced ${replacement} binding`, async context => {
+  const {bridge, config, server} = await fixture(context);
+  const controller = new AbortController();
+  const filename = path.join(config.stateDirectory, "codex-thread-intent.json");
+  const foreign = "synthetic unrelated intent\n";
+  const restore = onIntentSync(config, async () => {
+    if (replacement === "guard") await rename(filename, filename + ".original");
+    else {
+      await rename(config.stateDirectory, config.stateDirectory + ".original");
+      await mkdir(config.stateDirectory, {mode: 0o700});
+    }
+    await writeFile(filename, foreign, {mode: 0o600});
+    controller.abort();
+  });
+  try { await assert.rejects(bridge.preflight(controller.signal), code("agent-unavailable")); }
+  finally { restore(); }
+  await settle();
+  assert.equal(await readFile(filename, "utf8"), foreign);
+  assert.equal(server.calls("thread/start").length, 0);
 });
 linuxTest("Codex rejects a supposedly fresh thread that identifies inherited parent history", async (context) => {
   const { bridge, server } = await fixture(context);

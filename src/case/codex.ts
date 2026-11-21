@@ -139,6 +139,7 @@ export interface CodexBridgeDependencies {
   validate?: (config: AgentConfig) => Promise<CodexValidatedBinding>;
 }
 interface Receipt { version: 1; bindingHash: string; parentThreadId: string; threadId: string; profile: string }
+interface ThreadIntent { submitted: boolean; remove(): Promise<void>; close(): Promise<void> }
 interface Pending { resolve(value: unknown): void; reject(error: Error): void }
 interface TurnWaiter {
   event: AgentEvent; id?: string; completed: Map<string, Record<string, unknown>>;
@@ -166,6 +167,7 @@ export class CodexAgentBridge implements AgentBridge {
   private transport: CodexPipeTransport | undefined;
   private readonly pending = new Map<number, Pending>();
   private receipt: Receipt | undefined;
+  private threadIntent: ThreadIntent | undefined;
   private turn: TurnWaiter | undefined;
   private blockedReply: AgentReply | undefined;
   private readonly replies = new Map<string, AgentReply>();
@@ -179,6 +181,7 @@ export class CodexAgentBridge implements AgentBridge {
     this.working = true;
     try { await this.deadline((current) => this.setup(current), signal); }
     catch (error) {
+      await this.releaseUnsubmittedIntent();
       const fixed = error instanceof CodexAgentError ? error : new CodexAgentError("agent-unavailable");
       this.disconnect(fixed);
       throw fixed;
@@ -236,6 +239,7 @@ export class CodexAgentBridge implements AgentBridge {
       if (this.blockedReply) this.disconnect(new CodexAgentError("agent-approval-required"));
       return structuredClone(reply);
     } catch (error) {
+      await this.releaseUnsubmittedIntent();
       // Completion can arrive before cancellation while its async return is
       // still propagating. A known validated reply must survive that race.
       if (this.turn?.reply !== undefined) {
@@ -258,6 +262,7 @@ export class CodexAgentBridge implements AgentBridge {
   async close(): Promise<void> {
     this.closed = true;
     this.disconnect(new CodexAgentError("agent-unavailable"));
+    await this.releaseUnsubmittedIntent();
   }
   private async deadline<T>(operation: (signal: AbortSignal) => Promise<T>, externalSignal?: AbortSignal): Promise<T> {
     if (externalSignal?.aborted) fail("agent-unavailable");
@@ -312,18 +317,29 @@ export class CodexAgentBridge implements AgentBridge {
       const parent = await this.rpc("thread/read", { threadId: this.config.threadId, includeTurns: false });
       this.assertActive(signal);
       this.checkThread(parent, this.config.threadId, false);
-      await this.claimThread();
-      this.assertActive(signal);
-      const response = await this.rpc("thread/start", { dynamicTools: [], environments: [], ephemeral: false, ...settings });
-      if (!object(response) || !object(response.thread) || !identifier(response.thread.id) || response.thread.id === this.config.threadId) fail("agent-invalid-response");
-      this.receipt = { version: 1, bindingHash: this.bindingHash(), parentThreadId: this.config.threadId, threadId: response.thread.id, profile };
-      // Persist identity before subsequent setup: uncertainty must not create another thread.
-      await this.writeReceipt(this.receipt);
-      this.assertActive(signal);
-      await unlink(path.join(this.config.stateDirectory, "codex-thread-intent.json"));
-      this.assertActive(signal);
-      this.checkThread(response, this.receipt.threadId, true);
-      this.checkSettings(response, profile);
+      const intent = await this.claimThread(signal);
+      try {
+        this.assertActive(signal);
+        // RPC entry is the conservative boundary: a transport/write failure
+        // can no longer prove that the server did not create a thread.
+        intent.submitted = true;
+        const response = await this.rpc("thread/start", { dynamicTools: [], environments: [], ephemeral: false, ...settings });
+        if (!object(response) || !object(response.thread) || !identifier(response.thread.id) || response.thread.id === this.config.threadId) fail("agent-invalid-response");
+        this.receipt = { version: 1, bindingHash: this.bindingHash(), parentThreadId: this.config.threadId, threadId: response.thread.id, profile };
+        // Persist identity before removing our guard, even if cancellation
+        // arrived while the successful response was settling.
+        await this.writeReceipt(this.receipt);
+        await intent.remove();
+        this.assertActive(signal);
+        this.checkThread(response, this.receipt.threadId, true);
+        this.checkSettings(response, profile);
+      } catch (error) {
+        if (!intent.submitted) await this.releaseUnsubmittedIntent(intent);
+        throw error;
+      } finally {
+        await intent.close();
+        if (this.threadIntent === intent) this.threadIntent = undefined;
+      }
     }
     this.assertActive(signal);
     const resumed = await this.rpc("thread/resume", { threadId: this.receipt.threadId, excludeTurns: true, ...settings });
@@ -514,11 +530,67 @@ export class CodexAgentBridge implements AgentBridge {
       fail("agent-unavailable");
     }
   }
-  private async claimThread(): Promise<void> {
-    const handle = await open(path.join(this.config.stateDirectory, "codex-thread-intent.json"), constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o600);
-    try { await handle.writeFile(JSON.stringify({ version: 1, bindingHash: this.bindingHash() }) + "\n"); await handle.sync(); }
-    finally { await handle.close(); }
-    await this.syncState();
+  private async releaseUnsubmittedIntent(intent = this.threadIntent): Promise<void> {
+    if (intent === undefined || intent.submitted) return;
+    try { await intent.remove(); }
+    catch { /* Changed/unknown ownership preserves the guard for local review. */ }
+    finally {
+      await intent.close().catch(() => undefined);
+      if (this.threadIntent === intent) this.threadIntent = undefined;
+    }
+  }
+  private async claimThread(signal: AbortSignal): Promise<ThreadIntent> {
+    const filename = path.join(this.config.stateDirectory, "codex-thread-intent.json");
+    const directory = await open(this.config.stateDirectory, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW);
+    let handle: Awaited<ReturnType<typeof open>>;
+    try { handle = await open(filename, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o600); }
+    catch (error) { await directory.close(); throw error; }
+    let intent: ThreadIntent | undefined;
+    try {
+      const originalDirectory = await directory.stat({bigint: true});
+      const originalFile = await handle.stat({bigint: true});
+      let removal: Promise<void> | undefined;
+      let closing: Promise<void> | undefined;
+      const assertDirectory = async () => {
+        const current = await lstat(this.config.stateDirectory, {bigint: true});
+        const held = await directory.stat({bigint: true});
+        if (!current.isDirectory() || current.isSymbolicLink() || current.dev !== originalDirectory.dev || current.ino !== originalDirectory.ino
+          || held.dev !== originalDirectory.dev || held.ino !== originalDirectory.ino || current.uid !== originalDirectory.uid
+          || current.uid !== BigInt(process.getuid?.() ?? -1) || (current.mode & 0o077n) !== 0n
+          || await realpath(this.config.stateDirectory) !== this.config.stateDirectory) fail("agent-unavailable");
+      };
+      const ownedPath = `/proc/self/fd/${directory.fd}/codex-thread-intent.json`;
+      const assertOwned = async () => {
+        await assertDirectory();
+        const current = await lstat(ownedPath, {bigint: true});
+        const held = await handle.stat({bigint: true});
+        if (!current.isFile() || current.isSymbolicLink() || current.dev !== originalFile.dev || current.ino !== originalFile.ino
+          || held.dev !== originalFile.dev || held.ino !== originalFile.ino || current.nlink !== 1n || held.nlink !== 1n
+          || current.uid !== originalFile.uid || current.uid !== BigInt(process.getuid?.() ?? -1) || (current.mode & 0o077n) !== 0n) fail("agent-unavailable");
+        await assertDirectory();
+      };
+      intent = {submitted: false,
+        remove: () => removal ??= (async () => {
+          // Pin the directory as well as the still-open exclusive file so a
+          // replaced control path can never redirect removal to another guard.
+          await assertOwned();
+          await unlink(ownedPath);
+          await directory.sync();
+        })(),
+        close: () => closing ??= Promise.all([handle.close(), directory.close()]).then(() => undefined)};
+      this.threadIntent = intent;
+      this.assertActive(signal);
+      await assertOwned();
+      await handle.writeFile(JSON.stringify({ version: 1, bindingHash: this.bindingHash() }) + "\n");
+      await handle.sync();
+      await this.syncState();
+      await assertOwned();
+      return intent;
+    } catch (error) {
+      if (intent !== undefined) await this.releaseUnsubmittedIntent(intent);
+      else await Promise.all([handle.close(), directory.close()]);
+      throw error;
+    }
   }
   private async writeReceipt(receipt: Receipt): Promise<void> {
     const filename = path.join(this.config.stateDirectory, "codex-thread.json");

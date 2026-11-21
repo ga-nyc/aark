@@ -518,6 +518,7 @@ test("the host boundary waits for a fresh quota probe instead of reusing a timed
   const engine = new SystemdEngineHost({cliPath: path.resolve("dist/cli.js"), controlRoot: path.join(f.root, "host"), capacityTimeoutMs: 1,
     command: async (executable, args, options) => {
       if (args[0]?.endsWith("capacity.js")) {
+        assert.equal(options.waitForGroupExit, true, "the helper promise includes all live group members");
         calls++;
         if (calls === 1) await waiting;
         return result(executable, args, '{"ready":true}');

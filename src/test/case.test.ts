@@ -16,6 +16,9 @@ import { CaseSourceIdentityError } from "../case/sources.js";
 import { EngineLaunchCancelledError, EngineLaunchDeferredError, EngineLaunchRefusedError } from "../case/launch-error.js";
 import { captureCommand } from "../core/command.js";
 import { mkdtemp } from "./helpers.js";
+import { caseServiceUnit, watchCaseService } from "../case/service.js";
+import { atomicWriteJson } from "../core/fs-safe.js";
+import type { CommandOptions, CommandResult } from "../core/command.js";
 
 /** No test starts systemd, a scanner, or a model; all host effects are injected. */
 class FakeHost implements EngineHost {
@@ -470,6 +473,80 @@ test("user pause blocks new launches and never stops existing engines", linuxOnl
   const observation = f.host.observations.get(f.host.launches[0]!.identity.unit);
   assert.ok(observation && !(observation instanceof Error));
   assert.equal(observation.status, "running");
+});
+
+for (const failing of ["read", "write"] as const) {
+  test(`a transient command ${failing} failure cannot create a permission hold`, linuxOnly, async t => {
+    const f = await fixture();
+    await initializeCase(f.filename, {execute: true});
+    const supervisor = await CaseSupervisor.open(f.control, {host: f.host, agent: f.agent});
+    t.after(() => supervisor.close());
+    const command = path.join(f.control, "case-command.json");
+    await atomicWriteJson(command, {version: 1, id: randomUUID(), desired: "user-paused"});
+    const originalOpen = fs.promises.open, originalRename = fs.promises.rename;
+    let injected = false;
+    fs.promises.open = (async (...args: Parameters<typeof originalOpen>) => {
+      if (failing === "read" && !injected && args[0] === command) {
+        injected = true; throw Object.assign(new Error("synthetic transient read failure"), {code: "EIO"});
+      }
+      return originalOpen(...args);
+    }) as typeof originalOpen;
+    fs.promises.rename = async (...args: Parameters<typeof originalRename>) => {
+      if (failing === "write" && !injected && args[1] === path.join(f.control, "case-state-sensitive.json")) {
+        injected = true; throw Object.assign(new Error("synthetic transient write failure"), {code: "EIO"});
+      }
+      return originalRename(...args);
+    };
+    syncBuiltinESMExports();
+    try { await assert.rejects(supervisor.tick(), {code: "EIO"}); }
+    finally { fs.promises.open = originalOpen; fs.promises.rename = originalRename; syncBuiltinESMExports(); }
+    assert.equal(injected, true);
+    assert.equal(f.host.launches.length, 0);
+    await tick(supervisor);
+    assert.equal((await loadCaseState(f.control)).state.desired, "user-paused");
+    await atomicWriteJson(command, {version: 1, id: randomUUID(), desired: "running"});
+    await tick(supervisor);
+    const {state} = await loadCaseState(f.control);
+    assert.equal(state.desired, "running");
+    assert.equal(state.permissionReason, undefined);
+    assert.equal(f.host.launches.length, 1);
+  });
+}
+
+test("serial in-deadline engine observations keep the independent watchdog heartbeat fresh", linuxOnly, async t => {
+  const f = await fixture({jobs: 4, maxConcurrent: 4});
+  const document = JSON.parse(await readFile(f.filename, "utf8"));
+  await writeFile(f.filename, JSON.stringify({...document, probeTimeoutMs: 60_000, pollMs: 1000,
+    agent: {...document.agent, timeoutMs: 1000}}));
+  await initializeCase(f.filename, {execute: true});
+  let now = Date.now();
+  const supervisor = await CaseSupervisor.open(f.control, {host: f.host, agent: f.agent, clock: () => now});
+  t.after(() => supervisor.close());
+  await tick(supervisor);
+  const unit = caseServiceUnit(f.control);
+  await atomicWriteJson(path.join(f.control, "host-private.json"), {version: 1, unit,
+    watchUnit: unit.replace(".service", "-watch"), user: "syntheticuser", bus: "unix:path=/run/user/1000/bus",
+    cli: "/synthetic/cli.js", node: process.execPath});
+  const command = async (executable: string, args: string[], _options: CommandOptions): Promise<CommandResult> => {
+    const stdout = executable === "/usr/bin/systemctl"
+      ? "ActiveState=active\nSubState=running\nMainPID=1234\nResult=success\nExecMainStatus=0\nInvocationID=" + "1".repeat(32) + "\n" : "";
+    if (executable !== "/usr/bin/systemctl") assert.ok(args.includes("--retry-pending-failure"));
+    return {executable, args, exitCode: 0, signal: null, stdout: Buffer.from(stdout), stderr: Buffer.alloc(0),
+      stdoutTruncated: false, stderrTruncated: false, durationMs: 1, terminationReason: null};
+  };
+  let observations = 0;
+  f.host.observe = async () => {
+    for (let probe = 0; probe < 2; probe++) {
+      now += 55_000;
+      const status = await watchCaseService(f.control, command, now);
+      assert.equal(status.heartbeatStale, false);
+      assert.equal(status.notificationRequired, false);
+    }
+    observations++;
+    return {status: "running"};
+  };
+  await tick(supervisor);
+  assert.equal(observations, 4);
 });
 
 test("run cancellation during observation prevents an independent launch and preserves existing engines", linuxOnly, async t => {

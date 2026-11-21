@@ -72,6 +72,10 @@ export class CaseSupervisor {
     await this.lease.assertHeld();
   }
 
+  private async pulse(): Promise<void> {
+    if (this.clock() - Date.parse(this.state.updatedAt) >= 30_000) await this.persist();
+  }
+
   private async preflightAgent(signal?: AbortSignal): Promise<void> {
     if (signal?.aborted || this.agentReady || this.clock() < this.nextPreflight) return;
     try { await this.options.agent.preflight(signal); this.agentReady = true; }
@@ -97,18 +101,25 @@ export class CaseSupervisor {
   }
 
   private async readCommand(): Promise<void> {
+    let command: {version: number; id: string; desired: string};
     try {
-      const command = await readJson<{version: number; id: string; desired: string}>(path.join(this.config.control, "case-command.json"), 1024);
-      if (command.version !== 1 || typeof command.id !== "string"
-        || !/^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/u.test(command.id)
-        || !["running", "user-paused"].includes(command.desired)) throw new Error("invalid command");
-      if (command.id !== this.state.commandId) {
-        this.state.commandId = command.id;
-        this.setDesired(command.desired as "running" | "user-paused");
-        await this.persist();
-      }
+      command = await readJson(path.join(this.config.control, "case-command.json"), 1024);
     } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "ENOENT") { this.state.permissionReason = "new-plan-required"; this.configChanged = true; }
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
+      if (!(error instanceof SyntaxError)) throw error;
+      this.state.permissionReason = "new-plan-required"; this.configChanged = true; return;
+    }
+    if (typeof command !== "object" || command === null || command.version !== 1 || typeof command.id !== "string"
+      || !/^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/u.test(command.id)
+      || !["running", "user-paused"].includes(command.desired)) {
+      this.state.permissionReason = "new-plan-required"; this.configChanged = true; return;
+    }
+    if (command.id !== this.state.commandId) {
+      this.state.commandId = command.id;
+      this.setDesired(command.desired as "running" | "user-paused");
+      // Storage and authority failures must propagate; they do not invalidate
+      // a valid operator command or manufacture a permission hold.
+      await this.persist();
     }
   }
 
@@ -118,6 +129,9 @@ export class CaseSupervisor {
       const attempt = this.state.jobs[i]!.attempts.at(-1);
       if (attempt === undefined || attempt.status !== "running" || attempt.identity === undefined) continue;
       const approved = this.config.jobs[i]!.attempts[attempt.index]!;
+      // Each observation may include two separately bounded probes. Commit
+      // between engines instead of treating the whole serial batch as idle.
+      await this.pulse();
       let observation;
       try { observation = await this.options.host.observe(attempt.identity, approved); }
       catch { observation = {status: "unknown" as const}; }
@@ -232,6 +246,7 @@ export class CaseSupervisor {
         continue;
       }
       if (!this.config.jobs[index]!.resumeAfterQuota || paused.observation?.pauseReason !== "free-space-reserve") continue;
+      await this.pulse();
       let ready: boolean | undefined;
       try {
         const observed = await this.options.host.resumeReady?.(this.config.jobs[index]!.attempts[paused.index]!, signal);
@@ -302,6 +317,7 @@ export class CaseSupervisor {
       const attempt = this.state.jobs[index]!.attempts.at(-1);
       if (attempt?.status !== "launching" || attempt.dispatched !== true) continue;
       const approved = this.config.jobs[index]!.attempts[attempt.index]!;
+      await this.pulse();
       if (this.options.host.reattach !== undefined) {
         try {
           const identity = await this.options.host.reattach(approved, attempt.token, attempt.mode);

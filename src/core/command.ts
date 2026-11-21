@@ -1,6 +1,7 @@
 import { spawn } from "node:child_process";
+import { AsyncLocalStorage } from "node:async_hooks";
 import { constants } from "node:fs";
-import { access, open, readFile, stat, unlink } from "node:fs/promises";
+import { access, open, readFile, readdir, stat, unlink } from "node:fs/promises";
 import { basename, delimiter, dirname, isAbsolute, join, resolve } from "node:path";
 import { ensurePrivateDirectory, stableHandleStat, stableLstat, syncDirectory, type FilesystemIdentity } from "./fs-safe.js";
 
@@ -28,6 +29,8 @@ export interface CommandOptions {
   killGraceMs?: number;
   maxCaptureBytes?: number;
   signal?: AbortSignal;
+  /** Disposable Linux probes retain their slot until their whole private group is inactive. */
+  waitForGroupExit?: boolean;
   safetyCheck?: () => Promise<void>;
   // Runs independently so expensive accounting cannot delay the primary guard.
   // Each callback is serialized with itself; both must settle before success.
@@ -36,6 +39,45 @@ export interface CommandOptions {
   progress?: (progress: CommandProgress) => Promise<void>;
   progressIntervalMs?: number;
 }
+
+const inheritedCommandGroup = new AsyncLocalStorage<true>();
+/** Only disposable read-only probe entry points opt in; ordinary engines keep private groups. */
+export function withInheritedCommandGroup<T>(action: () => T): T { return inheritedCommandGroup.run(true, action); }
+
+export interface ProcessGroupProbe {
+  processes(): Promise<string[]>;
+  stat(pid: string): Promise<string>;
+}
+/** Linux stat-only proof: zombies cannot run or write, while unreadable state is unknown. */
+export async function processGroupHasLiveMembersFrom(group: number, probe: ProcessGroupProbe): Promise<boolean> {
+  if (!Number.isSafeInteger(group) || group < 1 || group > 0x7fff_ffff) throw new Error("invalid private process group");
+  const entries = await probe.processes();
+  if (entries.length > 65_536) throw new Error("private process group observation unavailable");
+  const pids = entries.filter(pid => /^[1-9][0-9]{0,9}$/u.test(pid));
+  for (let index = 0; index < pids.length; index += 32) {
+    const states = await Promise.all(pids.slice(index, index + 32).map(async pid => {
+      let value: string;
+      try { value = await probe.stat(pid); }
+      catch (error) { if (error instanceof Error && "code" in error && ["ENOENT", "ESRCH"].includes(String(error.code))) return false; throw error; }
+      const open = value.indexOf("("); const close = value.lastIndexOf(")");
+      if (Buffer.byteLength(value) > 8192 || open < 1 || close <= open || value.slice(0, open).trim() !== pid) throw new Error("private process group observation unavailable");
+      const fields = value.slice(close + 1).trim().split(/\s+/u);
+      if (!/^[A-Za-z]$/u.test(fields[0] ?? "") || !/^(?:0|[1-9][0-9]*)$/u.test(fields[2] ?? "")
+        || !/^(?:0|[1-9][0-9]*)$/u.test(fields[3] ?? "")
+        || !/^(?:0|[1-9][0-9]*)$/u.test(fields[17] ?? "")
+        || [fields[2], fields[3], fields[17]].some(value => !Number.isSafeInteger(Number(value)) || Number(value) > 0x7fff_ffff)) throw new Error("private process group observation unavailable");
+      if (Number(fields[2]) !== group) return false;
+      if (Number(fields[3]) !== group) throw new Error("private process group lost its private session");
+      // A zombie leader can still own other live threads. Keep that group's
+      // slot until the kernel reports only the inert leader remains.
+      return !["Z", "X", "x"].includes(fields[0]!) || Number(fields[17]) > 1;
+    }));
+    if (states.some(Boolean)) return true;
+  }
+  return false;
+}
+
+const linuxProcessGroups: ProcessGroupProbe = {processes: () => readdir("/proc"), stat: pid => readFile(`/proc/${pid}/stat`, "utf8")};
 
 export interface CommandProgress {
   elapsedMs: number;
@@ -86,12 +128,26 @@ function missingProcess(error: unknown): boolean {
   return error instanceof Error && "code" in error && (error as NodeJS.ErrnoException).code === "ESRCH";
 }
 
-async function killDetachedProcessGroupAndWait(processGroup: number, timeoutMs: number): Promise<void> {
+async function killDetachedProcessGroupAndWait(processGroup: number, timeoutMs: number, waitForGroupExit: boolean): Promise<void> {
   try {
     process.kill(-processGroup, "SIGKILL");
   } catch (error) {
     if (missingProcess(error)) return;
-    throw error;
+    if (!waitForGroupExit || process.platform !== "linux") throw error;
+  }
+  if (waitForGroupExit && process.platform === "linux") {
+    // Never release an aggregate probe's single-flight slot on a cleanup
+    // deadline or unreadable /proc state. Its caller has a separate deadline.
+    // Signal only once; subsequent polls cannot affect a later reused group ID.
+    while (true) {
+      // Kernel absence is conclusive even when /proc hides unrelated processes.
+      // Signal zero observes membership without delivering a signal.
+      try { process.kill(-processGroup, 0); }
+      catch (error) { if (missingProcess(error)) return; }
+      try { if (!await processGroupHasLiveMembersFrom(processGroup, linuxProcessGroups)) return; }
+      catch { /* Unknown membership must retain the slot. */ }
+      await new Promise<void>(resolveDelay => setTimeout(resolveDelay, 100));
+    }
   }
   const deadline = Date.now() + timeoutMs;
   while (true) {
@@ -172,6 +228,7 @@ export async function captureCommand(
   if (!Number.isSafeInteger(maxCapture) || maxCapture < 0) throw new Error("maxCaptureBytes must be a non-negative integer");
   if (!Number.isSafeInteger(killGraceMs) || killGraceMs < 1 || killGraceMs > 60_000) throw new Error("killGraceMs must be an integer from 1 through 60000");
   if (options.timeoutMs !== undefined && (!Number.isSafeInteger(options.timeoutMs) || options.timeoutMs < 1)) throw new Error("timeoutMs must be a positive integer");
+  if (options.waitForGroupExit !== undefined && typeof options.waitForGroupExit !== "boolean") throw new Error("waitForGroupExit must be a boolean");
   const safetyCheckIntervalMs = options.safetyCheckIntervalMs ?? 5_000;
   if (!Number.isSafeInteger(safetyCheckIntervalMs) || safetyCheckIntervalMs < 10 || safetyCheckIntervalMs > 60_000) {
     throw new Error("safetyCheckIntervalMs must be an integer from 10 through 60000");
@@ -233,7 +290,7 @@ export async function captureCommand(
 
   return await new Promise<CommandResult>((resolve, reject) => {
     let child: ReturnType<typeof spawn>;
-    const detached = process.platform !== "win32";
+    const detached = process.platform !== "win32" && inheritedCommandGroup.getStore() !== true;
     try {
       const environment = sanitizedEnvironment(options.env ?? process.env);
       if (temporaryDirectory !== undefined) {
@@ -346,7 +403,7 @@ export async function captureCommand(
     }
     const beginDescendantCleanup = (): void => {
       if (!detached || child.pid === undefined || descendantCleanupPromise !== undefined) return;
-      descendantCleanupPromise = killDetachedProcessGroupAndWait(child.pid, killGraceMs);
+      descendantCleanupPromise = killDetachedProcessGroupAndWait(child.pid, killGraceMs, options.waitForGroupExit === true);
       // The close handler awaits the same promise. Attach a handler immediately
       // so a fast rejection between exit and close is never unhandled.
       void descendantCleanupPromise.catch(() => undefined);

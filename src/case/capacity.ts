@@ -13,6 +13,7 @@ import { MAX_WORKFLOW_CONFIG_BYTES, type WorkflowConfig } from "../workflow/conf
 import { workflowExternalSources } from "./sources.js";
 import { verifyPreparedAttempt } from "./verify.js";
 import type { PreparedAttempt } from "./types.js";
+import { runCaseProbe } from "./probe.js";
 
 export interface CapacityProbes {
   /** Native identity validation includes the destination and every loop host. */
@@ -170,13 +171,15 @@ export async function quotaResumeReady(attempt: PreparedAttempt, probes: Capacit
 }
 
 if (process.argv[1] !== undefined && pathToFileURL(path.resolve(process.argv[1])).href === import.meta.url) {
-  try {
-    const [configFile, configHash] = process.argv.slice(2);
-    if (configFile === undefined || configHash === undefined) throw new Error();
-    const ready = await inspectReadiness(await verifyPreparedAttempt(configFile, configHash), {});
-    process.stdout.write(JSON.stringify({ready}) + "\n");
-  } catch {
-    process.stdout.write('{"ready":false}\n');
-    process.exitCode = 1;
-  }
+  await runCaseProbe(async () => {
+    try {
+      const [configFile, configHash] = process.argv.slice(2);
+      if (configFile === undefined || configHash === undefined) throw new Error();
+      const ready = await inspectReadiness(await verifyPreparedAttempt(configFile, configHash), {});
+      process.stdout.write(JSON.stringify({ready}) + "\n");
+    } catch {
+      process.stdout.write('{"ready":false}\n');
+      process.exitCode = 1;
+    }
+  });
 }

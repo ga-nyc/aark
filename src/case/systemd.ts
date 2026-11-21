@@ -71,7 +71,7 @@ export class SystemdEngineHost implements EngineHost {
       helper = Promise.resolve().then(() => {
         signal?.throwIfAborted();
         beforeStart?.();
-        return this.command(executable, args, {timeoutMs, killGraceMs: 250, maxCaptureBytes: 64 * 1024,
+        return this.command(executable, args, {timeoutMs, killGraceMs: 250, maxCaptureBytes: 64 * 1024, waitForGroupExit: true,
           ...(signal === undefined ? {} : {signal})});
       })
         .finally(() => this.helpers.delete(key));

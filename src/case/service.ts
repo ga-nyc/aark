@@ -63,6 +63,25 @@ async function notify(control: string, receipt: HostReceipt, event: "failed" | "
   return ok(result);
 }
 
+async function retryPendingFailure(control: string, receipt: HostReceipt, command: Command): Promise<boolean | null> {
+  const result = await command("/usr/bin/python3", [NOTIFIER, "--state-directory", path.join(control, "notifications"),
+    "--allow-unit", receipt.unit, "--session-user", receipt.user, "--bus-address", receipt.bus,
+    "--retry-pending-failure"], notificationOptions);
+  if (ok(result) && result.stdout.toString().trim() === "") return null;
+  if (!ok(result)) return false;
+  try {
+    const record: unknown = JSON.parse(result.stdout.toString());
+    if (record === null || typeof record !== "object" || Array.isArray(record)) return false;
+    const row = record as Record<string, unknown>;
+    const unit = receipt.unit.slice(0, -".service".length);
+    if (row.version !== 2 || row.unit !== unit || row.event !== "failed" || typeof row.invocationId !== "string"
+      || !/^[A-Za-z0-9:_-]{1,160}$/u.test(row.invocationId) || row.deliveryKey !== `${unit}|${row.invocationId}|failed`
+      || row.desktopDeliveryAttempted !== true || row.userAcknowledged !== false
+      || typeof row.desktopDeliveryAccepted !== "boolean") return false;
+    return row.desktopDeliveryAccepted;
+  } catch { return false; }
+}
+
 export async function startCaseService(control: string, cli: string, command: Command = captureCommand): Promise<Record<string, unknown>> {
   const {config, state} = await loadCaseState(control);
   await assertProductionCaseStorage(config);
@@ -172,25 +191,44 @@ async function watchCaseServiceHeld(control: string, command: Command, now: numb
   // an observed healthy interval closes it so the next failure alerts again,
   // including failures within the same systemd invocation.
   const incidentPath = path.join(control, "notification-incident.json");
-  let incident: {version: 1; unit: string; event: string | null; token: string} | undefined;
+  let incident: {version: 1; unit: string; event: string | null; token: string; retryNext?: boolean} | undefined;
   try {
     const value = await readJson<typeof incident>(incidentPath, 4096);
     if (value?.version === 1 && value.unit === receipt.unit && [null, "failed", "paused", "complete"].includes(value.event)
-      && /^[a-f0-9-]{36}$/u.test(value.token)) incident = value;
+      && /^[a-f0-9-]{36}$/u.test(value.token) && (value.retryNext === undefined || typeof value.retryNext === "boolean")) incident = value;
   } catch { /* An unavailable incident receipt must not suppress a failure alert. */ }
+  let incidentChanged = false;
   if (incident === undefined || incident.event !== (event ?? null)) {
     incident = {version: 1, unit: receipt.unit, event: event ?? null, token: randomUUID()};
-    await atomicWriteJson(incidentPath, incident);
+    incidentChanged = true;
   }
+  const terminalEvent = event === "complete" || event === "paused";
+  const retryPending = event === undefined || (terminalEvent && incident.retryNext === true);
+  if (terminalEvent) {
+    // Persist fair alternation before delivery. A still-visible terminal event
+    // and an unavailable old failure must each receive later delivery attempts.
+    incident.retryNext = !retryPending;
+    incidentChanged = true;
+  }
+  if (incidentChanged) await atomicWriteJson(incidentPath, incident);
   let delivered: boolean | null = null;
-  if (event !== undefined) {
+  let notificationEvent: typeof event = undefined;
+  if (!retryPending && event !== undefined) {
+    notificationEvent = event;
     const key = complete ? digest({case: receipt.unit, event: "complete"})
       : digest({case: receipt.unit, event, incident: incident.token});
     try { delivered = await notify(control, receipt, event, key, command); } catch { delivered = false; }
-    await atomicWriteJson(path.join(control, "notification-status-redacted.json"), {version: 1, event, deliveryAccepted: delivered,
+  } else {
+    // Closing or completing an incident does not erase a rejected desktop
+    // delivery. Retry one original receipt, without a second helper this poll.
+    try { delivered = await retryPendingFailure(control, receipt, command); } catch { delivered = false; }
+    if (delivered !== null) notificationEvent = "failed";
+  }
+  if (notificationEvent !== undefined) {
+    await atomicWriteJson(path.join(control, "notification-status-redacted.json"), {version: 1, event: notificationEvent, deliveryAccepted: delivered,
       userAcknowledged: false, checkedAt: new Date(now).toISOString()});
   }
-  return {version: 1, workerObservedActive: active, heartbeatStale: stale, notificationRequired: event !== undefined, deliveryAccepted: delivered, userAcknowledged: false};
+  return {version: 1, workerObservedActive: active, heartbeatStale: stale, notificationRequired: notificationEvent !== undefined, deliveryAccepted: delivered, userAcknowledged: false};
 }
 
 export async function caseNotificationStatus(control: string): Promise<Record<string, unknown>> {

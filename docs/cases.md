@@ -110,7 +110,10 @@ unavailable transport, exhausted requests, or a permission hold trigger that
 notice. Desktop acceptance and human acknowledgement are
 distinct. Failed deliveries retry the same durable event token. An observed
 healthy interval closes a failure incident so a later failure alerts again;
-continuous worker restart loops remain deduplicated. The notifier has a
+continuous worker restart loops remain deduplicated.
+Complete and paused incidents alternate terminal notices with bounded retries
+of earlier undelivered failures, without starving the terminal notice.
+The notifier has a
 45-second deadline and its watchdog service a 70-second deadline to accommodate
 bounded desktop delivery, process startup, and worker observation. No watchdog
 action stops, kills, or restarts a forensic engine. These transient systemd units
