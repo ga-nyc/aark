@@ -85,7 +85,10 @@ queries current status and sends a failure only while that unit is failed; it
 cannot identify a historical `OnFailure=` event. Run `--help` for arguments.
 The adapter deduplicates accepted notifications per unit/invocation/event,
 uses finite-expiry desktop notices, and retains a durable redacted journal.
-Notification transport failures can retry on later polls; scanner jobs are
+Notification transport failures can retry on later polls even after the failed
+unit restarts. Each watch pass makes at most one additional retry of a persisted
+undelivered failure, retaining its original invocation identity; accepted notices
+remain suppressed. Scanner jobs are
 never restarted or signalled by this adapter. Desktop acceptance is recorded
 separately from user acknowledgement. Do not reset its state to repeat an alert.
 

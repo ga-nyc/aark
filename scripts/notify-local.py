@@ -369,12 +369,43 @@ class LocalNotifier:
     def watch(self):
         # Independent timer; status/delivery problems never change scanner state.
         records = []
+        attempted = set()
         for unit in sorted(self.allowed):
             record = self.alert(unit, only_if_failed=True)
             if record is not None:
                 records.append(record)
+                if record.get('desktopDeliveryAttempted') and record.get('deliveryKey'):
+                    attempted.add(record['deliveryKey'])
                 print(json.dumps(record, sort_keys=True), flush=True)
+        # A failed invocation may already have restarted. Retry its persisted
+        # receipt independently of the current status, with at most one extra
+        # desktop attempt per pass and no second attempt for a just-polled key.
+        record = self._retry_failed_delivery(attempted)
+        if record is not None:
+            records.append(record)
+            print(json.dumps(record, sort_keys=True), flush=True)
         return records
+
+    def _retry_failed_delivery(self, attempted):
+        try:
+            with self._locked():
+                state, warning = self._load_state()
+                pending = (record for key, record in state['deliveries'].items()
+                           if key not in attempted and record['event'] == 'failed'
+                           and record.get('desktopDeliveryAttempted') is True
+                           and record['desktopDeliveryAccepted'] is False)
+                # Lowest attempt count prevents one unavailable delivery from
+                # permanently starving other known undelivered failures.
+                record = min(pending, key=lambda row: (row['attempt'], row['deliveryKey']), default=None)
+                if record is None:
+                    return None
+                return self._deliver(state, record['unit'], 'failed', record['invocationId'], warning)
+        except (OSError, ValueError) as exc:
+            return {
+                'version': 2, 'event': 'failed', 'time': _now(),
+                'desktopDeliveryAttempted': False, 'desktopDeliveryAccepted': False,
+                'userAcknowledged': False, 'deliveryInfrastructureError': _error(exc),
+            }
 
 
 def delivery_failed(record):

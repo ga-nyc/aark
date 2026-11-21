@@ -225,6 +225,64 @@ class LocalNotifierTests(unittest.TestCase):
         self.assertEqual(self.all_commands, [])
         self.assertFalse(self.root.exists())
 
+    def test_watch_retries_rejected_failure_handler_after_unit_restarts_active(self):
+        old_invocation, next_invocation = '1' * 32, '2' * 32
+        self.status[self.unit] = ('active', next_invocation)
+        self.delivery_results = [(1, ''), (0, '23\n')]
+        rejected = self.notifier.on_failure(self.unit, old_invocation)
+        self.assertFalse(rejected['desktopDeliveryAccepted'])
+        # Recovering from the durable journal must preserve the retry as well.
+        (self.root / 'delivery-state.json').unlink()
+        with contextlib.redirect_stdout(io.StringIO()):
+            retried = self.notifier.watch()
+            self.assertEqual(self.notifier.watch(), [])
+        self.assertEqual(len(retried), 1)
+        self.assertEqual(retried[0]['invocationId'], old_invocation)
+        self.assertEqual(retried[0]['attempt'], 2)
+        self.assertTrue(retried[0]['desktopDeliveryAccepted'])
+        self.assertEqual(len(self.notification_commands), 2)
+
+    def test_watch_retries_old_failure_and_delivers_new_failure_without_duplicates(self):
+        self.delivery_results = [(1, ''), (0, '23\n'), (0, '24\n')]
+        self.assertFalse(self.notifier.alert(self.unit)['desktopDeliveryAccepted'])
+        self.status[self.unit] = ('failed', 'next-run')
+        with contextlib.redirect_stdout(io.StringIO()):
+            delivered = self.notifier.watch()
+            self.assertEqual(self.notifier.watch(), [])
+        self.assertEqual({row['invocationId'] for row in delivered}, {'run-one', 'next-run'})
+        self.assertTrue(all(row['desktopDeliveryAccepted'] for row in delivered))
+        self.assertEqual(len(self.notification_commands), 3)
+
+    def test_watch_history_retries_are_bounded_fair_and_skip_current_attempts(self):
+        self.delivery_results = [(1, '')] * 12
+        for index in range(3):
+            self.notifier.on_failure(self.unit, str(index + 1) * 32)
+        self.status[self.unit] = ('active', 'next-run')
+        retried = []
+        with contextlib.redirect_stdout(io.StringIO()):
+            for _ in range(3):
+                before = len(self.notification_commands)
+                records = self.notifier.watch()
+                self.assertEqual(len(self.notification_commands) - before, 1)
+                self.assertEqual(len(records), 1)
+                retried.append(records[0]['invocationId'])
+        self.assertEqual(len(set(retried)), 3)
+        self.status[self.unit] = ('failed', retried[0])
+        with contextlib.redirect_stdout(io.StringIO()):
+            records = self.notifier.watch()
+        self.assertEqual(len(records), 2)
+        self.assertEqual(len({row['deliveryKey'] for row in records}), 2)
+
+    def test_watch_never_retries_unallowed_historical_delivery(self):
+        self.delivery_results = [(1, '')]
+        self.notifier.alert(self.other_unit, invocation_id='old-unallowed-run')
+        self.notifier.allowed.remove(self.other_unit)
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.notifier.watch()
+        self.assertTrue(all(row['unit'] != self.other_unit
+                            for row in self.journal()[1:]))
+        self.assertEqual(len(self.notification_commands), 2)
+
     def test_status_error_is_recorded_and_later_poll_retries(self):
         self.status[self.unit] = (subprocess.TimeoutExpired('systemctl', 10), '')
         failed = self.notifier.alert(self.unit, only_if_failed=True)
