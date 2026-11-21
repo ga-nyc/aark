@@ -40,6 +40,23 @@ def _error(exc):
     return type(exc).__name__
 
 
+def _unit_stem(unit):
+    if not isinstance(unit, str):
+        raise ValueError('Unknown alert identifier')
+    return unit[:-8] if unit.endswith('.service') else unit
+
+
+def _validate_identifiers(unit, event, invocation_id=None):
+    # Stored unit names are already normalized stems. Schema validation must
+    # neither normalize them again nor depend on the current authorization.
+    if (not isinstance(unit, str) or not re.fullmatch(r'[A-Za-z0-9_@.:-]+', unit)
+            or unit.startswith('-') or not isinstance(event, str) or event not in EVENTS):
+        raise ValueError('Unknown alert identifier')
+    if invocation_id is not None and (not isinstance(invocation_id, str)
+            or not re.fullmatch(r'[A-Za-z0-9:_-]{1,160}', invocation_id)):
+        raise ValueError('Invalid invocation identifier')
+
+
 def _historical_time(value):
     # Imported history is not trusted redacted text. Accept only an explicit
     # ISO timestamp and publish a freshly formatted UTC value.
@@ -63,7 +80,7 @@ class LocalNotifier:
             raise ValueError('Local desktop notification delivery requires Linux')
         if isinstance(allow_units, str):
             raise ValueError('The unit allowlist must be a collection of unit names')
-        self.allowed = {unit.removesuffix('.service') for unit in allow_units}
+        self.allowed = {_unit_stem(unit) for unit in allow_units}
         if not self.allowed or any(not re.fullmatch(r'[A-Za-z0-9_@.:-]+', unit)
                                    or unit.startswith('-') for unit in self.allowed):
             raise ValueError('Configure an explicit allowlist of systemd unit names')
@@ -78,14 +95,10 @@ class LocalNotifier:
                              '/usr/bin/env', 'DBUS_SESSION_BUS_ADDRESS=' + bus_address]
 
     def _identifiers(self, unit, event, invocation_id=None):
-        if not isinstance(unit, str) or not isinstance(event, str):
+        unit = _unit_stem(unit)
+        _validate_identifiers(unit, event, invocation_id)
+        if unit not in self.allowed:
             raise ValueError('Unknown alert identifier')
-        unit = unit.removesuffix('.service')
-        if unit not in self.allowed or event not in EVENTS:
-            raise ValueError('Unknown alert identifier')
-        if invocation_id is not None and (not isinstance(invocation_id, str)
-                or not re.fullmatch(r'[A-Za-z0-9:_-]{1,160}', invocation_id)):
-            raise ValueError('Invalid invocation identifier')
         return unit
 
     def _private_open(self, path, flags):
@@ -179,7 +192,7 @@ class LocalNotifier:
 
     def _valid_delivery(self, record):
         try:
-            self._identifiers(record['unit'], record['event'], record['invocationId'])
+            _validate_identifiers(record['unit'], record['event'], record['invocationId'])
             return (record.get('version') == 2
                     and record['deliveryKey'] == _key(record['unit'], record['invocationId'], record['event'])
                     and isinstance(record.get('desktopDeliveryAccepted'), bool)
@@ -274,16 +287,18 @@ class LocalNotifier:
             '-t', str(NOTIFICATION_TIMEOUT_MS), '-a', 'AARK']
         command += ['AARK: ' + event, unit + ': inspect the local redacted status.']
         try:
-            result = subprocess.run(command, capture_output=True, text=True, timeout=15)
+            result = subprocess.run(command, capture_output=True, text=True, errors='replace', timeout=15)
             record['desktopDeliveryAccepted'] = result.returncode == 0
             if result.returncode:
                 record['deliveryError'] = 'notify-send returned ' + str(result.returncode)
             else:
                 record['deliveryAcceptedTime'] = _now()
                 printed_id = result.stdout.strip()
-                if printed_id.isdigit() and 0 < int(printed_id) <= 0xffffffff:
-                    record['notificationId'] = int(printed_id)
-                else:
+                if re.fullmatch(r'[0-9]{1,10}', printed_id):
+                    notification_id = int(printed_id)
+                    if 0 < notification_id <= 0xffffffff:
+                        record['notificationId'] = notification_id
+                if 'notificationId' not in record:
                     record['notificationIdError'] = 'No valid notification ID returned'
         except (OSError, subprocess.SubprocessError) as exc:
             record['deliveryError'] = _error(exc)
@@ -316,7 +331,7 @@ class LocalNotifier:
                             return self._status_recovered(state, unit, active)
                         if not invocation_id:
                             raise RuntimeError('No stable systemd invocation identifier')
-                        self._identifiers(unit, event, invocation_id)
+                        _validate_identifiers(unit, event, invocation_id)
                         self._status_recovered(state, unit, active)
                     except (OSError, RuntimeError, ValueError, subprocess.SubprocessError) as exc:
                         record = {
@@ -338,7 +353,6 @@ class LocalNotifier:
         """Deliver for the triggering invocation supplied by systemd, not its successor."""
         if not isinstance(invocation_id, str) or not re.fullmatch(r'[a-f0-9]{32}', invocation_id):
             raise ValueError('A systemd failure handler requires its monitored invocation identifier')
-        unit = self._identifiers(unit, 'failed', invocation_id)
         return self.alert(unit, 'failed', invocation_id=invocation_id)
 
     def seed_accepted_history(self, unit, invocation_id, event='failed'):
@@ -377,7 +391,7 @@ class LocalNotifier:
         records = []
         attempted = set()
         for unit in sorted(self.allowed):
-            record = self.alert(unit, only_if_failed=True)
+            record = self.alert(unit + '.service', only_if_failed=True)
             if record is not None:
                 records.append(record)
                 if record.get('desktopDeliveryAttempted') and record.get('deliveryKey'):
@@ -397,7 +411,8 @@ class LocalNotifier:
             with self._locked():
                 state, warning = self._load_state()
                 pending = (record for key, record in state['deliveries'].items()
-                           if key not in attempted and record['event'] == 'failed'
+                           if key not in attempted and record['unit'] in self.allowed
+                           and record['event'] == 'failed'
                            and record.get('desktopDeliveryAttempted') is True
                            and record['desktopDeliveryAccepted'] is False)
                 # Lowest attempt count prevents one unavailable delivery from

@@ -52,7 +52,7 @@ class LocalNotifierTests(unittest.TestCase):
         self.assertGreater(kwargs['timeout'], 0)
         if command[0] == 'systemctl':
             self.assertEqual(command[1], 'show')
-            active, invocation = self.status[command[2].removesuffix('.service')]
+            active, invocation = self.status[notify_local._unit_stem(command[2])]
             if isinstance(active, Exception):
                 raise active
             return subprocess.CompletedProcess(command, 0,
@@ -104,6 +104,26 @@ class LocalNotifierTests(unittest.TestCase):
         self.assertLessEqual(expiry, 60000)
         self.assertEqual(record['notificationId'], 17)
         self.assertNotIn('fixture-private-error', json.dumps(record))
+
+    def test_malformed_optional_notification_ids_never_erase_accepted_delivery(self):
+        invalid = ['²\n', '１２\n', '\ufffd\n', '9' * 5000, '4294967296\n',
+                   '0\n', 'synthetic-private-metadata\n']
+        for index, output in enumerate(invalid):
+            with self.subTest(output=output[:20]):
+                self.delivery_results = [(0, output)]
+                invocation = 'metadata-' + str(index)
+                record = self.notifier.alert(self.unit, invocation_id=invocation)
+                self.assertTrue(record['desktopDeliveryAccepted'])
+                self.assertNotIn('notificationId', record)
+                self.assertEqual(record['notificationIdError'], 'No valid notification ID returned')
+                self.assertIsNone(self.notifier.alert(self.unit, invocation_id=invocation))
+        self.assertEqual(len(self.notification_commands), len(invalid))
+        self.assertNotIn('synthetic-private-metadata', json.dumps(self.state()))
+        self.assertNotIn('synthetic-private-metadata', json.dumps(self.journal()))
+        self.delivery_results = [(0, '4294967295\n')]
+        maximum = self.notifier.alert(self.unit, invocation_id='maximum-id')
+        self.assertTrue(maximum['desktopDeliveryAccepted'])
+        self.assertEqual(maximum['notificationId'], 0xffffffff)
 
     def test_delivery_failure_is_durable_and_retries_later(self):
         self.delivery_results = [(1, ''), (0, '23\n')]
@@ -225,6 +245,28 @@ class LocalNotifierTests(unittest.TestCase):
         self.assertEqual(self.all_commands, [])
         self.assertFalse(self.root.exists())
 
+    def test_service_suffix_is_normalized_once_for_failure_watch_and_replay(self):
+        self.notifier = notify_local.LocalNotifier(
+            allow_units={'worker.service', 'worker.service.service'}, session_user='fixtureuser',
+            bus_address='unix:path=/run/user/4242/bus', state_directory=self.root)
+        self.status = {'worker': ('failed', '1' * 32), 'worker.service': ('failed', '2' * 32)}
+        first = self.notifier.on_failure('worker.service', '1' * 32)
+        second = self.notifier.on_failure('worker.service.service', '2' * 32)
+        self.assertEqual(first['unit'], 'worker')
+        self.assertEqual(second['unit'], 'worker.service')
+        self.assertEqual(second['deliveryKey'], 'worker.service|' + '2' * 32 + '|failed')
+        self.assertEqual(self.notification_commands[0][-1], 'worker: inspect the local redacted status.')
+        self.assertEqual(self.notification_commands[1][-1], 'worker.service: inspect the local redacted status.')
+        (self.root / 'delivery-state.json').unlink()
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(self.notifier.watch(), [])
+        queried = [command[2] for command in self.all_commands if command[0] == 'systemctl']
+        self.assertEqual(queried, ['worker.service', 'worker.service.service'])
+        self.assertEqual(len(self.notification_commands), 2)
+        self.assertIsNone(self.notifier.alert('worker.service.service'))
+        self.assertIsNone(self.notifier.on_failure('worker.service.service', '2' * 32))
+        self.assertEqual(len(self.notification_commands), 2)
+
     def test_watch_retries_rejected_failure_handler_after_unit_restarts_active(self):
         old_invocation, next_invocation = '1' * 32, '2' * 32
         self.status[self.unit] = ('active', next_invocation)
@@ -304,6 +346,39 @@ class LocalNotifierTests(unittest.TestCase):
         self.assertTrue(all(row['unit'] != self.other_unit
                             for row in self.journal()[1:]))
         self.assertEqual(len(self.notification_commands), 2)
+
+    def check_allowlist_change_preserves_cache_only_delivery(self, accepted):
+        self.notifier.alert(self.other_unit, invocation_id='removed-unit-run')
+        self.delivery_results = [(0, '23\n') if accepted else (1, '')]
+        with mock.patch.object(self.notifier, '_append_record', side_effect=OSError('synthetic failure')):
+            cached = self.notifier.alert(self.unit, invocation_id='cache-only-run')
+        self.assertEqual(cached['desktopDeliveryAccepted'], accepted)
+        self.assertIn('journalPersistenceError', cached)
+        self.assertNotIn('statePersistenceError', cached)
+        self.notifier.allowed.remove(self.other_unit)
+        self.status[self.unit] = ('active', 'healthy-successor')
+        if accepted:
+            self.assertIsNone(self.notifier.alert(self.unit, invocation_id='cache-only-run'))
+        with contextlib.redirect_stdout(io.StringIO()):
+            retried = self.notifier.watch()
+            self.assertEqual(self.notifier.watch(), [])
+        if accepted:
+            self.assertEqual(retried, [])
+        else:
+            self.assertEqual(len(retried), 1)
+            self.assertEqual(retried[0]['invocationId'], 'cache-only-run')
+            self.assertEqual(retried[0]['attempt'], 2)
+            self.assertTrue(retried[0]['desktopDeliveryAccepted'])
+        self.notifier.allowed.add(self.other_unit)
+        self.assertIsNone(self.notifier.alert(self.other_unit, invocation_id='removed-unit-run'))
+        self.assertEqual(len(self.notification_commands), 2 if accepted else 3)
+        self.assertEqual(len(self.state()['deliveries']), 2)
+
+    def test_narrowed_allowlist_preserves_pending_cache_only_receipt(self):
+        self.check_allowlist_change_preserves_cache_only_delivery(False)
+
+    def test_narrowed_allowlist_preserves_accepted_cache_only_receipt(self):
+        self.check_allowlist_change_preserves_cache_only_delivery(True)
 
     def test_status_error_is_recorded_and_later_poll_retries(self):
         self.status[self.unit] = (subprocess.TimeoutExpired('systemctl', 10), '')
@@ -482,7 +557,7 @@ class LocalNotifierTests(unittest.TestCase):
     def test_unterminated_valid_receipt_is_preserved_before_a_new_receipt(self):
         first = self.notifier.alert(self.unit)
         path = self.root / 'alerts-redacted.ndjson'
-        first_line = path.read_bytes().removesuffix(b'\n')
+        first_line = path.read_bytes()[:-1]
         path.write_bytes(first_line)
         (self.root / 'delivery-state.json').unlink()
         self.status[self.unit] = ('failed', 'run-two')
