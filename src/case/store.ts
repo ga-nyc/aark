@@ -266,8 +266,13 @@ function serializeCaseState(control: string, config: CaseConfig, state: CaseStat
 export async function saveCaseState(control: string, config: CaseConfig, state: CaseState): Promise<void> {
   await assertCaseDirectory(control);
   const serialized = serializeCaseState(control, config, state);
+  const progress = redactedCaseStatus(config, state);
   await atomicWriteFile(path.join(control, STATE), serialized);
-  await atomicWriteJson(path.join(control, "case-progress-redacted.json"), redactedCaseStatus(config, state));
+  // The private state is the commit. CLI status and the watchdog derive their
+  // observations from it; failure of this advisory cache must not invalidate a
+  // successful control transition or prevent an undelivered-budget rollback.
+  try { await atomicWriteJson(path.join(control, "case-progress-redacted.json"), progress); }
+  catch { /* A later state publication can refresh the informational cache. */ }
 }
 
 export async function writeCaseCompletion(config: CaseConfig, state: CaseState): Promise<void> {

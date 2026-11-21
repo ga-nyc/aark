@@ -133,6 +133,135 @@ test("cancellation after systemd submission leaves the independent engine and cl
   assert.equal(host.calls.some(call => call.args.some(arg => ["kill", "stop", "restart"].includes(arg))), false);
 });
 
+test("prepared receipts remain provably unsubmitted across repeated cancellation and host restarts", linux, async context => {
+  const f = await fixture(), host = manager();
+  context.after(() => rm(f.root, {recursive: true, force: true}));
+  const controlRoot = path.join(f.root, "host");
+  const receiptPath = path.join(controlRoot, "engines", `${engineUnitName("repeat-cancelled")}.json`);
+  const originalOpen = fs.promises.open;
+  let controller = new AbortController();
+  fs.promises.open = async (filename, flags, mode) => {
+    if (typeof filename === "string" && filename.endsWith(".stderr.log")) controller.abort();
+    return await originalOpen(filename, flags, mode);
+  };
+  syncBuiltinESMExports();
+  try {
+    for (let iteration = 0; iteration < 3; iteration++) {
+      controller = new AbortController();
+      const engine = new SystemdEngineHost({cliPath: path.resolve("dist/cli.js"), controlRoot, command: host.command});
+      await assert.rejects(engine.launch(f.attempt, "repeat-cancelled", "run", controller.signal), EngineLaunchCancelledError);
+      const receipt = JSON.parse(await readFile(receiptPath, "utf8"));
+      assert.equal(receipt.version, 2);
+      assert.equal(receipt.phase, "prepared");
+      assert.equal(receipt.invocationId, undefined);
+      await assert.rejects(engine.reattach(f.attempt, "repeat-cancelled", "run"), EngineLaunchCancelledError);
+    }
+  } finally { fs.promises.open = originalOpen; syncBuiltinESMExports(); }
+  assert.equal(host.calls.some(call => call.executable.endsWith("systemd-run")), false);
+});
+
+test("a cancelled queued launch still proves its durable prepared state before returning cancellation", linux, async context => {
+  const f = await fixture(), host = manager();
+  context.after(() => rm(f.root, {recursive: true, force: true}));
+  const controlRoot = path.join(f.root, "host"), controller = new AbortController();
+  const engine = new SystemdEngineHost({cliPath: path.resolve("dist/cli.js"), controlRoot, command: host.command});
+  const launching = engine.launch(f.attempt, "cancel-before-entry", "run", controller.signal);
+  controller.abort();
+  await assert.rejects(launching, EngineLaunchCancelledError);
+  assert.equal(host.calls.every(call => call.executable.endsWith("systemctl")), true);
+  await assert.rejects(access(controlRoot));
+});
+
+test("a committed submitting phase stays unknown after cancellation before the client starts", linux, async context => {
+  const f = await fixture(), host = manager();
+  context.after(() => rm(f.root, {recursive: true, force: true}));
+  const controlRoot = path.join(f.root, "host");
+  const receiptPath = path.join(controlRoot, "engines", `${engineUnitName("commit-cancelled")}.json`);
+  const controller = new AbortController(), originalRename = fs.promises.rename;
+  fs.promises.rename = async (source, destination) => {
+    if (destination === receiptPath && JSON.parse(await readFile(source, "utf8")).phase === "submitting") controller.abort();
+    await originalRename(source, destination);
+  };
+  syncBuiltinESMExports();
+  try {
+    const engine = new SystemdEngineHost({cliPath: path.resolve("dist/cli.js"), controlRoot, command: host.command});
+    await assert.rejects(engine.launch(f.attempt, "commit-cancelled", "run", controller.signal),
+      error => error instanceof Error && !(error instanceof EngineLaunchCancelledError) && !(error instanceof EngineLaunchRefusedError));
+  } finally { fs.promises.rename = originalRename; syncBuiltinESMExports(); }
+  assert.equal(JSON.parse(await readFile(receiptPath, "utf8")).phase, "submitting");
+  assert.equal(host.calls.some(call => call.executable.endsWith("systemd-run")), false);
+  const restarted = new SystemdEngineHost({cliPath: path.resolve("dist/cli.js"), controlRoot, command: host.command});
+  assert.equal(await restarted.reattach(f.attempt, "commit-cancelled", "run"), undefined);
+});
+
+test("legacy receipts never acquire an unsubmitted proof and observed legacy invocations upgrade safely", linux, async context => {
+  const f = await fixture(), host = manager();
+  context.after(() => rm(f.root, {recursive: true, force: true}));
+  const controlRoot = path.join(f.root, "host");
+  const engine = new SystemdEngineHost({cliPath: path.resolve("dist/cli.js"), controlRoot, command: host.command});
+  const identity = await engine.launch(f.attempt, "legacy-token", "run");
+  const receiptPath = path.join(controlRoot, "engines", `${identity.unit}.json`);
+  const current = JSON.parse(await readFile(receiptPath, "utf8"));
+  await writeFile(receiptPath, JSON.stringify({version: 1, binding: current.binding, invocationId: identity.invocationId}));
+  const restarted = new SystemdEngineHost({cliPath: path.resolve("dist/cli.js"), controlRoot, command: host.command});
+  assert.deepEqual(await restarted.reattach(f.attempt, "legacy-token", "run"), identity);
+  assert.equal(JSON.parse(await readFile(receiptPath, "utf8")).phase, "submitting");
+  host.forget();
+  await writeFile(receiptPath, JSON.stringify({version: 1, binding: current.binding}));
+  assert.equal(await restarted.reattach(f.attempt, "legacy-token", "run"), undefined);
+  const controller = new AbortController();
+  const cancelled = new SystemdEngineHost({cliPath: path.resolve("dist/cli.js"), controlRoot,
+    command: async (executable, args, options) => {
+      if (args[1] === "binding") controller.abort();
+      return await host.command(executable, args, options);
+    }});
+  await assert.rejects(cancelled.launch(f.attempt, "legacy-token", "run", controller.signal),
+    error => error instanceof Error && !(error instanceof EngineLaunchCancelledError) && !(error instanceof EngineLaunchRefusedError));
+  assert.equal(JSON.parse(await readFile(receiptPath, "utf8")).version, 1);
+});
+
+test("same-token launch calls serialize their durable submission and attach to one invocation", linux, async context => {
+  const f = await fixture(), host = manager();
+  context.after(() => rm(f.root, {recursive: true, force: true}));
+  const controlRoot = path.join(f.root, "host"), entered = barrier(), release = barrier();
+  context.after(() => release.resolve());
+  const engine = new SystemdEngineHost({cliPath: path.resolve("dist/cli.js"), controlRoot,
+    command: async (executable, args, options) => {
+      if (executable.endsWith("systemd-run")) {
+        const receipt = JSON.parse(await readFile(path.join(controlRoot, "engines", `${engineUnitName("concurrent-token")}.json`), "utf8"));
+        assert.equal(receipt.phase, "submitting", "the submission intent is durable before entering the command runner");
+        entered.resolve(); await release.promise;
+      }
+      return await host.command(executable, args, options);
+    }});
+  const first = engine.launch(f.attempt, "concurrent-token", "run");
+  await entered.promise;
+  const second = engine.launch(f.attempt, "concurrent-token", "run");
+  release.resolve();
+  assert.deepEqual(await second, await first);
+  assert.equal(host.calls.filter(call => call.executable.endsWith("systemd-run")).length, 1);
+});
+
+test("receipt versions and submission phases reject contradictory or unknown control fields", linux, async context => {
+  const f = await fixture(), host = manager();
+  context.after(() => rm(f.root, {recursive: true, force: true}));
+  const controlRoot = path.join(f.root, "host");
+  const engine = new SystemdEngineHost({cliPath: path.resolve("dist/cli.js"), controlRoot, command: host.command});
+  const identity = await engine.launch(f.attempt, "strict-receipt", "run");
+  const receiptPath = path.join(controlRoot, "engines", `${identity.unit}.json`);
+  const receipt = JSON.parse(await readFile(receiptPath, "utf8"));
+  const calls = host.calls.length;
+  for (const value of [{...receipt, phase: "prepared"}, {...receipt, phase: "unknown"}, {...receipt, version: 3},
+    {...receipt, extra: true}, {version: 1, binding: receipt.binding, phase: "prepared"}]) {
+    await writeFile(receiptPath, JSON.stringify(value));
+    await assert.rejects(engine.reattach(f.attempt, "strict-receipt", "run"), /receipt unavailable/);
+  }
+  assert.equal(host.calls.length, calls, "malformed receipts cannot cause any command probe or submission");
+  await writeFile(receiptPath, JSON.stringify({version: 2, phase: "prepared", binding: receipt.binding}));
+  await assert.rejects(engine.reattach(f.attempt, "strict-receipt", "run"), /identity changed/,
+    "a prepared receipt cannot claim an already-present invocation");
+});
+
 test("immutable local launch refusals are explicit and cannot create an engine or receipt", linux, async context => {
   const f = await fixture();
   context.after(() => rm(f.root, {recursive: true, force: true}));

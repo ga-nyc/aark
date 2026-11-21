@@ -74,7 +74,7 @@ class FakeAgent implements AgentBridge {
     this.preflights++;
     if (this.unavailablePreflights > 0) { this.unavailablePreflights--; throw new Error("synthetic agent registration unavailable"); }
   }
-  async request(event: AgentEvent): Promise<AgentReply> {
+  async request(event: AgentEvent, _signal?: AbortSignal): Promise<AgentReply> {
     this.active++;
     this.maximumActive = Math.max(this.maximumActive, this.active);
     try {
@@ -497,6 +497,103 @@ test("run cancellation during observation prevents an independent launch and pre
   assert.equal(f.agent.requests.length, 0, "shutdown does not dispatch a fresh agent decision");
   await tick(supervisor);
   assert.equal(f.host.launches.length, 3, "an explicit manual tick remains usable after run stops");
+});
+
+test("an already cancelled tick skips a due agent registration retry", linuxOnly, async t => {
+  const f = await fixture();
+  f.agent.unavailablePreflights = 1;
+  await initializeCase(f.filename, {execute: true});
+  let now = Date.now();
+  const supervisor = await CaseSupervisor.open(f.control, {host: f.host, agent: f.agent, clock: () => now});
+  t.after(() => supervisor.close());
+  assert.equal(f.agent.preflights, 1);
+  now += 60_000;
+  const controller = new AbortController();
+  const queued = supervisor.tick(controller.signal);
+  controller.abort();
+  await queued;
+  assert.equal(f.agent.preflights, 1);
+  assert.equal(f.host.launches.length, 0);
+  await tick(supervisor);
+  assert.equal(f.agent.preflights, 2);
+  assert.equal(f.host.launches.length, 1);
+});
+
+test("graceful close preserves a returned permission reply and its budget before releasing ownership", linuxOnly, async () => {
+  const f = await fixture({jobs: 2, maxConcurrent: 1, maxRequests: 1});
+  await initializeCase(f.filename, {execute: true});
+  const supervisor = await CaseSupervisor.open(f.control, {host: f.host, agent: f.agent});
+  await tick(supervisor);
+  f.host.observations.set(f.host.launches[0]!.identity.unit, {status: "failed"});
+  await tick(supervisor);
+  f.agent.reply(0, {type: "needs-permission", reason: "agent-approval-required"});
+  // Deliberately do not wait for the promise chain or another reconciliation.
+  await Promise.all([supervisor.close(), supervisor.close()]);
+  const {state} = await loadCaseState(f.control);
+  assert.equal(state.permissionReason, "agent-approval-required");
+  assert.equal(state.health, "awaiting-permission");
+  assert.equal(state.agentRequests, 1);
+  assert.equal(state.outbox[0]!.status, "processed");
+  assert.equal(state.outbox[0]!.deliveries, 1);
+  assert.deepEqual(state.outbox[0]!.reply?.action, {type: "needs-permission", reason: "agent-approval-required"});
+  assert.equal(f.agent.closed, 1, "concurrent close calls share one shutdown");
+  const agent = new FakeAgent();
+  const restarted = await CaseSupervisor.open(f.control, {host: f.host, agent});
+  try {
+    await tick(restarted);
+    assert.equal((await loadCaseState(f.control)).state.permissionReason, "agent-approval-required");
+    assert.equal(agent.requests.length, 0);
+    assert.equal(f.host.launches.length, 2, "the independently launched job remains running without a new launch");
+  } finally { await restarted.close(); }
+});
+
+test("graceful close does not wait indefinitely for an unresolved bridge request", {...linuxOnly, timeout: 2000}, async () => {
+  const f = await fixture({maxRequests: 1});
+  f.agent.close = async () => {}; // Model a bridge that cannot settle an unknown request.
+  await initializeCase(f.filename, {execute: true});
+  const supervisor = await CaseSupervisor.open(f.control, {host: f.host, agent: f.agent});
+  await tick(supervisor);
+  f.host.observations.set(f.host.launches[0]!.identity.unit, {status: "failed"});
+  await tick(supervisor);
+  assert.equal(f.agent.active, 1);
+  await supervisor.close();
+  const {state} = await loadCaseState(f.control);
+  assert.equal(state.agentRequests, 1);
+  assert.equal(state.outbox[0]!.status, "delivering", "an unresolved delivery remains truthfully uncertain");
+});
+
+for (const queued of [false, true]) {
+  test(`graceful close ends ${queued ? "a queued" : "a sleeping"} run without another scheduling pass`, {...linuxOnly, timeout: 2000}, async () => {
+    const f = await fixture();
+    f.config.pollMs = 300_000;
+    await writeFile(f.filename, JSON.stringify(f.config));
+    await initializeCase(f.filename, {execute: true});
+    const supervisor = await CaseSupervisor.open(f.control, {host: f.host, agent: f.agent});
+    const running = supervisor.run(new AbortController().signal);
+    if (!queued) await supervisor.snapshot(); // Serialize behind the first full pass.
+    await Promise.all([running, supervisor.close()]);
+    assert.equal(f.agent.closed, 1);
+    assert.equal(f.host.launches.length, queued ? 0 : 1);
+  });
+}
+
+test("the external stop signal reaches an in-flight bridge before reconciliation observation completes", linuxOnly, async () => {
+  const f = await fixture();
+  await initializeCase(f.filename, {execute: true});
+  const controller = new AbortController(), requested = barrier();
+  let requestSignal: AbortSignal | undefined;
+  f.agent.request = async (_event, signal) => {
+    requestSignal = signal; requested.resolve();
+    return await new Promise<AgentReply>(() => {});
+  };
+  const supervisor = await CaseSupervisor.open(f.control, {host: f.host, agent: f.agent});
+  await tick(supervisor);
+  f.host.observations.set(f.host.launches[0]!.identity.unit, {status: "failed"});
+  const running = supervisor.run(controller.signal);
+  await requested.promise;
+  controller.abort();
+  assert.equal(requestSignal?.aborted, true);
+  await running; await supervisor.close();
 });
 
 test("run cancellation during quota readiness settles the observation without launching new work", linuxOnly, async t => {

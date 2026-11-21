@@ -21,7 +21,8 @@ export interface SystemdEngineHostOptions {
   /** Test seam; production always uses captureCommand. */
   command?: Command;
 }
-interface Receipt { version: 1; binding: string; invocationId?: string }
+type Receipt = {version: 1; binding: string; invocationId?: string}
+  | {version: 2; binding: string; phase: "prepared" | "submitting"; invocationId?: string};
 type Properties = Record<string, string>;
 const SYSTEMCTL = "/usr/bin/systemctl";
 const SYSTEMD_RUN = "/usr/bin/systemd-run";
@@ -44,7 +45,7 @@ export class SystemdEngineHost implements EngineHost {
   private readonly pending = new Map<string, Promise<EngineObservation>>();
   private readonly completed = new Map<string, EngineIdentity>();
   private readonly helpers = new Map<string, Promise<CommandResult>>();
-  private readonly submittedUnits = new Set<string>();
+  private readonly launches = new Map<string, Promise<EngineIdentity>>();
 
   public constructor(private readonly options: SystemdEngineHostOptions) {
     for (const value of [options.cliPath, options.controlRoot, process.execPath]) {
@@ -118,13 +119,6 @@ export class SystemdEngineHost implements EngineHost {
     return values;
   }
 
-  private submissionPending(unit: string): boolean {
-    return this.submittedUnits.has(unit) || [...this.helpers.keys()].some(key => {
-      const [executable, args] = JSON.parse(key) as [string, string[]];
-      return executable === SYSTEMD_RUN && args.includes(`--unit=${unit}`);
-    });
-  }
-
   private binding(attempt: PreparedAttempt, mode: "run" | "resume"): string {
     if (!/^[a-f0-9]{64}$/u.test(attempt.configHash) || hash(JSON.stringify(attempt.workflow)) !== attempt.configHash
       || !isSupportedCasePath(attempt.configFile) || !isSupportedCasePath(attempt.workflow.output)) throw new EngineLaunchRefusedError();
@@ -132,7 +126,18 @@ export class SystemdEngineHost implements EngineHost {
   }
 
   private async receipt(unit: string): Promise<Receipt | undefined> {
-    try { return await readJson<Receipt>(path.join(this.directory, `${unit}.json`), 4096); }
+    try {
+      const value = await readJson<unknown>(path.join(this.directory, `${unit}.json`), 4096);
+      if (typeof value !== "object" || value === null || Array.isArray(value)) throw new Error();
+      const row = value as Record<string, unknown>;
+      if (typeof row.binding !== "string" || !/^[a-f0-9]{64}$/u.test(row.binding)
+        || (row.invocationId !== undefined && (typeof row.invocationId !== "string" || !/^[a-f0-9]{32}$/u.test(row.invocationId)))
+        || (row.version === 1 ? Object.keys(row).some(key => !["version", "binding", "invocationId"].includes(key))
+          : row.version !== 2 || !["prepared", "submitting"].includes(String(row.phase))
+            || Object.keys(row).some(key => !["version", "binding", "phase", "invocationId"].includes(key))
+            || (row.phase === "prepared" && row.invocationId !== undefined))) throw new Error();
+      return value as Receipt;
+    }
     catch (error) {
       if (error instanceof Error && "code" in error && error.code === "ENOENT") return undefined;
       throw new Error("case engine receipt unavailable");
@@ -168,32 +173,48 @@ export class SystemdEngineHost implements EngineHost {
     const unit = engineUnitName(token);
     const receipt = await this.receipt(unit);
     const binding = this.checkedBinding(attempt, mode, receipt);
+    if (receipt !== undefined && receipt.binding !== binding) throw new Error("case engine identity changed");
     const values = await this.show(unit);
-    if (values === undefined) return undefined;
+    if (values === undefined) {
+      if (receipt?.version === 2 && receipt.phase === "prepared") throw new EngineLaunchCancelledError();
+      return undefined;
+    }
     const receiptPath = path.join(this.directory, `${unit}.json`);
     if (receipt === undefined) throw new Error("case engine receipt unavailable");
-    if (receipt.version !== 1 || receipt.binding !== binding
-      || (receipt.invocationId !== undefined && !/^[a-f0-9]{32}$/u.test(receipt.invocationId))) throw new Error("case engine identity changed");
+    if (receipt.binding !== binding || (receipt.version === 2 && receipt.phase === "prepared")) throw new Error("case engine identity changed");
     const invocationId = this.assertUnit(values, binding);
     if (receipt.invocationId !== undefined && receipt.invocationId !== invocationId) throw new Error("case engine identity changed");
     // An interrupted launch may have persisted its intent before observing identity.
-    if (receipt.invocationId === undefined) await atomicWriteJson(receiptPath, {version: 1, binding, invocationId});
+    if (receipt.invocationId === undefined || receipt.version === 1) await atomicWriteJson(receiptPath, {version: 2, phase: "submitting", binding, invocationId});
     return {unit, invocationId};
   }
 
   public async launch(attempt: PreparedAttempt, token: string, mode: "run" | "resume", signal?: AbortSignal): Promise<EngineIdentity> {
-    signal?.throwIfAborted();
     const unit = engineUnitName(token);
+    // Serializing a stable token makes receipt transitions monotonic even when
+    // callers overlap. A later call must reread the first call's durable phase.
+    const previous = this.launches.get(unit);
+    const launching = (previous === undefined ? Promise.resolve() : previous.then(() => undefined, () => undefined))
+      .then(() => this.launchOnce(attempt, unit, mode, signal));
+    this.launches.set(unit, launching);
+    try { return await launching; }
+    finally { if (this.launches.get(unit) === launching) this.launches.delete(unit); }
+  }
+
+  private async launchOnce(attempt: PreparedAttempt, unit: string, mode: "run" | "resume", signal?: AbortSignal): Promise<EngineIdentity> {
+    // Even a queued call cancelled before entry must inspect the durable phase
+    // before claiming no submission. These receipt/unit observations are read-only.
     const receiptPath = path.join(this.directory, `${unit}.json`);
     const receipt = await this.receipt(unit);
     const binding = this.checkedBinding(attempt, mode, receipt);
-    if (receipt !== undefined && (receipt.version !== 1 || receipt.binding !== binding
-      || (receipt.invocationId !== undefined && !/^[a-f0-9]{32}$/u.test(receipt.invocationId)))) throw new Error("case engine identity changed");
+    if (receipt !== undefined && receipt.binding !== binding) throw new Error("case engine identity changed");
     let values = await this.show(unit);
+    if (values !== undefined && receipt?.version === 2 && receipt.phase === "prepared") throw new Error("case engine identity changed");
     if (values === undefined) {
       // A previously observed invocation must never be replaced under its old token.
       if (receipt?.invocationId !== undefined) throw new Error("case engine invocation disappeared");
-      let submitted = false;
+      // A version-1 receipt cannot establish whether its old writer submitted.
+      let phase = receipt === undefined || (receipt.version === 2 && receipt.phase === "prepared") ? "prepared" : "submitting";
       try {
       signal?.throwIfAborted();
       await ensurePrivateDirectory(this.directory);
@@ -202,7 +223,7 @@ export class SystemdEngineHost implements EngineHost {
       if (config.exitCode === 2 && config.terminationReason === null && !config.stdoutTruncated && !config.stderrTruncated
         && config.stdout.toString().trim() === '{"valid":false,"reason":"source-identity-changed"}') throw new CaseSourceIdentityError();
       if (!successful(config) || config.stdout.toString().trim() !== '{"valid":true}') throw new Error("case engine configuration binding changed");
-      await atomicWriteJson(receiptPath, {version: 1, binding});
+      if (receipt === undefined) await atomicWriteJson(receiptPath, {version: 2, phase: "prepared", binding});
       const logs = ["stdout", "stderr"].map(kind => path.join(this.directory, `${unit}.${kind}.log`));
       for (const filename of logs) {
         const handle = await open(filename, constants.O_CREAT | constants.O_APPEND | constants.O_WRONLY | constants.O_NOFOLLOW, 0o600);
@@ -217,17 +238,17 @@ export class SystemdEngineHost implements EngineHost {
         "--", process.execPath, this.options.cliPath, "workflow", mode,
         ...(mode === "run" ? ["--config", attempt.configFile] : ["--output", attempt.workflow.output]), "--expected-config-hash", attempt.configHash,
         ...(attempt.workflow.recovery === undefined ? [] : ["--expected-source-bindings", JSON.stringify(this.sourcePolicy(attempt))]), "--execute"];
-      // A client timeout can leave a successfully started service. Always reconcile it.
-      // A reused helper may already be submitting this same stable token.
-      submitted = this.submissionPending(unit);
+      signal?.throwIfAborted();
+      // Once this write is attempted, a crash or write failure can leave a
+      // durable submission intent. Never downgrade it to prepared afterward.
+      phase = "submitting";
+      await atomicWriteJson(receiptPath, {version: 2, phase, binding});
       let cancelledBeforeStart = false;
       try {
         await this.capture(SYSTEMD_RUN, args, this.timeout, () => {
           // Do not pass this signal to the client: once submitted, its engine
           // is independent and still needs the normal identity reconciliation.
           if (signal?.aborted) { cancelledBeforeStart = true; signal.throwIfAborted(); }
-          submitted = true;
-          this.submittedUnits.add(unit);
         });
       } catch (error) {
         if (cancelledBeforeStart) throw error;
@@ -236,20 +257,22 @@ export class SystemdEngineHost implements EngineHost {
       values = await this.show(unit);
       if (values === undefined) throw new Error("case engine launch was not observed");
       } catch (error) {
-        if (!submitted && signal?.aborted) {
-          if (receipt === undefined && !this.submissionPending(unit)) throw new EngineLaunchCancelledError();
+        if (phase === "prepared" && signal?.aborted) {
+          throw new EngineLaunchCancelledError();
+        }
+        if (signal?.aborted) {
           throw error;
         }
         if (error instanceof CaseSourceIdentityError) throw error;
         // An absent unit and no prior receipt prove this is a pre-submit
         // refusal. Once submission starts, even a timeout remains unknown.
-        if (!submitted && receipt === undefined && !this.submissionPending(unit)) throw new EngineLaunchRefusedError();
+        if (phase === "prepared") throw new EngineLaunchRefusedError();
         throw error;
       }
     }
     const invocationId = this.assertUnit(values, binding);
     if (receipt?.invocationId !== undefined && receipt.invocationId !== invocationId) throw new Error("case engine identity changed");
-    await atomicWriteJson(receiptPath, {version: 1, binding, invocationId});
+    await atomicWriteJson(receiptPath, {version: 2, phase: "submitting", binding, invocationId});
     return {unit, invocationId};
   }
 
@@ -265,8 +288,9 @@ export class SystemdEngineHost implements EngineHost {
     let confirmedFailure = false;
     try {
       if (!/^aark-case-engine-[a-f0-9]{40}\.service$/u.test(identity.unit) || !/^[a-f0-9]{32}$/u.test(identity.invocationId)) return {status: "unknown"};
-      const receipt = await readJson<Receipt>(path.join(this.directory, `${identity.unit}.json`), 4096);
-      if (![this.binding(attempt, "run"), this.binding(attempt, "resume")].includes(receipt.binding)) return {status: "unknown"};
+      const receipt = await this.receipt(identity.unit);
+      if (receipt === undefined || (receipt.version === 2 && receipt.phase === "prepared")
+        || ![this.binding(attempt, "run"), this.binding(attempt, "resume")].includes(receipt.binding)) return {status: "unknown"};
       const values = await this.show(identity.unit);
       if (values === undefined || this.assertUnit(values, receipt.binding) !== identity.invocationId || receipt.invocationId !== identity.invocationId) return {status: "unknown"};
       const running = ["activating", "reloading", "deactivating"].includes(values.ActiveState ?? "")

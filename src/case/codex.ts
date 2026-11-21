@@ -143,6 +143,7 @@ interface Pending { resolve(value: unknown): void; reject(error: Error): void }
 interface TurnWaiter {
   event: AgentEvent; id?: string; completed: Map<string, Record<string, unknown>>;
   messages: Map<string, Map<string, string>>;
+  reply?: AgentReply;
   resolve(reply: AgentReply): void; reject(error: Error): void;
 }
 
@@ -173,10 +174,10 @@ export class CodexAgentBridge implements AgentBridge {
     this.config = { ...config, readableRoots: [...config.readableRoots] };
     this.deps = dependencies;
   }
-  async preflight(): Promise<void> {
+  async preflight(signal?: AbortSignal): Promise<void> {
     if (this.working || this.closed) fail(this.closed ? "agent-unavailable" : "agent-busy");
     this.working = true;
-    try { await this.deadline((signal) => this.setup(signal)); }
+    try { await this.deadline((current) => this.setup(current), signal); }
     catch (error) {
       const fixed = error instanceof CodexAgentError ? error : new CodexAgentError("agent-unavailable");
       this.disconnect(fixed);
@@ -184,7 +185,7 @@ export class CodexAgentBridge implements AgentBridge {
     }
     finally { this.working = false; }
   }
-  async request(input: AgentEvent): Promise<AgentReply> {
+  async request(input: AgentEvent, externalSignal?: AbortSignal): Promise<AgentReply> {
     const event = validateAgentEvent(input);
     if (this.closed) fail("agent-unavailable");
     if (this.working) fail("agent-busy");
@@ -196,15 +197,19 @@ export class CodexAgentBridge implements AgentBridge {
     try {
       const reply = await this.deadline(async (signal) => {
         await this.setup(signal);
+        this.assertActive(signal);
         const receipt = this.receipt!;
-        this.checkThread(await this.rpc("thread/read", { threadId: receipt.threadId, includeTurns: false }), receipt.threadId, true);
+        const thread = await this.rpc("thread/read", { threadId: receipt.threadId, includeTurns: false });
+        this.assertActive(signal);
+        this.checkThread(thread, receipt.threadId, true);
         // The transport can stay ready across many events. External/user goal
         // changes must be checked again before each decision turn, without ever
         // clearing a goal or taking over its automatic continuation lifecycle.
         const goal = await this.rpc("thread/goal/get", { threadId: receipt.threadId });
+        this.assertActive(signal);
         if (!object(goal) || !Object.hasOwn(goal, "goal")) fail("agent-invalid-response");
         if (goal.goal !== null) fail("agent-approval-required");
-        signal.throwIfAborted();
+        this.assertActive(signal);
         let resolve!: (reply: AgentReply) => void;
         let reject!: (error: Error) => void;
         const result = new Promise<AgentReply>((yes, no) => { resolve = yes; reject = no; });
@@ -226,11 +231,19 @@ export class CodexAgentBridge implements AgentBridge {
           this.finishTurn();
         }
         return result;
-      });
+      }, externalSignal);
       this.replies.set(key, reply);
       if (this.blockedReply) this.disconnect(new CodexAgentError("agent-approval-required"));
       return structuredClone(reply);
     } catch (error) {
+      // Completion can arrive before cancellation while its async return is
+      // still propagating. A known validated reply must survive that race.
+      if (this.turn?.reply !== undefined) {
+        const reply = this.turn.reply;
+        this.replies.set(key, reply);
+        this.disconnect(new CodexAgentError("agent-unavailable"));
+        return structuredClone(reply);
+      }
       if (this.blockedReply || (error instanceof CodexAgentError && error.code === "agent-approval-required")) {
         const reply: AgentReply = this.blockedReply ?? { eventId: event.eventId, revision: event.revision,
           action: { type: "needs-permission", reason: "agent-approval-required" } };
@@ -246,9 +259,19 @@ export class CodexAgentBridge implements AgentBridge {
     this.closed = true;
     this.disconnect(new CodexAgentError("agent-unavailable"));
   }
-  private async deadline<T>(operation: (signal: AbortSignal) => Promise<T>): Promise<T> {
+  private async deadline<T>(operation: (signal: AbortSignal) => Promise<T>, externalSignal?: AbortSignal): Promise<T> {
+    if (externalSignal?.aborted) fail("agent-unavailable");
     const controller = new AbortController();
     let timer: NodeJS.Timeout | undefined;
+    let rejectStopped!: (error: CodexAgentError) => void;
+    const stopped = new Promise<never>((_resolve, reject) => { rejectStopped = reject; });
+    const stop = () => {
+      const error = new CodexAgentError("agent-unavailable");
+      controller.abort(error);
+      this.disconnect(error);
+      rejectStopped(error);
+    };
+    externalSignal?.addEventListener("abort", stop, {once: true});
     const timedOut = new Promise<never>((_, reject) => {
       timer = setTimeout(() => {
         const error = new CodexAgentError("agent-timeout");
@@ -257,53 +280,67 @@ export class CodexAgentBridge implements AgentBridge {
         reject(error);
       }, this.config.timeoutMs);
     });
-    try { return await Promise.race([operation(controller.signal), timedOut]); }
-    finally { if (timer) clearTimeout(timer); }
+    try { return await Promise.race([operation(controller.signal), timedOut, stopped]); }
+    finally { if (timer) clearTimeout(timer); externalSignal?.removeEventListener("abort", stop); }
+  }
+  private assertActive(signal: AbortSignal): void {
+    signal.throwIfAborted();
+    if (this.closed) fail("agent-unavailable");
   }
   private bindingHash(): string {
     return createHash("sha256").update(JSON.stringify({ ownership: this.config.ownership, executable: this.config.executable, socketPath: this.config.socketPath,
       parentThreadId: this.config.threadId, user: this.config.user, readableRoots: this.config.readableRoots })).digest("hex");
   }
   private async setup(signal: AbortSignal): Promise<void> {
-    if (this.closed) fail("agent-unavailable");
+    this.assertActive(signal);
     if (this.ready) return;
     const identity = await (this.deps.validate ?? validateCodexAgentConfig)(this.config);
-    signal.throwIfAborted();
+    this.assertActive(signal);
     await this.prepareState();
-    signal.throwIfAborted();
-    await this.startProxy(identity);
+    this.assertActive(signal);
+    await this.startProxy(identity, signal);
+    this.assertActive(signal);
     await this.rpc("initialize", { clientInfo: { name: "aark-case-supervisor", version: "1" }, capabilities: { experimentalApi: true } });
+    this.assertActive(signal);
     this.send({ method: "initialized", params: {} });
     this.receipt = await this.readReceipt();
-    signal.throwIfAborted();
+    this.assertActive(signal);
     const profile = this.receipt?.profile ?? `aark-case-${randomUUID()}`;
     const settings = await this.restrictedSettings(profile);
+    this.assertActive(signal);
     if (!this.receipt) {
-      this.checkThread(await this.rpc("thread/read", { threadId: this.config.threadId, includeTurns: false }), this.config.threadId, false);
+      const parent = await this.rpc("thread/read", { threadId: this.config.threadId, includeTurns: false });
+      this.assertActive(signal);
+      this.checkThread(parent, this.config.threadId, false);
       await this.claimThread();
-      signal.throwIfAborted();
+      this.assertActive(signal);
       const response = await this.rpc("thread/start", { dynamicTools: [], environments: [], ephemeral: false, ...settings });
       if (!object(response) || !object(response.thread) || !identifier(response.thread.id) || response.thread.id === this.config.threadId) fail("agent-invalid-response");
       this.receipt = { version: 1, bindingHash: this.bindingHash(), parentThreadId: this.config.threadId, threadId: response.thread.id, profile };
       // Persist identity before subsequent setup: uncertainty must not create another thread.
       await this.writeReceipt(this.receipt);
-      signal.throwIfAborted();
+      this.assertActive(signal);
       await unlink(path.join(this.config.stateDirectory, "codex-thread-intent.json"));
+      this.assertActive(signal);
       this.checkThread(response, this.receipt.threadId, true);
       this.checkSettings(response, profile);
     }
+    this.assertActive(signal);
     const resumed = await this.rpc("thread/resume", { threadId: this.receipt.threadId, excludeTurns: true, ...settings });
+    this.assertActive(signal);
     this.checkThread(resumed, this.receipt.threadId, true);
     this.checkSettings(resumed, profile);
     // A fresh decision thread has no inherited goal. A later goal belongs to
     // external/user intent and must not be cleared or automatically continued.
     const goal = await this.rpc("thread/goal/get", { threadId: this.receipt.threadId });
+    this.assertActive(signal);
     if (!object(goal) || !Object.hasOwn(goal, "goal")) fail("agent-invalid-response");
     if (goal.goal !== null) fail("agent-approval-required");
-    signal.throwIfAborted();
+    this.assertActive(signal);
     this.ready = true;
   }
-  private async startProxy(identity: CodexValidatedBinding): Promise<void> {
+  private async startProxy(identity: CodexValidatedBinding, signal: AbortSignal): Promise<void> {
+    this.assertActive(signal);
     // This command is a stdio-to-Unix-socket proxy, not a new model session.
     const args = ["app-server", "proxy", "--sock", this.config.socketPath];
     const executable = identity.currentUid === 0 ? "/usr/sbin/runuser" : this.config.executable;
@@ -322,6 +359,7 @@ export class CodexAgentBridge implements AgentBridge {
     child.once("exit", () => { if (this.child === child) this.disconnect(new CodexAgentError("agent-unavailable")); });
     transport.start();
     await transport.ready;
+    this.assertActive(signal);
   }
   private send(value: unknown): void {
     if (!this.child || this.closed || this.transport === undefined) fail("agent-unavailable");
@@ -409,7 +447,8 @@ export class CodexAgentBridge implements AgentBridge {
       const messages = waiter.messages.get(waiter.id);
       if (!messages || messages.size !== 1) fail("agent-invalid-response");
       const text = [...messages.values()][0]!;
-      waiter.resolve(validateAgentReply(JSON.parse(text), waiter.event));
+      waiter.reply = validateAgentReply(JSON.parse(text), waiter.event);
+      waiter.resolve(waiter.reply);
     } catch { waiter.reject(new CodexAgentError("agent-invalid-response")); }
   }
   private checkThread(response: unknown, expected: string, child: boolean): void {

@@ -15,12 +15,18 @@ import type { AgentBridge, AgentEvent, AgentReply, CaseAttempt, CaseConfig, Case
 interface Options {host: EngineHost; agent: AgentBridge; clock?: () => number}
 type AgentResult = {entry: OutboxEntry; reply?: AgentReply; failed?: true};
 type ProofResult = {proof?: CompletionProof; failed?: true};
+class SupervisorClosedError extends Error {
+  constructor() { super("case supervisor is closed"); }
+}
 
 /** Policy reconciliation owns no engine PID and never sends a signal to one. */
 export class CaseSupervisor {
   private readonly clock: () => number;
   private tail: Promise<unknown> = Promise.resolve();
   private closed = false;
+  private closing = false;
+  private closingTask: Promise<void> | undefined;
+  private readonly shutdown = new AbortController();
   private agentReady = false;
   private nextPreflight = 0;
   private agentInFlight = false;
@@ -52,7 +58,7 @@ export class CaseSupervisor {
   }
 
   private serialized<T>(action: () => Promise<T>): Promise<T> {
-    const next = this.tail.then(async () => { if (this.closed) throw new Error("case supervisor is closed"); return action(); });
+    const next = this.tail.then(async () => { if (this.closed || this.closing) throw new SupervisorClosedError(); return action(); });
     this.tail = next.catch(() => undefined);
     return next;
   }
@@ -61,18 +67,25 @@ export class CaseSupervisor {
     await this.lease.assertHeld();
     this.state.updatedAt = new Date(this.clock()).toISOString();
     await saveCaseState(this.config.control, this.config, this.state);
+    // The advisory cache may fail independently, but loss of authoritative
+    // control ownership must still stop every subsequent external operation.
+    await this.lease.assertHeld();
   }
 
-  private async preflightAgent(): Promise<void> {
-    if (this.agentReady || this.clock() < this.nextPreflight) return;
-    try { await this.options.agent.preflight(); this.agentReady = true; }
+  private async preflightAgent(signal?: AbortSignal): Promise<void> {
+    if (signal?.aborted || this.agentReady || this.clock() < this.nextPreflight) return;
+    try { await this.options.agent.preflight(signal); this.agentReady = true; }
     catch (error) {
       if (error instanceof CodexAgentError && error.code === "agent-approval-required") this.state.permissionReason = "agent-approval-required";
+      if (signal?.aborted) return;
       this.state.health = "agent-unavailable"; this.nextPreflight = this.clock() + 60_000;
     }
   }
 
-  public tick(signal?: AbortSignal): Promise<void> { return this.serialized(() => this.reconcile(signal)); }
+  public tick(signal?: AbortSignal): Promise<void> {
+    const stopping = signal === undefined ? this.shutdown.signal : AbortSignal.any([signal, this.shutdown.signal]);
+    return this.serialized(() => this.reconcile(stopping));
+  }
   public snapshot(): Promise<Record<string, unknown>> { return this.serialized(async () => redactedCaseStatus(this.config, this.state)); }
   public pause(): Promise<void> { return this.serialized(async () => { this.setDesired("user-paused"); await this.persist(); }); }
   public resume(): Promise<void> { return this.serialized(async () => { this.setDesired("running"); await this.persist(); }); }
@@ -287,6 +300,12 @@ export class CaseSupervisor {
             this.changed(); await this.persist(); continue;
           }
         } catch (error) {
+          if (error instanceof EngineLaunchCancelledError) {
+            // A durable prepared receipt proves this inherited intent never
+            // submitted. Restore its fresh quota gate before polling below.
+            delete attempt.dispatched;
+            this.changed(); await this.persist(); continue;
+          }
           if (error instanceof EngineLaunchRefusedError) {
             attempt.status = "failed"; attempt.launchRefused = true; attempt.observation = {status: "failed"};
             this.changed(); await this.persist(); continue;
@@ -372,6 +391,17 @@ export class CaseSupervisor {
     return this.state.outbox.reduce((until, row) => row.deliveries > 0 ? Math.max(until, row.nextDeliveryAt) : until, 0);
   }
 
+  private refreshHealth(): void {
+    const statuses = this.state.jobs.map(job => job.attempts.at(-1)?.status);
+    const pendingDelivery = this.state.outbox.some(row => row.status === "pending");
+    const transportBlocked = pendingDelivery && this.clock() < this.transportBackoffUntil();
+    this.state.health = this.state.permissionReason !== undefined ? "awaiting-permission"
+      : !this.agentReady || transportBlocked || (this.state.agentRequests >= this.config.agent.maxRequests && pendingDelivery) ? "agent-unavailable"
+      : this.observationUnavailable ? "observation-unavailable"
+      : this.state.outbox.some(row => row.status !== "processed") ? "awaiting-agent"
+      : this.capacityWaiting || statuses.some(status => status === "failed" || status === "paused") ? "degraded" : "healthy";
+  }
+
   private async dispatch(signal?: AbortSignal): Promise<void> {
     if (signal?.aborted || this.agentInFlight || !this.agentReady || this.state.desired !== "running") return;
     // A new event must not bypass a failed request's durable transport cooldown.
@@ -392,7 +422,7 @@ export class CaseSupervisor {
     // the cancellation check and actual delivery.
     void (async () => {
       try {
-        const reply = await this.options.agent.request(structuredClone(entry.event));
+        const reply = await this.options.agent.request(structuredClone(entry.event), signal);
         if (!this.closed) this.agentResult = {entry, reply};
       } catch { if (!this.closed) this.agentResult = {entry, failed: true}; }
       finally { this.agentInFlight = false; }
@@ -403,7 +433,7 @@ export class CaseSupervisor {
     await this.lease.assertHeld();
     this.locations.clear();
     await this.readCommand();
-    await this.preflightAgent();
+    await this.preflightAgent(signal);
     await this.observe();
     const unavailableReattachments = await this.reattach();
     const unavailableBeforeCapacity = this.observationUnavailable;
@@ -448,37 +478,51 @@ export class CaseSupervisor {
     else if (statuses.includes("failed")) this.queueDecision("job-failed");
     else if (this.state.jobs.some(job => { const latest = job.attempts.at(-1); return latest?.status === "paused" && latest.resumeReady === true; })) this.queueDecision("job-paused");
     else if (unavailableBeforeCapacity) this.queueDecision("observation-unavailable");
-    const pendingDelivery = this.state.outbox.some(row => row.status === "pending");
     // Historical failures still constrain dispatch, but health describes work
     // that is currently waiting and only while its transport deadline is live.
-    const transportBlocked = pendingDelivery && this.clock() < this.transportBackoffUntil();
-    this.state.health = this.state.permissionReason !== undefined ? "awaiting-permission"
-      : !this.agentReady || transportBlocked || (this.state.agentRequests >= this.config.agent.maxRequests && pendingDelivery) ? "agent-unavailable"
-      : this.observationUnavailable ? "observation-unavailable"
-      : this.state.outbox.some(row => row.status !== "processed") ? "awaiting-agent"
-      : this.capacityWaiting || statuses.some(status => status === "failed" || status === "paused") ? "degraded" : "healthy";
+    this.refreshHealth();
     await this.persist();
     if (!signal?.aborted) await this.dispatch(signal);
   }
 
   public async run(signal: AbortSignal): Promise<void> {
-    while (!signal.aborted && !this.closed) {
-      await this.tick(signal);
-      if (signal.aborted) break;
+    const stopping = AbortSignal.any([signal, this.shutdown.signal]);
+    while (!stopping.aborted && !this.closed) {
+      try { await this.tick(stopping); }
+      catch (error) {
+        if (stopping.aborted && error instanceof SupervisorClosedError) break;
+        throw error; // Cancellation never hides authority or persistence errors.
+      }
+      if (stopping.aborted) break;
       await new Promise<void>(resolve => {
-        const done = () => { clearTimeout(timer); signal.removeEventListener("abort", done); resolve(); };
+        const done = () => { clearTimeout(timer); stopping.removeEventListener("abort", done); resolve(); };
         const timer = setTimeout(done, this.config.pollMs);
-        signal.addEventListener("abort", done, {once: true});
-        if (signal.aborted) done();
+        stopping.addEventListener("abort", done, {once: true});
+        if (stopping.aborted) done();
       });
     }
   }
 
-  public async close(): Promise<void> {
-    await this.tail;
-    if (this.closed) return;
-    this.closed = true;
-    await this.options.agent.close().catch(() => undefined);
-    await this.lease.release();
+  public close(): Promise<void> {
+    if (this.closingTask !== undefined) return this.closingTask;
+    this.closing = true;
+    this.shutdown.abort();
+    this.closingTask = (async () => {
+      try {
+        await this.tail;
+        await this.options.agent.close().catch(() => undefined);
+        // A bridge reply may have fulfilled before close but still be moving
+        // through promise callbacks. Drain those callbacks, without awaiting
+        // an unresolved model turn or starting another reconciliation.
+        await new Promise<void>(resolve => setImmediate(resolve));
+        if (this.agentResult !== undefined) {
+          this.processReply(); this.refreshHealth(); await this.persist();
+        }
+      } finally {
+        this.closed = true;
+        await this.lease.release();
+      }
+    })();
+    return this.closingTask;
   }
 }

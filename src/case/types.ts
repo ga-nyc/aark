@@ -88,8 +88,8 @@ export interface AgentReply {
   action: AgentAction;
 }
 export interface AgentBridge {
-  preflight(): Promise<void>;
-  request(event: AgentEvent): Promise<AgentReply>;
+  preflight(signal?: AbortSignal): Promise<void>;
+  request(event: AgentEvent, signal?: AbortSignal): Promise<AgentReply>;
   close(): Promise<void>;
 }
 export interface CaseAttempt {

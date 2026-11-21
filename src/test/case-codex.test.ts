@@ -120,6 +120,121 @@ async function fixture(context: TestContext, changes: Partial<AgentConfig> = {})
   return { config, server, bridge };
 }
 const code = (message: string): { message: string } => ({ message });
+function barrier() {
+  let resolve = () => {};
+  const promise = new Promise<void>(done => { resolve = done; });
+  return {promise, resolve};
+}
+const settle = async () => { await new Promise<void>(resolve => setImmediate(resolve)); };
+
+linuxTest("an already cancelled bridge operation creates no proxy or decision thread", async context => {
+  const {bridge, server} = await fixture(context);
+  const controller = new AbortController(); controller.abort(new Error("synthetic private cancellation"));
+  await assert.rejects(bridge.preflight(controller.signal), code("agent-unavailable"));
+  await assert.rejects(bridge.request(EVENT, controller.signal), code("agent-unavailable"));
+  assert.equal(server.spawns.length, 0);
+  assert.equal(server.wire.length, 0);
+});
+
+for (const operation of ["preflight", "request"] as const) linuxTest(`external cancellation during ${operation} validation prevents late proxy setup`, async context => {
+  const {config, server} = await fixture(context);
+  const entered = barrier(), release = barrier(), controller = new AbortController();
+  const bridge = new CodexAgentBridge(config, {spawn: server.spawn, validate: async () => {
+    entered.resolve(); await release.promise; return {uid: 4242, currentUid: 4242, home: "/home/fixtureuser"};
+  }});
+  context.after(() => bridge.close());
+  const pending = operation === "preflight" ? bridge.preflight(controller.signal) : bridge.request(EVENT, controller.signal);
+  const rejected = assert.rejects(pending, code("agent-unavailable"));
+  await entered.promise;
+  controller.abort(); await rejected;
+  release.resolve(); await settle();
+  assert.equal(server.spawns.length, 0);
+  assert.equal(server.wire.length, 0);
+});
+
+linuxTest("closing a bridge during unresolved validation prevents late proxy setup", async context => {
+  const {config, server} = await fixture(context);
+  const entered = barrier(), release = barrier();
+  const bridge = new CodexAgentBridge(config, {spawn: server.spawn, validate: async () => {
+    entered.resolve(); await release.promise; return {uid: 4242, currentUid: 4242, home: "/home/fixtureuser"};
+  }});
+  context.after(() => bridge.close());
+  const rejected = assert.rejects(bridge.request(EVENT), code("agent-unavailable"));
+  await entered.promise;
+  await bridge.close(); release.resolve(); await rejected;
+  assert.equal(server.spawns.length, 0);
+  assert.equal(server.wire.length, 0);
+});
+
+for (const phase of ["initialize", "config/read", "thread/read", "thread/resume", "thread/goal/get"]) linuxTest(`external cancellation during setup ${phase} prevents later setup or model work`, async context => {
+  const {bridge, server} = await fixture(context);
+  const entered = barrier(), controller = new AbortController();
+  let held: {request: Wire; proxy: FakeProxy} | undefined;
+  server.custom = (request, proxy) => {
+    if (request.method !== phase) return false;
+    held = {request, proxy}; entered.resolve(); return true;
+  };
+  const rejected = assert.rejects(bridge.preflight(controller.signal), code("agent-unavailable"));
+  await entered.promise;
+  const methodsBeforeStop = server.wire.map(request => request.method);
+  controller.abort(); await rejected;
+  server.custom = undefined;
+  assert.ok(held);
+  server.receive(held.request, held.proxy); await settle();
+  assert.deepEqual(server.wire.map(request => request.method), methodsBeforeStop);
+  assert.equal(server.calls("turn/start").length, 0);
+  assert.deepEqual(server.proxies[0]!.killed, ["SIGTERM"]);
+});
+
+for (const phase of ["thread/read", "thread/goal/get"]) linuxTest(`external cancellation during decision ${phase} prevents turn submission`, async context => {
+  const {bridge, server} = await fixture(context);
+  await bridge.preflight();
+  const entered = barrier(), controller = new AbortController();
+  let held: {request: Wire; proxy: FakeProxy} | undefined;
+  server.custom = (request, proxy) => {
+    if (request.method !== phase) return false;
+    held = {request, proxy}; entered.resolve(); return true;
+  };
+  const rejected = assert.rejects(bridge.request(EVENT, controller.signal), code("agent-unavailable"));
+  await entered.promise;
+  const methodsBeforeStop = server.wire.map(request => request.method);
+  controller.abort(); await rejected;
+  server.custom = undefined;
+  assert.ok(held);
+  server.receive(held.request, held.proxy); await settle();
+  assert.deepEqual(server.wire.map(request => request.method), methodsBeforeStop);
+  assert.equal(server.calls("turn/start").length, 0);
+  assert.equal(server.wire.some(request => request.method === "turn/interrupt" || request.method === "turn/steer"), false);
+});
+
+linuxTest("external cancellation does not turn an unprocessed goal response into a permission reply", async context => {
+  const {bridge, server} = await fixture(context);
+  await bridge.preflight();
+  const controller = new AbortController();
+  server.custom = (request, proxy) => {
+    if (request.method !== "thread/goal/get") return false;
+    proxy.result(request, {goal: {id: "synthetic-external-goal"}});
+    controller.abort(); return true;
+  };
+  await assert.rejects(bridge.request(EVENT, controller.signal), code("agent-unavailable"));
+  assert.equal(server.calls("turn/start").length, 0);
+});
+
+for (const stopping of ["cancellation", "close"] as const) linuxTest(`a validated permission reply survives ${stopping} while its async return is settling`, async context => {
+  const {bridge, server} = await fixture(context);
+  await bridge.preflight();
+  const controller = new AbortController();
+  const reply: AgentReply = {...REPLY, action: {type: "needs-permission", reason: "agent-approval-required"}};
+  server.custom = (request, proxy) => {
+    if (request.method !== "turn/start") return false;
+    proxy.result(request, {turn: {id: "turn-fixture", status: "inProgress", items: []}});
+    queueMicrotask(() => { server.complete(proxy, "completed", reply); if (stopping === "close") void bridge.close(); else controller.abort(); });
+    return true;
+  };
+  assert.deepEqual(await bridge.request(EVENT, controller.signal), reply);
+  if (stopping === "cancellation") assert.deepEqual(await bridge.request(EVENT), reply);
+  assert.equal(server.calls("turn/start").length, 1);
+});
 
 linuxTest("Codex preflight creates a protected fresh decision thread without starting a model turn", async (context) => {
   const { config, server, bridge } = await fixture(context);
