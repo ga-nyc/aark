@@ -108,7 +108,7 @@ Do not invoke `aark mine reveal` unless the case authorization explicitly requir
   symbolic links, so symlink-specific tests are skipped there. Run the complete
   suite on Ubuntu before merging changes that affect shared Linux behavior.
 - `npm run check` runs on both Ubuntu and Windows in CI (Node 22 and 24).
-  Python 3 must be available through `python3`, `python`, or Windows `py -3`.
+  Python 3.7 or newer must be available through `python3`, `python`, or Windows `py -3`.
 - `scripts/scan-large-file-sharded.mjs` requires a build. It stages bounded
   read-only source ranges, verifies their inventories/artifacts, and scans a
   17 MiB window on each side of every shard boundary before claiming completion.
