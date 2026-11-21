@@ -254,6 +254,57 @@ class LocalNotifierTests(unittest.TestCase):
         self.assertIsNone(self.notifier.alert(self.unit))
         self.assertEqual(len(self.notification_commands), 1)
 
+    def test_torn_journal_tail_cannot_hide_a_new_durable_receipt(self):
+        self.root.mkdir(mode=0o700)
+        path = self.root / 'alerts-redacted.ndjson'
+        for tail in (b'{"torn":', b'{"torn": "\xe2\x82'):
+            with self.subTest(tail=tail):
+                path.write_bytes(tail)
+                self.notification_commands.clear()
+                # Model interruption after the journal fsync, before replacing
+                # the state file or attempting any recovery writes.
+                with mock.patch.object(self.notifier, '_save_state',
+                                       side_effect=SystemExit('synthetic interruption')):
+                    with self.assertRaises(SystemExit):
+                        self.notifier.alert(self.unit)
+                self.assertFalse((self.root / 'delivery-state.json').exists())
+                rows = path.read_bytes().splitlines()
+                self.assertEqual(rows[0], tail)
+                self.assertTrue(json.loads(rows[1])['desktopDeliveryAccepted'])
+                self.assertIsNone(self.notifier.alert(self.unit))
+                self.assertEqual(len(self.notification_commands), 1)
+
+    def test_unterminated_valid_receipt_is_preserved_before_a_new_receipt(self):
+        first = self.notifier.alert(self.unit)
+        path = self.root / 'alerts-redacted.ndjson'
+        first_line = path.read_bytes().removesuffix(b'\n')
+        path.write_bytes(first_line)
+        (self.root / 'delivery-state.json').unlink()
+        self.status[self.unit] = ('failed', 'run-two')
+        with mock.patch.object(self.notifier, '_save_state',
+                               side_effect=SystemExit('synthetic interruption')):
+            with self.assertRaises(SystemExit):
+                self.notifier.alert(self.unit)
+        contents = path.read_bytes()
+        self.assertTrue(contents.startswith(first_line + b'\n'))
+        self.assertEqual(len(contents.splitlines()), 2)
+        self.assertEqual(json.loads(contents.splitlines()[0]), first)
+        self.assertIsNone(self.notifier.alert(self.unit))
+        self.status[self.unit] = ('failed', 'run-one')
+        self.assertIsNone(self.notifier.alert(self.unit))
+        self.assertEqual(len(self.notification_commands), 2)
+
+    def test_terminated_journal_receipts_do_not_gain_empty_lines(self):
+        self.notifier.alert(self.unit)
+        path = self.root / 'alerts-redacted.ndjson'
+        first_line = path.read_bytes()
+        self.notifier.alert(self.unit, invocation_id='run-two')
+        contents = path.read_bytes()
+        self.assertTrue(contents.startswith(first_line))
+        self.assertEqual(len(contents.splitlines()), 2)
+        self.assertTrue(all(json.loads(line)['desktopDeliveryAccepted']
+                            for line in contents.splitlines()))
+
     def test_journal_write_failure_keeps_accepted_state(self):
         with mock.patch.object(self.notifier, '_append_record', side_effect=OSError('private')):
             record = self.notifier.alert(self.unit)
