@@ -10,6 +10,7 @@ import { assessRecoveryStorage } from "./recovery/assessment.js";
 import { readProgress } from "./core/progress.js";
 import { resumeSensitiveMaterial, scanSensitiveMaterial } from "./mining/scanner.js";
 import { readValidatedRevealArtifact } from "./mining/reveal.js";
+import { scanDiagnostics } from "./mining/diagnostics.js";
 import { planCleanup, runCleanup } from "./cleanup.js";
 import type { Provenance } from "./core/types.js";
 import { loadWorkflowConfig } from "./workflow/config.js";
@@ -182,6 +183,11 @@ recover.command("run")
   });
 
 const mine = program.command("mine").description("Scan local recovered data for validated sensitive material");
+
+mine.command("diagnose")
+  .description("Show fixed redacted error categories from a verified terminal scan inventory")
+  .requiredOption("-o, --output <directory>", "completed or degraded mining output directory")
+  .action(async (options: {output: string}) => { json(await scanDiagnostics(options.output)); });
 
 mine.command("status")
   .description("Read aggregate scan progress without opening sensitive inventories")

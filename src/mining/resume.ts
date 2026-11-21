@@ -3,6 +3,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { lstat, open, realpath, rename, unlink } from "node:fs/promises";
 import path from "node:path";
 import { StringDecoder } from "node:string_decoder";
+import { isDeepStrictEqual } from "node:util";
 import type { Provenance } from "../core/types.js";
 import { sha256Hex } from "../core/crypto.js";
 import { assertNoSymlinkComponents, atomicWriteJson, readDirectoryNamesBounded, safeJoin, stableHandleStat, stableLstat, syncDirectory } from "../core/fs-safe.js";
@@ -629,7 +630,7 @@ export async function loadScanState(output: string, signal?: AbortSignal): Promi
 async function loadMiningInventory(
   output: string,
   expected: ScanState["inventory"],
-  requiredStatus: "paused" | "complete",
+  requiredStatus: "paused" | "complete" | "complete-with-errors",
   signal?: AbortSignal,
 ): Promise<SensitiveScanInventory> {
   const filename = safeJoin(output, expected.filename);
@@ -659,7 +660,7 @@ async function loadMiningInventory(
     || document.layer !== "mining"
     || document.outputRoot !== output
     || document.status !== requiredStatus
-    || document.complete !== (requiredStatus === "complete")
+    || document.complete !== (requiredStatus === "complete" || requiredStatus === "complete-with-errors")
     || !boundedString(document.startedAt, 128)
     || !boundedString(document.updatedAt, 128)
     || !boundedString(document.finishedAt, 128)
@@ -805,6 +806,28 @@ export async function loadCompletedInventory(output: string, expected: ScanState
   const inventory = await loadMiningInventory(output, expected, "complete", signal);
   if (inventory.errors.length !== 0 || inventory.errorsOmitted !== 0 || inventory.failureMessage !== undefined) {
     throw new Error("completed mining inventory contains errors or a failure message");
+  }
+  return inventory;
+}
+
+/** Diagnostic access never makes a degraded scan eligible for resume or cleanup. */
+export async function loadDiagnosticInventory(output: string, state: ScanState): Promise<SensitiveScanInventory> {
+  if (state.status !== "complete" && state.status !== "complete-with-errors") {
+    throw new Error("scan diagnostics require a terminal completed or degraded scan");
+  }
+  const inventory = state.status === "complete"
+    ? await loadCompletedInventory(output, state.inventory)
+    : await loadMiningInventory(output, state.inventory, state.status);
+  const checkpoint = {runId: state.runId, status: state.status, inventoryComplete: state.inventoryComplete,
+    semantic: state.semantic, inputRoots: state.inputRoots,
+    ...(state.outputLoopBinding === undefined ? {} : {outputLoopBinding: state.outputLoopBinding}),
+    manifest: state.manifest, cursor: state.cursor, progress: state.progress};
+  if (!isDeepStrictEqual(inventory.resumeCheckpoint, checkpoint)) {
+    throw new Error("scan diagnostic checkpoint and sealed inventory disagree");
+  }
+  if (inventory.errors.length + inventory.errorsOmitted !== state.progress.scanErrors
+    || state.progress.filesScanned > state.progress.filesVisited) {
+    throw new Error("scan diagnostic checkpoint and error counts disagree");
   }
   return inventory;
 }
