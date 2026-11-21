@@ -3,14 +3,18 @@ import { spawnSync } from "node:child_process";
 const candidates = process.platform === "win32"
   ? [["py", "-3"], ["python"], ["python3"]]
   : [["python3"], ["python"]];
-const code = "import ast,pathlib; ast.parse(pathlib.Path('optional/impacket/dpapi_bridge.py').read_text(encoding='utf-8'))";
+const code = "import ast,pathlib; [ast.parse(pathlib.Path(p).read_text(encoding='utf-8')) for p in ['optional/impacket/dpapi_bridge.py', 'scripts/notify-local.py', 'scripts/notify-local.test.py']]";
 let found = false;
 for (const [command, ...prefix] of candidates) {
   const probe = spawnSync(command, [...prefix, "--version"], { shell: false, windowsHide: true, encoding: "utf8" });
   if (probe.status !== 0 || !/^Python 3\./.test(probe.stdout || probe.stderr || "")) continue;
   found = true;
   const result = spawnSync(command, [...prefix, "-c", code], { shell: false, windowsHide: true, stdio: "inherit" });
-  process.exitCode = result.status ?? 1;
+  if (result.status !== 0) process.exitCode = result.status ?? 1;
+  else {
+    const tests = spawnSync(command, [...prefix, "scripts/notify-local.test.py"], { shell: false, windowsHide: true, stdio: "inherit" });
+    process.exitCode = tests.status ?? 1;
+  }
   break;
 }
 if (!found) {

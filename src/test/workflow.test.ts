@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { appendFileSync, existsSync } from "node:fs";
+import { appendFileSync, existsSync, unlinkSync } from "node:fs";
 import { access, mkdir, readFile, readdir, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -38,14 +38,20 @@ test("workflow automatically verifies, deduplicates, and packages all selected s
   const f = await fixture(2);
   const phases: string[] = [];
   let locksObserved = true;
+  let nextScanCountersReset = false;
   const result = await runWorkflow(f.filename, {execute: true, progress: snapshot => {
     phases.push(String(snapshot.phase));
+    if (snapshot.phase === "mining" && snapshot.scansCompleted === 1 && snapshot.currentScanFilesScanned === undefined) {
+      nextScanCountersReset = snapshot.currentScanBytesScanned === undefined && snapshot.currentScanErrors === undefined;
+    }
     if (snapshot.phase === "packaging") for (const number of [1, 2]) for (const name of [".aark-mining.lock", ".agetnic-mining.lock"]) {
       locksObserved &&= existsSync(path.join(f.output, "mining", `scan-${String(number).padStart(6, "0")}`, name));
     }
   }});
   assert.equal(result.status, "complete");
   assert.equal(locksObserved, true);
+  assert.equal(nextScanCountersReset, true);
+  assert.equal(result.currentScanErrors, 0);
   assert.deepEqual([...new Set(phases)], ["mining", "verification", "packaging", "complete"]);
   const summary = JSON.parse(await readFile(path.join(f.output, "manifest-redacted.json"), "utf8"));
   assert.equal(summary.scansVerified, 2);
@@ -138,8 +144,48 @@ test("a later scan failure retains earlier outputs and reports workflow failure"
   assert.equal(status.scansCompleted, 1);
   assert.equal(status.resumable, false);
   assert.equal(status.failureCode, "unclassified-failure");
+  assert.equal(status.currentScanErrors, undefined);
+  assert.equal(status.currentScanFilesScanned, undefined);
   await access(path.join(f.output, "mining", "scan-000001", "inventory-sensitive.json"));
   await assert.rejects(access(path.join(f.output, "manifest-redacted.json")));
+});
+
+test("a child disappearing after inventory retains findings and stops before the next scan with specific diagnostics", async () => {
+  const f = await fixture(2);
+  const missing = path.join(f.config.scans[0]!.inputs[0]!, "zz-disappearing.txt");
+  await writeFile(missing, "ordinary synthetic data\n");
+  let removed = false;
+  await assert.rejects(runWorkflow(f.filename, {execute: true, progress: snapshot => {
+    if (!removed && snapshot.phase === "mining" && Number(snapshot.currentScanBytesScanned) > 0) {
+      unlinkSync(missing);
+      removed = true;
+    }
+  }}), /workflow failed \(scan-completed-with-errors\)/);
+  assert.equal(removed, true);
+  const status = await workflowStatus(f.output);
+  assert.equal(status.status, "failed");
+  assert.equal(status.failureCode, "scan-completed-with-errors");
+  assert.equal(status.currentScanErrors, 1);
+  assert.equal(status.currentScanFilesScanned, 1);
+  assert.equal(status.scansCompleted, 0);
+  assert.equal(status.scansPlanned, 2);
+  assert.equal(status.resumable, false);
+  assert.equal(status.cleanupAuthorized, false);
+  assert.equal(status.needsReview, true);
+  assert.equal(JSON.stringify(status).includes(f.root), false);
+  assert.equal(JSON.stringify(status).includes(f.value), false);
+  const mining = path.join(f.output, "mining", "scan-000001");
+  const inventory = JSON.parse(await readFile(path.join(mining, "inventory-sensitive.json"), "utf8"));
+  assert.equal(inventory.status, "complete-with-errors");
+  assert.equal(inventory.resumeCheckpoint.manifest.entries, 2);
+  assert.equal(inventory.resumeCheckpoint.progress.filesScanned, 1);
+  assert.equal(inventory.errors.length, 1);
+  assert.equal(inventory.errors[0].operation, "read-or-scan");
+  assert.equal(inventory.findings.length, 1);
+  assert.equal((await readFile(path.join(mining, inventory.findings[0].artifactFiles[0]))).toString(), f.value);
+  await assert.rejects(access(path.join(f.output, "mining", "scan-000002")));
+  await assert.rejects(access(path.join(f.output, "manifest-redacted.json")));
+  await assert.rejects(resumeWorkflow(f.output, {execute: true}), /explicitly paused/);
 });
 
 test("workflow CLI completes the whole sequence and status filters injected fields", async () => {
@@ -156,7 +202,7 @@ test("workflow CLI completes the whole sequence and status filters injected fiel
   assert.equal(run.stdout.includes(Buffer.from(f.root)), false);
   await writeFile(path.join(f.output, "progress-redacted.json"), JSON.stringify({version: 1, tool: "aark", layer: "workflow",
     status: "running", sourcePathsRedacted: true, phase: "packaging", processId: 2147483647, scansCompleted: 1,
-    summary: {source: f.root, value: f.value}, phaseName: f.value, failureClass: f.value, failureCode: f.value}));
+    summary: {source: f.root, value: f.value}, phaseName: f.value, failureClass: f.value, failureCode: f.value, currentScanErrors: f.value}));
   const status = await captureCommand(process.execPath, [cli, "workflow", "status", "--output", f.output]);
   assert.equal(status.exitCode, 0);
   assert.equal(JSON.parse(status.stdout.toString()).processObserved, false);
@@ -164,7 +210,28 @@ test("workflow CLI completes the whole sequence and status filters injected fiel
   assert.equal(status.stdout.includes(Buffer.from(f.value)), false);
   assert.equal(status.stdout.includes(Buffer.from(f.root)), false);
   assert.equal(JSON.parse(status.stdout.toString()).failureCode, undefined);
+  assert.equal(JSON.parse(status.stdout.toString()).currentScanErrors, undefined);
   await assert.rejects(resumeWorkflow(f.output, {execute: true}), /explicitly paused/);
+});
+
+test("workflow status filters invalid error counters and exposes only fixed diagnostics", async () => {
+  const f = await fixture();
+  await mkdir(f.output);
+  const progress = {version: 1, tool: "aark", layer: "workflow", sourcePathsRedacted: true,
+    status: "failed", phase: "mining", failureCode: "scan-completed-with-errors", currentScanErrors: 2,
+    scanErrorSummary: {sourcePath: f.root, message: f.value}};
+  const filename = path.join(f.output, "progress-redacted.json");
+  await writeFile(filename, JSON.stringify(progress));
+  const status = await workflowStatus(f.output);
+  assert.equal(status.currentScanErrors, 2);
+  assert.equal(status.failureCode, "scan-completed-with-errors");
+  assert.equal(status.scanErrorSummary, undefined);
+  assert.equal(JSON.stringify(status).includes(f.root), false);
+  assert.equal(JSON.stringify(status).includes(f.value), false);
+  for (const currentScanErrors of [-1, 1.5, Number.MAX_SAFE_INTEGER + 1, "2", null, {message: f.value}]) {
+    await writeFile(filename, JSON.stringify({...progress, currentScanErrors}));
+    assert.equal((await workflowStatus(f.output)).currentScanErrors, undefined);
+  }
 });
 
 test("storage preflight fails explicitly before creating workflow output", async () => {

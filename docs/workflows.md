@@ -48,6 +48,50 @@ messages are never copied into redacted status. Failed workflows remain failed
 and cannot be resumed as though they were clean pauses. A reviewed correction
 requires a fresh output. Preserve prior outputs and do not change their seals.
 
+`currentScanErrors` reports the active scan's aggregate error count. A scan that
+finishes `complete-with-errors` stops its workflow with the fixed
+`scan-completed-with-errors` code; subsequent selected scans remain unstarted.
+Inspect the terminal scan without exposing source paths or exception text:
+
+```sh
+aark mine diagnose --output /mnt/results/workflow-001/mining/scan-000001
+```
+
+Diagnosis verifies the saved state and sealed inventory and emits only fixed
+error categories and counters. It does not reveal artifacts, modify controls,
+resume a failed run, or grant cleanup eligibility. Missing files, OS I/O errors,
+changed input snapshots, and detector resource limits remain distinct failures.
+Unknown messages remain `unclassified-scan-error`. Independently authorized
+follow-up scans may use fresh outputs; their success does not relabel the
+original degraded scan as clean or authorize deletion of its recovered copy.
+
+For a Linux host, `scripts/notify-local.py` is a local desktop adapter that
+accepts an explicit unit allowlist, session user and session-bus address. Install
+the script and host configuration on a protected filesystem, separate from
+evidence and scanner outputs. Configure `--on-failure` for a systemd `OnFailure=`
+handler or `--watch` for an independent timer. The handler requires systemd 251+
+and reads the triggering service's `MONITOR_UNIT` and `MONITOR_INVOCATION_ID`
+environment variables, validates them against the unit allowlist, and binds the
+alert to that failed invocation. It never substitutes the service's current
+invocation or the handler's own `INVOCATION_ID`. A delayed handler can therefore
+report an earlier failure after the service has restarted. Missing or invalid
+monitor identities fail before any delivery. Use a dedicated handler for each
+source service, or a template such as `OnFailure=aark-alert@%n.service`;
+systemd omits these variables when several services share one handler unit.
+The protected handler's `ExecStart=` should invoke the adapter directly with
+`--on-failure`, its explicit `--allow-unit`, `--session-user`, `--bus-address`,
+and private `--state-directory`. `--unit` without a known explicit invocation
+queries current status and sends a failure only while that unit is failed; it
+cannot identify a historical `OnFailure=` event. Run `--help` for arguments.
+The adapter deduplicates accepted notifications per unit/invocation/event,
+uses finite-expiry desktop notices, and retains a durable redacted journal.
+Notification transport failures can retry on later polls even after the failed
+unit restarts. Each watch pass makes at most one additional retry of a persisted
+undelivered failure, retaining its original invocation identity; accepted notices
+remain suppressed. Scanner jobs are
+never restarted or signalled by this adapter. Desktop acceptance is recorded
+separately from user acknowledgement. Do not reset its state to repeat an alert.
+
 Execution retains the existing recovery confirmations, read-only source and
 independent-destination checks, local mount and loop-backing validation, mining
 worker limits, and native checkpoints. Recovery remains Linux-only; mining-only

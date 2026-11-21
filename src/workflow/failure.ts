@@ -4,6 +4,7 @@ const FAILURES = new Map<string, string>([
   ["mountedReadOnlyRoot is not on a read-only mount", "source-mount-not-read-only"],
   ["workflow recovery did not complete successfully", "recovery-stage-failed"],
   ["a selected recovery output has no completed producing stage", "recovery-output-incomplete"],
+  ["workflow scan did not complete without errors", "scan-completed-with-errors"],
   ["workflow requires the exact error-free completed scan selection", "scan-completion-mismatch"],
   ["workflow mining inventory and checkpoint disagree", "scan-inventory-mismatch"],
   ["workflow input root changed after scanning", "input-root-changed"],

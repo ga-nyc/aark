@@ -2,8 +2,9 @@
 
 ## WFL-003: observable unattended failure and notification delivery
 
-Status: fixed diagnostic codes implemented; durable event delivery and a native
-multi-workflow host remain follow-up work.
+Status: fixed diagnostics, scan error counters, and a tested local notification
+adapter implemented; native event delivery and multi-workflow hosting remain
+follow-up work.
 
 A process can correctly return failure while its user remains unaware. Generic
 exception classes are insufficient to diagnose a stopped workflow. Fixed codes
@@ -34,6 +35,16 @@ Acceptance criteria for the remaining supervision work:
 
 These requirements also apply to external case supervisors. A systemd service
 and log alone do not constitute unattended user notification.
+
+Implemented follow-up: degraded scans now report `scan-completed-with-errors`
+and aggregate error counters; `mine diagnose` verifies terminal controls and
+categorizes errors without revealing source paths or arbitrary messages. The
+local `scripts/notify-local.py` host adapter deduplicates by systemd invocation,
+records delivery separately from acknowledgement, uses expiring notifications,
+and never restarts scanners. Synthetic tests cover degraded-scan integration,
+sealed diagnostic inputs, notification delivery/retry, and duplicate suppression.
+The worker ceiling and stop-on-degraded-scan gates predate these changes; no
+pause/resume or cleanup gate is relaxed by the new diagnostics.
 
 ## WFL-001: scan completed outputs after a later recovery failure
 
