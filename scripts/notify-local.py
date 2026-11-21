@@ -167,8 +167,14 @@ class LocalNotifier:
         if not self._valid_delivery(record):
             return
         key = record['deliveryKey']
-        old = state['deliveries'].get(key, {})
-        if not old.get('desktopDeliveryAccepted') or record.get('desktopDeliveryAccepted'):
+        old = state['deliveries'].get(key)
+        # The cache may be newer when a journal append failed. Acceptance is
+        # authoritative at every attempt count; otherwise preserve the highest
+        # durable attempt and keep equal-attempt replay idempotent.
+        if (old is None
+                or (record['desktopDeliveryAccepted'] and not old['desktopDeliveryAccepted'])
+                or (record['desktopDeliveryAccepted'] == old['desktopDeliveryAccepted']
+                    and record['attempt'] > old['attempt'])):
             state['deliveries'][key] = record
 
     def _valid_delivery(self, record):
