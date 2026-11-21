@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """Linux desktop notification adapter with durable, serialized delivery state.
 
-This adapter reads only systemd unit properties and its own redacted delivery
-bookkeeping. It never reads evidence or scanner logs, and never starts, stops,
-restarts, or signals a scanner. Configure an explicit unit allowlist and desktop
-session before use. Notification acceptance is not user acknowledgement.
+This adapter reads only systemd unit properties, the kernel boot identifier,
+and its own redacted delivery bookkeeping. It never reads evidence or scanner
+logs, and never starts, stops, restarts, or signals a scanner. Configure an
+explicit unit allowlist and desktop session before use. Notification acceptance
+is not user acknowledgement.
 """
 import argparse
 import contextlib
@@ -25,6 +26,7 @@ import tempfile
 EVENTS = {'failed', 'paused', 'complete', 'notification-test'}
 NOTIFICATION_TIMEOUT_MS = 15000
 DEFAULT_STATE_DIRECTORY = Path('/var/lib/aark-alerts')
+UNIT_STEM_PATTERN = r'(?:[A-Za-z0-9_@.:-]|\\x[0-9a-fA-F]{2})+'
 
 
 def _now():
@@ -46,11 +48,25 @@ def _unit_stem(unit):
     return unit[:-8] if unit.endswith('.service') else unit
 
 
+def _valid_unit_stem(unit):
+    return (isinstance(unit, str) and re.fullmatch(UNIT_STEM_PATTERN, unit) is not None
+            and not unit.startswith('-'))
+
+
+def _boot_id():
+    fd = os.open('/proc/sys/kernel/random/boot_id', os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+    with os.fdopen(fd, 'r', encoding='ascii') as stream:
+        value = stream.read(38)
+    if (not re.fullmatch(r'[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}\n?', value)
+            or value.rstrip('\n') == '00000000-0000-0000-0000-000000000000'):
+        raise RuntimeError('Kernel boot identity unavailable')
+    return value.rstrip('\n')
+
+
 def _validate_identifiers(unit, event, invocation_id=None):
     # Stored unit names are already normalized stems. Schema validation must
     # neither normalize them again nor depend on the current authorization.
-    if (not isinstance(unit, str) or not re.fullmatch(r'[A-Za-z0-9_@.:-]+', unit)
-            or unit.startswith('-') or not isinstance(event, str) or event not in EVENTS):
+    if (not _valid_unit_stem(unit) or not isinstance(event, str) or event not in EVENTS):
         raise ValueError('Unknown alert identifier')
     if invocation_id is not None and (not isinstance(invocation_id, str)
             or not re.fullmatch(r'[A-Za-z0-9:_-]{1,160}', invocation_id)):
@@ -81,8 +97,7 @@ class LocalNotifier:
         if isinstance(allow_units, str):
             raise ValueError('The unit allowlist must be a collection of unit names')
         self.allowed = {_unit_stem(unit) for unit in allow_units}
-        if not self.allowed or any(not re.fullmatch(r'[A-Za-z0-9_@.:-]+', unit)
-                                   or unit.startswith('-') for unit in self.allowed):
+        if not self.allowed or any(not _valid_unit_stem(unit) for unit in self.allowed):
             raise ValueError('Configure an explicit allowlist of systemd unit names')
         if not re.fullmatch(r'[A-Za-z_][A-Za-z0-9_.-]*[$]?', session_user):
             raise ValueError('Configure a valid desktop session user')
@@ -264,8 +279,9 @@ class LocalNotifier:
         if not invocation_id:
             start = fields.get('ExecMainStartTimestampMonotonic', '0')
             end = fields.get('ExecMainExitTimestampMonotonic', '0')
-            if start.isdigit() and end.isdigit() and int(start) > 0:
-                invocation_id = 'systemd-' + start + '-' + end
+            if (re.fullmatch(r'[0-9]{1,20}', start) and re.fullmatch(r'[0-9]{1,20}', end)
+                    and 0 < int(start) <= 0xffffffffffffffff and int(end) <= 0xffffffffffffffff):
+                invocation_id = 'systemd-' + _boot_id() + '-' + start + '-' + end
         return active, invocation_id
 
     def _deliver(self, state, unit, event, invocation_id, state_warning=None):

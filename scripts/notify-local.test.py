@@ -39,6 +39,7 @@ class LocalNotifierTests(unittest.TestCase):
             historical_journal=self.history)
         self.server = 'synthetic-bus|:1.15'
         self.status = {self.unit: ('failed', 'run-one'), self.other_unit: ('active', 'run-other')}
+        self.monotonic = None
         self.notification_commands = []
         self.all_commands = []
         self.delivery_results = []
@@ -55,8 +56,11 @@ class LocalNotifierTests(unittest.TestCase):
             active, invocation = self.status[notify_local._unit_stem(command[2])]
             if isinstance(active, Exception):
                 raise active
-            return subprocess.CompletedProcess(command, 0,
-                'ActiveState=' + active + '\nInvocationID=' + invocation + '\n', '')
+            fields = 'ActiveState=' + active + '\nInvocationID=' + invocation + '\n'
+            if self.monotonic is not None:
+                fields += ('ExecMainStartTimestampMonotonic=' + self.monotonic[0]
+                           + '\nExecMainExitTimestampMonotonic=' + self.monotonic[1] + '\n')
+            return subprocess.CompletedProcess(command, 0, fields, '')
         if '/usr/bin/busctl' in command:
             value = self.server.split('|')[0 if 'GetId' in command else 1]
             return subprocess.CompletedProcess(command, 0, 's "' + value + '"\n', '')
@@ -91,6 +95,56 @@ class LocalNotifierTests(unittest.TestCase):
         self.assertEqual(second['invocationId'], 'run-two')
         self.assertEqual(third['event'], 'complete')
         self.assertEqual(len(self.notification_commands), 3)
+
+    def test_monotonic_fallback_is_bound_to_boot_and_deduplicates_only_within_that_boot(self):
+        self.status[self.unit] = ('failed', '')
+        self.monotonic = ('1000', '2000')
+        first_boot = '11111111-1111-4111-8111-111111111111'
+        second_boot = '22222222-2222-4222-8222-222222222222'
+        with mock.patch.object(notify_local, '_boot_id', return_value=first_boot):
+            first = self.notifier.alert(self.unit)
+            self.assertIsNone(self.notifier.alert(self.unit))
+        self.notifier = notify_local.LocalNotifier(
+            allow_units={self.unit, self.other_unit}, session_user='fixtureuser',
+            bus_address='unix:path=/run/user/4242/bus', state_directory=self.root)
+        with mock.patch.object(notify_local, '_boot_id', return_value=second_boot):
+            second = self.notifier.alert(self.unit)
+            self.assertIsNone(self.notifier.alert(self.unit))
+        self.assertEqual(first['invocationId'], 'systemd-' + first_boot + '-1000-2000')
+        self.assertEqual(second['invocationId'], 'systemd-' + second_boot + '-1000-2000')
+        self.assertEqual(len(self.notification_commands), 2)
+
+    def test_monotonic_fallback_without_verified_boot_identity_never_delivers(self):
+        self.status[self.unit] = ('failed', '')
+        self.monotonic = ('1000', '2000')
+        with mock.patch.object(notify_local, '_boot_id', side_effect=OSError('synthetic private metadata')):
+            failed = self.notifier.alert(self.unit)
+        self.assertFalse(failed['desktopDeliveryAttempted'])
+        self.assertEqual(failed['statusQueryError'], 'OSError')
+        self.assertEqual(self.notification_commands, [])
+        self.assertNotIn('synthetic private metadata', json.dumps(failed))
+
+    def test_boot_identity_reader_accepts_only_bounded_canonical_nonzero_kernel_uuid(self):
+        canonical = '11111111-1111-4111-8111-111111111111'
+        for raw in (canonical, canonical + '\n'):
+            with mock.patch.object(notify_local.os, 'open', return_value=123) as opened, \
+                    mock.patch.object(notify_local.os, 'fdopen', return_value=io.StringIO(raw)):
+                self.assertEqual(notify_local._boot_id(), canonical)
+            self.assertEqual(opened.call_args[0][0], '/proc/sys/kernel/random/boot_id')
+            self.assertTrue(opened.call_args[0][1] & os.O_NOFOLLOW)
+        invalid = ['', 'not-a-boot-id', '00000000-0000-0000-0000-000000000000',
+                   canonical + '\nextra', canonical + ' ', ' ' + canonical]
+        for raw in invalid:
+            with self.subTest(raw=raw), mock.patch.object(notify_local.os, 'open', return_value=123), \
+                    mock.patch.object(notify_local.os, 'fdopen', return_value=io.StringIO(raw)):
+                with self.assertRaises(RuntimeError):
+                    notify_local._boot_id()
+
+    def test_explicit_and_current_invocation_ids_do_not_depend_on_boot_metadata(self):
+        with mock.patch.object(notify_local, '_boot_id', side_effect=AssertionError('unexpected boot probe')):
+            self.assertTrue(self.notifier.alert(self.unit)['desktopDeliveryAccepted'])
+            self.assertTrue(self.notifier.on_failure(self.unit, '1' * 32)['desktopDeliveryAccepted'])
+        self.assertEqual(len(self.notification_commands), 2)
 
     def test_finite_normal_notification_requests_printed_id(self):
         record = self.notifier.alert(self.unit)
@@ -266,6 +320,47 @@ class LocalNotifierTests(unittest.TestCase):
         self.assertIsNone(self.notifier.alert('worker.service.service'))
         self.assertIsNone(self.notifier.on_failure('worker.service.service', '2' * 32))
         self.assertEqual(len(self.notification_commands), 2)
+
+    def test_escaped_instance_identity_is_exact_for_failure_direct_watch_and_replay(self):
+        external = r'worker@dev-disk-by\x2duuid.service'
+        stem = external[:-8]
+        self.notifier = notify_local.LocalNotifier(
+            allow_units={external}, session_user='fixtureuser',
+            bus_address='unix:path=/run/user/4242/bus', state_directory=self.root)
+        self.status = {stem: ('failed', '2' * 32)}
+        old = self.notifier.on_failure(external, '1' * 32)
+        current = self.notifier.alert(external)
+        self.assertEqual(old['unit'], stem)
+        self.assertEqual(current['unit'], stem)
+        self.assertEqual(self.notification_commands[0][-1], stem + ': inspect the local redacted status.')
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(self.notifier.watch(), [])
+        (self.root / 'delivery-state.json').unlink()
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(self.notifier.watch(), [])
+        self.assertIsNone(self.notifier.on_failure(external, '1' * 32))
+        queried = [command[2] for command in self.all_commands if command[0] == 'systemctl']
+        self.assertEqual(queried, [external] * 3)
+        self.assertEqual(len(self.notification_commands), 2)
+        # Hex spelling remains an exact allowlist identity, with no decoding.
+        with self.assertRaises(ValueError):
+            self.notifier.alert(external.replace('2d', '2D'))
+
+    def test_unit_escapes_reject_arbitrary_backslashes_slashes_and_control_characters(self):
+        invalid = [r'worker@bad\stuff.service', r'worker@bad\x2.service',
+                   r'worker@bad\xGG.service', r'worker@bad\X2d.service',
+                   'worker@bad/name.service', 'worker@bad\nname.service',
+                   'worker@bad\rname.service', 'worker@bad\0name.service']
+        for unit in invalid:
+            with self.subTest(unit=unit):
+                with self.assertRaises(ValueError):
+                    notify_local.LocalNotifier(allow_units={unit}, session_user='fixtureuser',
+                        bus_address='unix:path=/run/user/4242/bus', state_directory=self.root)
+        uppercase = notify_local.LocalNotifier(allow_units={r'worker@disk\x2Duuid.service'},
+            session_user='fixtureuser', bus_address='unix:path=/run/user/4242/bus', state_directory=self.root)
+        self.assertIn(r'worker@disk\x2Duuid', uppercase.allowed)
+        self.assertEqual(self.all_commands, [])
+        self.assertFalse(self.root.exists())
 
     def test_watch_retries_rejected_failure_handler_after_unit_restarts_active(self):
         old_invocation, next_invocation = '1' * 32, '2' * 32
