@@ -22,6 +22,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+from urllib.parse import unquote_to_bytes
 
 EVENTS = {'failed', 'paused', 'complete', 'notification-test'}
 NOTIFICATION_TIMEOUT_MS = 15000
@@ -63,6 +64,31 @@ def _boot_id():
     return value.rstrip('\n')
 
 
+def _local_bus_address(value):
+    # D-Bus permits semicolon-separated transports. Accept one connectable
+    # Unix endpoint only, using the specification's escaped-value grammar.
+    if not isinstance(value, str) or not value.startswith('unix:'):
+        return False
+    properties = {}
+    for item in value[5:].split(','):
+        key, separator, encoded = item.partition('=')
+        if (not separator or key not in ('path', 'abstract', 'guid') or key in properties
+                or not re.fullmatch(r'(?:[-0-9A-Za-z_/.*]|%[0-9a-fA-F]{2})+', encoded)):
+            return False
+        decoded = unquote_to_bytes(encoded)
+        if any(byte < 32 or byte == 127 for byte in decoded):
+            return False
+        properties[key] = decoded
+    endpoints = set(properties).intersection(('path', 'abstract'))
+    if len(endpoints) != 1:
+        return False
+    if 'path' in properties and not properties['path'].startswith(b'/'):
+        return False
+    if 'guid' in properties and not re.fullmatch(b'[0-9a-fA-F]{32}', properties['guid']):
+        return False
+    return True
+
+
 def _validate_identifiers(unit, event, invocation_id=None):
     # Stored unit names are already normalized stems. Schema validation must
     # neither normalize them again nor depend on the current authorization.
@@ -101,7 +127,7 @@ class LocalNotifier:
             raise ValueError('Configure an explicit allowlist of systemd unit names')
         if not re.fullmatch(r'[A-Za-z_][A-Za-z0-9_.-]*[$]?', session_user):
             raise ValueError('Configure a valid desktop session user')
-        if not bus_address.startswith('unix:') or any(char in bus_address for char in '\r\n\0'):
+        if not _local_bus_address(bus_address):
             raise ValueError('Configure the local desktop session bus address')
         self.root = Path(state_directory)
         self.historical_journal = Path(historical_journal) if historical_journal else None
@@ -470,20 +496,24 @@ def main(arguments=None):
     action.add_argument('--watch', action='store_true')
     action.add_argument('--on-failure', action='store_true',
                         help='Use systemd MONITOR_UNIT and MONITOR_INVOCATION_ID from OnFailure=')
+    action.add_argument('--retry-pending-failure', action='store_true',
+                        help='Retry at most one persisted unaccepted failure without querying systemd')
     parser.add_argument('--event', choices=sorted(EVENTS), default='failed')
     parser.add_argument('--seed-accepted-history', metavar='INVOCATION',
                         help='Seed a known unit invocation from accepted historical rows')
     args = parser.parse_args(arguments)
     if args.seed_accepted_history and (not args.unit or not args.historical_journal):
         parser.error('--seed-accepted-history requires --unit and --historical-journal')
-    if args.on_failure and args.event != 'failed':
-        parser.error('--on-failure requires the failed event')
+    if (args.on_failure or args.retry_pending_failure) and args.event != 'failed':
+        parser.error('Failure delivery actions require the failed event')
     notifier = LocalNotifier(allow_units=args.allow_unit, session_user=args.session_user,
                              bus_address=args.bus_address, state_directory=args.state_directory,
                              historical_journal=args.historical_journal)
     if args.watch:
         return int(any(delivery_failed(record) for record in notifier.watch()))
-    if args.on_failure:
+    if args.retry_pending_failure:
+        record = notifier._retry_failed_delivery(set())
+    elif args.on_failure:
         try:
             record = notifier.on_failure(os.environ.get('MONITOR_UNIT'), os.environ.get('MONITOR_INVOCATION_ID'))
         except ValueError:

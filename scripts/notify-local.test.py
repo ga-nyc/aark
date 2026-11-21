@@ -706,6 +706,76 @@ class LocalNotifierTests(unittest.TestCase):
         self.assertEqual(self.all_commands, [])
         self.assertFalse(self.root.exists())
 
+    def test_bus_address_accepts_one_local_unix_endpoint_with_strict_escaped_values(self):
+        valid = ['unix:path=/run/user/4242/bus',
+                 'unix:path=/run/user/4242/bus,guid=' + 'a' * 32,
+                 'unix:guid=' + 'B' * 32 + ',path=%2Frun/user/4242/bus',
+                 'unix:abstract=/tmp/dbus-synthetic',
+                 'unix:abstract=synthetic%20socket,guid=' + '0' * 32]
+        for address in valid:
+            with self.subTest(address=address):
+                adapter = notify_local.LocalNotifier(allow_units={self.unit}, session_user='fixtureuser',
+                    bus_address=address, state_directory=self.root)
+                self.assertEqual(adapter.bus_address, address)
+                self.assertIn('DBUS_SESSION_BUS_ADDRESS=' + address, adapter.user_command)
+        self.assertEqual(self.all_commands, [])
+        self.assertFalse(self.root.exists())
+
+    def test_bus_address_rejects_transport_alternatives_properties_and_bad_escaping(self):
+        invalid = [None, 'tcp:host=192.0.2.1,port=12345',
+                   'unix:path=/synthetic/missing;tcp:host=192.0.2.1,port=12345',
+                   'unix:path=/first;unix:path=/second', 'unix:path=/first;',
+                   'unix:', 'unix:guid=' + 'a' * 32, 'unix:path=', 'unix:abstract=',
+                   'unix:path=relative', 'unix:path=/first,path=/second',
+                   'unix:path=/first,abstract=second', 'unix:path=/first,fd=3',
+                   'unix:fd=3', 'unix:tmpdir=/tmp', 'unix:dir=/tmp',
+                   'unix:runtime=yes', 'unix:path=/first,host=remote',
+                   'unix:path=/first,guid=not-a-guid',
+                   'unix:path=/first,guid=' + 'a' * 32 + ',guid=' + 'b' * 32,
+                   'unix:path=/first,', 'unix:path=/bad%', 'unix:path=/bad%2',
+                   'unix:path=/bad%GG', 'unix:path=/bad%00', 'unix:path=/bad%0a',
+                   'unix:abstract=bad%7f', 'unix:path=/bad\n', 'unix:path=/bad\t',
+                   'unix:path=/bad path', 'unix:path=/bad:property', 'unix:path=/bad\\path']
+        for address in invalid:
+            with self.subTest(address=address):
+                with self.assertRaises(ValueError):
+                    notify_local.LocalNotifier(allow_units={self.unit}, session_user='fixtureuser',
+                        bus_address=address, state_directory=self.root)
+        self.assertEqual(self.all_commands, [])
+        self.assertFalse(self.root.exists())
+
+    def test_cli_retries_one_pending_failure_with_original_identity_and_no_current_query(self):
+        self.delivery_results = [(1, ''), (0, '23\n')]
+        rejected = self.notifier.on_failure(self.unit, '1' * 32)
+        self.status[self.unit] = ('active', '2' * 32)
+        options = ['--allow-unit', self.unit, '--session-user', 'fixtureuser',
+                   '--bus-address', 'unix:path=/run/user/4242/bus', '--retry-pending-failure']
+        output = io.StringIO()
+        with mock.patch.object(notify_local, 'LocalNotifier', return_value=self.notifier), \
+                contextlib.redirect_stdout(output):
+            self.assertEqual(notify_local.main(options), 0)
+            self.assertEqual(notify_local.main(options), 0)
+        records = [json.loads(line) for line in output.getvalue().splitlines()]
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0]['deliveryKey'], rejected['deliveryKey'])
+        self.assertEqual(records[0]['invocationId'], '1' * 32)
+        self.assertTrue(records[0]['desktopDeliveryAccepted'])
+        self.assertFalse(any(command[0] == 'systemctl' for command in self.all_commands))
+        self.assertEqual(len(self.notification_commands), 2)
+
+    def test_cli_pending_failure_retry_is_bounded_and_retains_delivery_failure_exit(self):
+        self.delivery_results = [(1, '')] * 4
+        self.notifier.on_failure(self.unit, '1' * 32)
+        self.notifier.on_failure(self.unit, '2' * 32)
+        options = ['--allow-unit', self.unit, '--session-user', 'fixtureuser',
+                   '--bus-address', 'unix:path=/run/user/4242/bus', '--retry-pending-failure']
+        output = io.StringIO()
+        with mock.patch.object(notify_local, 'LocalNotifier', return_value=self.notifier), \
+                contextlib.redirect_stdout(output):
+            self.assertEqual(notify_local.main(options), 1)
+        self.assertEqual(len(output.getvalue().splitlines()), 1)
+        self.assertEqual(len(self.notification_commands), 3)
+
     def test_cli_reports_delivery_and_bookkeeping_failures_to_its_host(self):
         options = ['--allow-unit', self.unit, '--session-user', 'fixtureuser',
                    '--bus-address', 'unix:path=/run/user/4242/bus', '--unit', self.unit]
