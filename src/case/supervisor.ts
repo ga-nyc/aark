@@ -37,9 +37,13 @@ export class CaseSupervisor {
   private observationUnavailable = false;
   private capacityWaiting = false;
   private configChanged = false;
+  private persistedAt: number;
 
   private constructor(private readonly config: CaseConfig, private readonly state: CaseState,
-    private readonly options: Options, private readonly lease: CaseLease) { this.clock = options.clock ?? Date.now; }
+    private readonly options: Options, private readonly lease: CaseLease) {
+    this.clock = options.clock ?? Date.now;
+    this.persistedAt = Date.parse(state.updatedAt);
+  }
 
   public static async open(control: string, options: Options): Promise<CaseSupervisor> {
     const loaded = await loadCaseState(control);
@@ -70,10 +74,11 @@ export class CaseSupervisor {
     // The advisory cache may fail independently, but loss of authoritative
     // control ownership must still stop every subsequent external operation.
     await this.lease.assertHeld();
+    this.persistedAt = Date.parse(this.state.updatedAt);
   }
 
   private async pulse(): Promise<void> {
-    if (this.clock() - Date.parse(this.state.updatedAt) >= 30_000) await this.persist();
+    if (this.clock() - this.persistedAt >= 30_000) await this.persist();
   }
 
   private async preflightAgent(signal?: AbortSignal): Promise<void> {
@@ -106,7 +111,9 @@ export class CaseSupervisor {
       command = await readJson(path.join(this.config.control, "case-command.json"), 1024);
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
-      if (!(error instanceof SyntaxError)) throw error;
+      // readJson preserves JSON.parse's SyntaxError as its cause while keeping
+      // arbitrary input text out of the public error message.
+      if (!(error instanceof SyntaxError) && !(error instanceof Error && error.cause instanceof SyntaxError)) throw error;
       this.state.permissionReason = "new-plan-required"; this.configChanged = true; return;
     }
     if (typeof command !== "object" || command === null || command.version !== 1 || typeof command.id !== "string"

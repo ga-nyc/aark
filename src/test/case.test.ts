@@ -513,7 +513,21 @@ for (const failing of ["read", "write"] as const) {
   });
 }
 
-test("serial in-deadline engine observations keep the independent watchdog heartbeat fresh", linuxOnly, async t => {
+test("malformed operator JSON holds permission without confusing a parser fault with storage failure", linuxOnly, async t => {
+  const f = await fixture();
+  await initializeCase(f.filename, {execute: true});
+  const supervisor = await CaseSupervisor.open(f.control, {host: f.host, agent: f.agent});
+  t.after(() => supervisor.close());
+  await writeFile(path.join(f.control, "case-command.json"), "{");
+  await tick(supervisor);
+  const {state} = await loadCaseState(f.control);
+  assert.equal(state.permissionReason, "new-plan-required");
+  assert.equal(state.health, "awaiting-permission");
+  assert.equal(f.host.launches.length, 0);
+});
+
+for (const observedStatus of ["running", "complete"] as const) {
+test(`serial in-deadline ${observedStatus} observations keep the independent watchdog heartbeat fresh`, linuxOnly, async t => {
   const f = await fixture({jobs: 4, maxConcurrent: 4});
   const document = JSON.parse(await readFile(f.filename, "utf8"));
   await writeFile(f.filename, JSON.stringify({...document, probeTimeoutMs: 60_000, pollMs: 1000,
@@ -523,6 +537,10 @@ test("serial in-deadline engine observations keep the independent watchdog heart
   const supervisor = await CaseSupervisor.open(f.control, {host: f.host, agent: f.agent, clock: () => now});
   t.after(() => supervisor.close());
   await tick(supervisor);
+  if (observedStatus === "complete") {
+    for (const launch of f.host.launches) f.host.observations.set(launch.identity.unit, {status: "complete"});
+    await tick(supervisor); // Let the separate verification tasks return their proofs.
+  }
   const unit = caseServiceUnit(f.control);
   await atomicWriteJson(path.join(f.control, "host-private.json"), {version: 1, unit,
     watchUnit: unit.replace(".service", "-watch"), user: "syntheticuser", bus: "unix:path=/run/user/1000/bus",
@@ -543,11 +561,12 @@ test("serial in-deadline engine observations keep the independent watchdog heart
       assert.equal(status.notificationRequired, false);
     }
     observations++;
-    return {status: "running"};
+    return {status: observedStatus};
   };
   await tick(supervisor);
   assert.equal(observations, 4);
 });
+}
 
 test("run cancellation during observation prevents an independent launch and preserves existing engines", linuxOnly, async t => {
   const f = await fixture({jobs: 3, maxConcurrent: 2});
