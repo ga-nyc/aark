@@ -41,6 +41,20 @@ def _error(exc):
     return type(exc).__name__
 
 
+def _historical_time(value):
+    # Imported history is not trusted redacted text. Accept only an explicit
+    # ISO timestamp and publish a freshly formatted UTC value.
+    if not isinstance(value, str) or not re.fullmatch(
+            r'[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}'
+            r'(?:\.[0-9]{1,6})?(?:Z|[+-][0-9]{2}:[0-9]{2})', value):
+        return None
+    try:
+        return datetime.datetime.fromisoformat(value.replace('Z', '+00:00')).astimezone(
+            datetime.timezone.utc).isoformat()
+    except (ValueError, OverflowError):
+        return None
+
+
 class LocalNotifier:
     """A host adapter. Construction does not access files or invoke processes."""
 
@@ -335,7 +349,7 @@ class LocalNotifier:
                 if invocation_id is None:
                     try:
                         active, invocation_id = self._unit_status(unit)
-                        if only_if_failed and active != 'failed':
+                        if (only_if_failed or event == 'failed') and active != 'failed':
                             return self._status_recovered(state, unit, active)
                         if not invocation_id:
                             raise RuntimeError('No stable systemd invocation identifier')
@@ -356,6 +370,13 @@ class LocalNotifier:
                 'desktopDeliveryAttempted': False, 'desktopDeliveryAccepted': False,
                 'userAcknowledged': False, 'deliveryInfrastructureError': _error(exc),
             }
+
+    def on_failure(self, unit, invocation_id):
+        """Deliver for the triggering invocation supplied by systemd, not its successor."""
+        if not isinstance(invocation_id, str) or not re.fullmatch(r'[a-f0-9]{32}', invocation_id):
+            raise ValueError('A systemd failure handler requires its monitored invocation identifier')
+        unit = self._identifiers(unit, 'failed', invocation_id)
+        return self.alert(unit, 'failed', invocation_id=invocation_id)
 
     def seed_accepted_history(self, unit, invocation_id, event='failed'):
         """Suppress a known invocation using accepted historical delivery, without a popup.
@@ -382,8 +403,10 @@ class LocalNotifier:
                 'desktopDeliveryAttempted': False, 'desktopDeliveryAccepted': True,
                 'userAcknowledged': False, 'seededFromAcceptedHistory': True,
                 'historicalAcceptedCount': len(accepted),
-                'historicalLatestTime': accepted[-1].get('time'),
             }
+            historical_time = _historical_time(accepted[-1].get('time'))
+            if historical_time is not None:
+                record['historicalLatestTime'] = historical_time
             return self._persist(state, record)
 
     def watch(self):
@@ -420,18 +443,27 @@ def main(arguments=None):
     action = parser.add_mutually_exclusive_group(required=True)
     action.add_argument('--unit')
     action.add_argument('--watch', action='store_true')
+    action.add_argument('--on-failure', action='store_true',
+                        help='Use systemd MONITOR_UNIT and MONITOR_INVOCATION_ID from OnFailure=')
     parser.add_argument('--event', choices=sorted(EVENTS), default='failed')
     parser.add_argument('--seed-accepted-history', metavar='INVOCATION',
                         help='Seed a known unit invocation from accepted historical rows')
     args = parser.parse_args(arguments)
     if args.seed_accepted_history and (not args.unit or not args.historical_journal):
         parser.error('--seed-accepted-history requires --unit and --historical-journal')
+    if args.on_failure and args.event != 'failed':
+        parser.error('--on-failure requires the failed event')
     notifier = LocalNotifier(allow_units=args.allow_unit, session_user=args.session_user,
                              bus_address=args.bus_address, state_directory=args.state_directory,
                              historical_journal=args.historical_journal)
     if args.watch:
         return int(any(delivery_failed(record) for record in notifier.watch()))
-    if args.seed_accepted_history:
+    if args.on_failure:
+        try:
+            record = notifier.on_failure(os.environ.get('MONITOR_UNIT'), os.environ.get('MONITOR_INVOCATION_ID'))
+        except ValueError:
+            parser.error('--on-failure requires an allowed MONITOR_UNIT and valid MONITOR_INVOCATION_ID')
+    elif args.seed_accepted_history:
         record = notifier.seed_accepted_history(args.unit, args.seed_accepted_history, args.event)
     else:
         record = notifier.alert(args.unit, args.event)

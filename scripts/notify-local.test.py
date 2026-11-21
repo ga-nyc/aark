@@ -162,6 +162,54 @@ class LocalNotifierTests(unittest.TestCase):
         self.assertEqual(second, [])
         self.assertEqual(len(self.notification_commands), 1)
 
+    def test_delayed_failure_handler_uses_old_invocation_without_consuming_next_failure(self):
+        old_invocation, next_invocation = '1' * 32, '2' * 32
+        self.status[self.unit] = ('active', next_invocation)
+        options = ['--allow-unit', self.unit, '--session-user', 'fixtureuser',
+                   '--bus-address', 'unix:path=/run/user/4242/bus', '--on-failure']
+        environment = {'MONITOR_UNIT': self.unit + '.service',
+                       'MONITOR_INVOCATION_ID': old_invocation,
+                       'INVOCATION_ID': '3' * 32}
+        with mock.patch.dict(os.environ, environment, clear=True), \
+                mock.patch.object(notify_local, 'LocalNotifier', return_value=self.notifier), \
+                contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(notify_local.main(options), 0)
+            self.assertEqual(notify_local.main(options), 0)
+        self.assertEqual(self.journal()[0]['invocationId'], old_invocation)
+        self.assertFalse(any(command[0] == 'systemctl' for command in self.all_commands))
+        self.assertIsNone(self.notifier.alert(self.unit))
+        self.status[self.unit] = ('failed', next_invocation)
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(len(self.notifier.watch()), 1)
+            self.assertEqual(self.notifier.watch(), [])
+        self.assertEqual(self.journal()[-1]['invocationId'], next_invocation)
+        self.assertEqual(len(self.notification_commands), 2)
+
+    def test_queried_failure_never_consumes_an_active_invocations_later_failure(self):
+        self.status[self.unit] = ('active', 'next-run')
+        self.assertIsNone(self.notifier.alert(self.unit))
+        self.assertEqual(self.notification_commands, [])
+        self.status[self.unit] = ('failed', 'next-run')
+        self.assertTrue(self.notifier.alert(self.unit)['desktopDeliveryAccepted'])
+        self.assertEqual(len(self.notification_commands), 1)
+
+    def test_failure_handler_requires_allowed_monitored_identity_before_delivery(self):
+        options = ['--allow-unit', self.unit, '--session-user', 'fixtureuser',
+                   '--bus-address', 'unix:path=/run/user/4242/bus', '--on-failure']
+        for environment in ({}, {'INVOCATION_ID': '1' * 32},
+                            {'MONITOR_UNIT': self.unit, 'MONITOR_INVOCATION_ID': 'invalid'},
+                            {'MONITOR_UNIT': 'unknown.service', 'MONITOR_INVOCATION_ID': '1' * 32},
+                            {'MONITOR_UNIT': self.unit, 'MONITOR_INVOCATION_ID': ''}):
+            with self.subTest(environment=environment), \
+                    mock.patch.dict(os.environ, environment, clear=True), \
+                    mock.patch.object(notify_local, 'LocalNotifier', return_value=self.notifier), \
+                    contextlib.redirect_stderr(io.StringIO()):
+                with self.assertRaises(SystemExit) as stopped:
+                    notify_local.main(options)
+                self.assertEqual(stopped.exception.code, 2)
+        self.assertEqual(self.all_commands, [])
+        self.assertFalse(self.root.exists())
+
     def test_status_error_is_recorded_and_later_poll_retries(self):
         self.status[self.unit] = (subprocess.TimeoutExpired('systemctl', 10), '')
         failed = self.notifier.alert(self.unit, only_if_failed=True)
@@ -216,6 +264,33 @@ class LocalNotifierTests(unittest.TestCase):
         self.notifier.historical_journal = None
         with self.assertRaises(ValueError):
             self.notifier.seed_accepted_history(self.unit, 'run-one')
+        self.assertEqual(self.notification_commands, [])
+
+    def test_historical_seed_normalizes_timestamps_without_copying_arbitrary_values(self):
+        invalid_times = [{'diagnostic': 'synthetic-secret-marker'}, 'synthetic-secret-marker',
+                         '2030-01-02T03:04:05Z synthetic-secret-marker',
+                         '2030-02-31T03:04:05Z', '2030-01-02T03:04:05',
+                         '2030-01-02X03:04:05Z', None, 12345]
+        for index, value in enumerate(invalid_times):
+            with self.subTest(value=value):
+                self.history.write_text(json.dumps({'unit': self.unit, 'event': 'failed',
+                    'desktopDeliveryAccepted': True, 'time': value}) + '\n')
+                output = io.StringIO()
+                options = ['--allow-unit', self.unit, '--session-user', 'fixtureuser',
+                           '--bus-address', 'unix:path=/run/user/4242/bus', '--unit', self.unit,
+                           '--historical-journal', str(self.history),
+                           '--seed-accepted-history', 'seed-' + str(index)]
+                with mock.patch.object(notify_local, 'LocalNotifier', return_value=self.notifier), \
+                        contextlib.redirect_stdout(output):
+                    self.assertEqual(notify_local.main(options), 0)
+                self.assertNotIn('historicalLatestTime', json.loads(output.getvalue()))
+                self.assertNotIn('synthetic-secret-marker', output.getvalue())
+        self.history.write_text(json.dumps({'unit': self.unit, 'event': 'failed',
+            'desktopDeliveryAccepted': True, 'time': '2030-01-02T05:04:05.123456+02:00'}) + '\n')
+        valid = self.notifier.seed_accepted_history(self.unit, 'valid-seed')
+        self.assertEqual(valid['historicalLatestTime'], '2030-01-02T03:04:05.123456+00:00')
+        self.assertNotIn('synthetic-secret-marker', json.dumps(self.state()))
+        self.assertNotIn('synthetic-secret-marker', json.dumps(self.journal()))
         self.assertEqual(self.notification_commands, [])
 
     def test_concurrent_poll_and_onfailure_call_deliver_once(self):
