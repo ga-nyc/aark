@@ -124,7 +124,7 @@ test("supervised captured raw identities reject legacy snapshots and a media gen
   const raw = {...JSON.parse(captured[0]!), kind: "block-device", regularFileIdentity: null,
     blockDeviceIdentity: {device: 1, inode: 2, rawDevice: 2048, media: {version: 1,
       bootId: "11111111-1111-1111-1111-111111111111", devices: [{device: "/dev/synthetic", majorMinor: "8:0",
-        diskseq: "11", parent: null, slaves: []}]}}};
+        diskseq: "11", startSector: "0", sizeSectors: "8", parent: null, slaves: []}]}}};
   captured[0] = JSON.stringify(raw);
   const pin = {source: f.source, sha256: createHash("sha256").update(captured[0]).digest("hex")};
   await assertSourceBindings(f.workflow, [pin], captured);

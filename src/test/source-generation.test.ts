@@ -11,12 +11,13 @@ import { workflowSourceIdentity } from "../workflow/verify.js";
 const BOOT = "11111111-1111-1111-1111-111111111111";
 function fixture() {
   const nodes = new Map<string, BlockMediaNode>([
-    ["/dev/dm-0", {device: "/dev/dm-0", majorMinor: "253:0", diskseq: "9007199254740993", parent: null, slaves: ["/dev/dm-1"]}],
-    ["/dev/dm-1", {device: "/dev/dm-1", majorMinor: "253:1", diskseq: "9007199254740994", parent: null, slaves: ["/dev/sda1"]}],
-    ["/dev/sda1", {device: "/dev/sda1", majorMinor: "8:1", diskseq: "18446744073709551615", parent: "/dev/sda", slaves: []}],
-    ["/dev/sda", {device: "/dev/sda", majorMinor: "8:0", diskseq: "18446744073709551615", parent: null, slaves: []}],
-    ["/dev/loop0", {device: "/dev/loop0", majorMinor: "7:0", diskseq: "20", parent: null, slaves: []}],
-    ["/dev/sdb", {device: "/dev/sdb", majorMinor: "8:16", diskseq: "21", parent: null, slaves: []}],
+    ["/dev/dm-0", {device: "/dev/dm-0", majorMinor: "253:0", diskseq: "9007199254740993", startSector: "0", sizeSectors: "8", dmTableSha256: "a".repeat(64), parent: null, slaves: ["/dev/dm-1"]}],
+    ["/dev/dm-1", {device: "/dev/dm-1", majorMinor: "253:1", diskseq: "9007199254740994", startSector: "0", sizeSectors: "8", dmTableSha256: "b".repeat(64), parent: null, slaves: ["/dev/sda1"]}],
+    ["/dev/dm-2", {device: "/dev/dm-2", majorMinor: "253:2", diskseq: "9007199254740995", startSector: "0", sizeSectors: "8", dmTableSha256: "d".repeat(64), parent: null, slaves: ["/dev/sdb"]}],
+    ["/dev/sda1", {device: "/dev/sda1", majorMinor: "8:1", diskseq: "18446744073709551615", startSector: "2048", sizeSectors: "8", parent: "/dev/sda", slaves: []}],
+    ["/dev/sda", {device: "/dev/sda", majorMinor: "8:0", diskseq: "18446744073709551615", startSector: "0", sizeSectors: "18446744073709551615", parent: null, slaves: []}],
+    ["/dev/loop0", {device: "/dev/loop0", majorMinor: "7:0", diskseq: "20", startSector: "0", sizeSectors: "8", parent: null, slaves: []}],
+    ["/dev/sdb", {device: "/dev/sdb", majorMinor: "8:16", diskseq: "21", startSector: "0", sizeSectors: "8", parent: null, slaves: []}],
   ]);
   const calls: string[] = [];
   const probe: BlockMediaProbe = {bootId: async () => BOOT, node: async device => {
@@ -37,10 +38,10 @@ function safety(media: BlockMediaIdentity): SourceSafety {
 
 test("raw generation snapshots include mapper dependencies, partition parents and loop-host physical devices exactly", async () => {
   const f = fixture();
-  const media = await captureBlockMediaIdentityFrom(["/dev/mapper/authorized", "/dev/sda", "/dev/loop0", "/dev/sdb"], f.probe);
+  const media = await captureBlockMediaIdentityFrom(["/dev/mapper/authorized", "/dev/sda", "/dev/loop0", "/dev/dm-2"], f.probe);
   assert.equal(media.version, 1);
   assert.equal(media.bootId, BOOT);
-  assert.deepEqual(media.devices.map(node => node.device), ["/dev/dm-0", "/dev/dm-1", "/dev/loop0", "/dev/sda", "/dev/sda1", "/dev/sdb"]);
+  assert.deepEqual(media.devices.map(node => node.device), ["/dev/dm-0", "/dev/dm-1", "/dev/dm-2", "/dev/loop0", "/dev/sda", "/dev/sda1", "/dev/sdb"]);
   assert.equal(media.devices[0]!.diskseq, "9007199254740993");
   assert.equal(media.devices.find(node => node.device === "/dev/sda")!.diskseq, "18446744073709551615");
   assert.ok(f.calls.filter(device => device === "/dev/dm-1").length >= 2);
@@ -62,6 +63,67 @@ for (const changed of ["/dev/dm-0", "/dev/dm-1", "/dev/sda"] as const) {
     await assert.rejects(assertSourceBindings(workflow, bindings, [workflowSourceIdentity(replacement)]), CaseSourceIdentityError);
     assert.notEqual(recoverySourceIdentity(original), recoverySourceIdentity(replacement));
     assert.throws(() => assertRecoveryQuotaSourceCurrent(original, replacement), /source identity differs/u);
+  });
+}
+
+for (const field of ["startSector", "sizeSectors"] as const) {
+  test(`partition ${field} changes refuse authorization with unchanged node, disk sequence and source metadata`, async () => {
+    const f = fixture();
+    const original = {...safety(await captureBlockMediaIdentityFrom(["/dev/sda1"], f.probe)), resolvedSource: "/dev/sda1"};
+    original.blockDeviceIdentity!.rawDevice = 8 * 256 + 1;
+    f.nodes.get("/dev/sda1")![field] = field === "startSector" ? "4096" : "16";
+    const replacement = {...structuredClone(original), blockDeviceIdentity: {...original.blockDeviceIdentity!,
+      media: await captureBlockMediaIdentityFrom(["/dev/sda1"], f.probe)}};
+    assert.equal(replacement.bytes, original.bytes);
+    assert.equal(replacement.kernelReadOnly, original.kernelReadOnly);
+    assert.deepEqual(replacement.blockDeviceIdentity!.media!.devices.map(node => [node.device, node.majorMinor, node.diskseq]),
+      original.blockDeviceIdentity!.media!.devices.map(node => [node.device, node.majorMinor, node.diskseq]));
+    const source = original.resolvedSource;
+    const identity = workflowSourceIdentity(original);
+    const workflow = {recovery: {source, image: {enabled: false}}} as WorkflowConfig;
+    const bindings = [{source, sha256: createHash("sha256").update(identity).digest("hex")}];
+    await assertSourceBindings(workflow, bindings, [identity]);
+    await assert.rejects(assertSourceBindings(workflow, bindings, [workflowSourceIdentity(replacement)]), CaseSourceIdentityError);
+    assert.throws(() => assertRecoveryQuotaSourceCurrent(original, replacement), /source identity differs/u);
+  });
+}
+
+test("geometry is exact, bounded and mandatory while partition sector zero is valid", async () => {
+  const f = fixture();
+  f.nodes.get("/dev/sda1")!.startSector = "0";
+  const original = safety(await captureBlockMediaIdentityFrom(["/dev/dm-0"], f.probe));
+  assert.equal(original.blockDeviceIdentity!.media!.devices.find(node => node.device === "/dev/sda1")!.startSector, "0");
+  const legacy = structuredClone(original);
+  for (const node of legacy.blockDeviceIdentity!.media!.devices) delete (node as Partial<BlockMediaNode>).startSector;
+  assert.equal(hasBlockMediaIdentity(legacy), false);
+  assert.throws(() => assertRecoveryQuotaSourceCurrent(legacy, original), /source identity differs/u);
+  for (const field of ["startSector", "sizeSectors"] as const) {
+    for (const invalid of ["", "01", "-1", "1.5", "18446744073709551616"]) {
+      f.nodes.get("/dev/sda1")![field] = invalid;
+      await assert.rejects(captureBlockMediaIdentityFrom(["/dev/sda1"], f.probe), /kernel generation/u);
+    }
+    f.nodes.get("/dev/sda1")![field] = "0";
+  }
+  f.nodes.get("/dev/sda1")!.startSector = "18446744073709551615";
+  f.nodes.get("/dev/sda1")!.sizeSectors = "1";
+  await assert.rejects(captureBlockMediaIdentityFrom(["/dev/sda1"], f.probe), /kernel generation/u);
+});
+
+for (const device of ["/dev/dm-0", "/dev/dm-1"]) {
+  test(`changed active mapping digest for ${device} rejects case and native quota authorization without changing topology`, async () => {
+    const f = fixture();
+    const original = safety(await captureBlockMediaIdentityFrom(["/dev/dm-0"], f.probe));
+    f.nodes.get(device)!.dmTableSha256 = "c".repeat(64);
+    const replacement = safety(await captureBlockMediaIdentityFrom(["/dev/dm-0"], f.probe));
+    const source = original.resolvedSource;
+    const identity = workflowSourceIdentity(original);
+    const workflow = {recovery: {source, image: {enabled: false}}} as WorkflowConfig;
+    const bindings = [{source, sha256: createHash("sha256").update(identity).digest("hex")}];
+    await assertSourceBindings(workflow, bindings, [identity]);
+    await assert.rejects(assertSourceBindings(workflow, bindings, [workflowSourceIdentity(replacement)]), CaseSourceIdentityError);
+    assert.throws(() => assertRecoveryQuotaSourceCurrent(original, replacement), /source identity differs/u);
+    delete f.nodes.get(device)!.dmTableSha256;
+    await assert.rejects(captureBlockMediaIdentityFrom(["/dev/dm-0"], f.probe), /kernel generation/u);
   });
 }
 
@@ -92,7 +154,7 @@ test("missing, malformed and legacy raw generations fail closed without recaptur
 });
 
 test("media and topology changes between metadata snapshots refuse capture", async () => {
-  for (const change of ["generation", "topology", "boot"] as const) {
+  for (const change of ["generation", "topology", "partition", "mapping", "boot"] as const) {
     const f = fixture();
     let roots = 0;
     let boots = 0;
@@ -101,6 +163,8 @@ test("media and topology changes between metadata snapshots refuse capture", asy
         if (device === "/dev/dm-0" && ++roots > 1) {
           if (change === "generation") f.nodes.get("/dev/sda")!.diskseq = "100";
           if (change === "topology") f.nodes.get("/dev/dm-0")!.slaves = ["/dev/sdb"];
+          if (change === "partition") f.nodes.get("/dev/sda1")!.startSector = "4096";
+          if (change === "mapping") f.nodes.get("/dev/dm-0")!.dmTableSha256 = "c".repeat(64);
         }
         return f.probe.node(device);
       }};

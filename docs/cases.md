@@ -69,12 +69,17 @@ frozen configurations are detected rather than silently adopted.
 Initialization pins the original recovery media and external analysis views.
 Fresh jobs and retries compare those identities at the native engine's source
 baseline. Raw sources bind the kernel boot identity and disk sequence of the
-source and its underlying devices, so kernel-observed media replacement fails
+source and its underlying devices, plus exact partition start/size geometry, so kernel-observed media replacement fails
 closed even if the device name and capacity are unchanged. Missing generations,
 a reboot, and legacy raw checkpoints without this binding require local review
 and new authorization. This cannot attest a physical change the driver has not
 reported. Inputs that will be produced by an approved dependency remain
 subject to that producer's exact verified attempt and native launch checks.
+Device-mapper sources additionally require Python 3.7 or newer and `dmsetup`. A bounded
+offline helper fingerprints the active mapping table; raw table and key bytes
+never reach case reports, logs, or agent packets. The digest binds exported table
+parameters, including literal keys and offsets; opaque kernel key references are
+bound as references and do not attest non-exported key contents.
 
 ## Process host and restricted agent
 

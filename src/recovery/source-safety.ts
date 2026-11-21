@@ -1,6 +1,7 @@
 import { constants } from "node:fs";
-import { access, readFile, readdir, realpath, stat } from "node:fs/promises";
+import { access, lstat, readFile, readdir, realpath, stat } from "node:fs/promises";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { isDeepStrictEqual } from "node:util";
 import { captureCommand } from "../core/command.js";
 import { nearestExistingParent } from "../core/fs-safe.js";
@@ -23,6 +24,11 @@ export interface BlockMediaNode {
   device: string;
   majorMinor: string;
   diskseq: string;
+  /** Kernel geometry uses 512-byte sectors, regardless of logical block size. */
+  startSector: string;
+  sizeSectors: string;
+  /** A private native helper hashes the complete active mapping, including literal keys. */
+  dmTableSha256?: string;
   parent: string | null;
   slaves: string[];
 }
@@ -44,8 +50,12 @@ function majorMinor(value: unknown): value is string {
   return typeof value === "string" && /^(?:0|[1-9][0-9]{0,9}):(?:0|[1-9][0-9]{0,9})$/u.test(value)
     && value.split(":").every(part => BigInt(part) <= 0xffff_ffffn);
 }
+function sectorCount(value: unknown): value is string { return value === "0" || unsigned(value); }
 function validMediaNode(value: BlockMediaNode): boolean {
   return typeof value === "object" && value !== null && kernelDevice(value.device) && majorMinor(value.majorMinor) && unsigned(value.diskseq)
+    && sectorCount(value.startSector) && sectorCount(value.sizeSectors) && (value.parent !== null || value.startSector === "0")
+    && (/^\/dev\/dm-[0-9]+$/u.test(value.device) ? typeof value.dmTableSha256 === "string" && /^[a-f0-9]{64}$/u.test(value.dmTableSha256)
+      : value.dmTableSha256 === undefined)
     && (value.parent === null || kernelDevice(value.parent)) && Array.isArray(value.slaves) && value.slaves.length <= 1024
     && value.slaves.every(kernelDevice) && new Set(value.slaves).size === value.slaves.length;
 }
@@ -74,7 +84,10 @@ export async function captureBlockMediaIdentityFrom(roots: string[], probe: Bloc
       }
     };
     for (const root of [...new Set(roots)].sort()) await walk(root, new Set(), 0);
-    for (const node of captured.values()) if (node.parent !== null && captured.get(node.parent)?.diskseq !== node.diskseq) throw mediaError();
+    for (const node of captured.values()) if (node.parent !== null) {
+      const parent = captured.get(node.parent);
+      if (parent?.diskseq !== node.diskseq || BigInt(node.startSector) + BigInt(node.sizeSectors) > BigInt(parent.sizeSectors)) throw mediaError();
+    }
     return [...captured.values()].sort((left, right) => left.device.localeCompare(right.device));
   };
   const devices = await snapshot();
@@ -86,6 +99,23 @@ async function kernelText(filename: string): Promise<string> {
   const data = await readFile(filename, "utf8");
   if (Buffer.byteLength(data) > 4096) throw mediaError();
   return data.trim();
+}
+async function dmTableDigest(id: string): Promise<string> {
+  const filename = fileURLToPath(new URL("../../scripts/source-dm-digest.py", import.meta.url));
+  if (await realpath(filename) !== filename) throw mediaError();
+  const metadata = await lstat(filename);
+  if (!metadata.isFile() || metadata.nlink !== 1 || metadata.uid !== 0 || (metadata.mode & 0o022) !== 0) throw mediaError();
+  let directory = path.dirname(filename);
+  while (true) {
+    const current = await lstat(directory);
+    if (!current.isDirectory() || current.isSymbolicLink() || current.uid !== 0 || (current.mode & 0o022) !== 0) throw mediaError();
+    if (directory === path.dirname(directory)) break;
+    directory = path.dirname(directory);
+  }
+  const result = await captureCommand("/usr/bin/python3", ["-I", "-B", filename, ...id.split(":")], {timeoutMs: 12_000, killGraceMs: 250, maxCaptureBytes: 128});
+  if (result.exitCode !== 0 || result.terminationReason !== null || result.stdoutTruncated || result.stderrTruncated || result.stderr.length !== 0
+    || !/^[a-f0-9]{64}\n$/u.test(result.stdout.toString())) throw mediaError();
+  return result.stdout.toString().trim();
 }
 async function blockMediaNode(device: string): Promise<BlockMediaNode> {
   const metadata = await stat(device, {bigint: true});
@@ -111,12 +141,24 @@ async function blockMediaNode(device: string): Promise<BlockMediaNode> {
   if (!slaves.every(kernelDevice)) throw mediaError();
   // Partitions share their parent gendisk's sequence number.
   const diskseq = await kernelText(path.join(parent === null ? sysfs : path.dirname(sysfs), "diskseq"));
-  if (!unsigned(diskseq)) throw mediaError();
-  return {device: canonical, majorMinor: id, diskseq, parent, slaves};
+  const startSector = parent === null ? "0" : await kernelText(path.join(sysfs, "start"));
+  const sizeSectors = await kernelText(path.join(sysfs, "size"));
+  if (!unsigned(diskseq) || !sectorCount(startSector) || !sectorCount(sizeSectors)) throw mediaError();
+  return {device: canonical, majorMinor: id, diskseq, startSector, sizeSectors, parent, slaves,
+    ...(/^\/dev\/dm-[0-9]+$/u.test(canonical) ? {dmTableSha256: await dmTableDigest(id)} : {})};
 }
 async function captureBlockMediaIdentity(roots: string[]): Promise<BlockMediaIdentity> {
   try { return await captureBlockMediaIdentityFrom(roots, {bootId: () => kernelText("/proc/sys/kernel/random/boot_id"), node: blockMediaNode}); }
   catch { throw mediaError(); }
+}
+function sourceMediaRoots(source: string, physical: string[], loops: LoopBackingIdentity[]): string[] {
+  try {
+    return [source, ...physical, ...loops.flatMap(backing => {
+      const mount: unknown = JSON.parse(backing.mount);
+      if (typeof mount !== "object" || mount === null || !("source" in mount) || typeof mount.source !== "string" || !mount.source.startsWith("/dev/")) throw mediaError();
+      return [backing.device, mount.source.replace(/\[[^\]]*\]$/u, "")];
+    })];
+  } catch { throw mediaError(); }
 }
 
 export interface SourceSafety {
@@ -155,7 +197,8 @@ export function hasBlockMediaIdentity(safety: SourceSafety | string): boolean {
       && Array.isArray(media.devices) && media.devices.length > 0 && media.devices.length <= 1024 && media.devices.every(validMediaNode)
       && new Set(media.devices.map(node => node.device)).size === media.devices.length
       && media.devices.some(node => node.majorMinor === linuxMajorMinor(BigInt(block.rawDevice)))
-      && media.devices.every(node => node.parent === null || media.devices.some(parent => parent.device === node.parent && parent.diskseq === node.diskseq))
+      && media.devices.every(node => node.parent === null || media.devices.some(parent => parent.device === node.parent && parent.diskseq === node.diskseq
+        && BigInt(node.startSector) + BigInt(node.sizeSectors) <= BigInt(parent.sizeSectors)))
       && media.devices.every(node => [node.parent, ...node.slaves].every(parent => parent === null || media.devices.some(candidate => candidate.device === parent)));
   } catch { return false; }
 }
@@ -242,7 +285,7 @@ export async function inspectSourceSafety(source: string, destination: string): 
     if (sourceResolution.networkBacked) throw new Error("network-backed block-device recovery sources are not allowed");
     sourceTopDevices = sourceResolution.devices;
     sourceLoopBackings = sourceResolution.loopBackings;
-    sourceMedia = await captureBlockMediaIdentity([resolvedSource, ...sourceTopDevices, ...sourceLoopBackings.map(backing => backing.device)]);
+    sourceMedia = await captureBlockMediaIdentity(sourceMediaRoots(resolvedSource, sourceTopDevices, sourceLoopBackings));
     const result = await captureCommand(
       "lsblk",
       ["--json", "--bytes", "--paths", "--output", "PATH,KNAME,TYPE,RO,SIZE,FSTYPE,MOUNTPOINTS", resolvedSource],
@@ -287,7 +330,7 @@ export async function inspectSourceSafety(source: string, destination: string): 
     if (!current.isBlockDevice() || current.dev !== metadata.dev || current.ino !== metadata.ino || current.rdev !== metadata.rdev
       || resolution.networkBacked || !isDeepStrictEqual(resolution.devices, sourceTopDevices) || !isDeepStrictEqual(resolution.loopBackings, sourceLoopBackings)
       || !sourceMedia?.devices.some(node => node.majorMinor === linuxMajorMinor(BigInt(metadata.rdev)))
-      || !isDeepStrictEqual(sourceMedia, await captureBlockMediaIdentity([resolvedSource, ...sourceTopDevices, ...sourceLoopBackings.map(backing => backing.device)]))) throw mediaError();
+      || !isDeepStrictEqual(sourceMedia, await captureBlockMediaIdentity(sourceMediaRoots(resolvedSource, sourceTopDevices, sourceLoopBackings)))) throw mediaError();
   }
   if (metadata.isFile()) await assertLoopBackingsOutside(destinationInfo.loopBackings, [resolvedSource], "recovery source image");
   await assertLoopBackingsOutside(sourceLoopBackings, [destination], "recovery destination");
