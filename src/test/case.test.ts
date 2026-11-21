@@ -13,7 +13,7 @@ import { CaseSupervisor } from "../case/supervisor.js";
 import { caseConfigHash, casePlan, digest, loadCaseConfig, MAX_CASE_BYTES } from "../case/config.js";
 import { engineUnitName } from "../case/systemd.js";
 import { CaseSourceIdentityError } from "../case/sources.js";
-import { EngineLaunchRefusedError } from "../case/launch-error.js";
+import { EngineLaunchCancelledError, EngineLaunchRefusedError } from "../case/launch-error.js";
 import { captureCommand } from "../core/command.js";
 import { mkdtemp } from "./helpers.js";
 
@@ -519,6 +519,111 @@ test("run cancellation during quota readiness settles the observation without la
   assert.equal(state.jobs[1]!.attempts.length, 0);
   assert.equal(f.host.launches.length, 1);
 });
+
+for (const inherited of [false, true]) {
+  test(`a proven cancelled quota resume rechecks capacity${inherited ? " after reconciling an inherited intent" : " after restart"}`, linuxOnly, async () => {
+    const f = await fixture();
+    f.config.jobs[0]!.resumeAfterQuota = true;
+    await writeFile(f.filename, JSON.stringify(f.config));
+    await initializeCase(f.filename, {execute: true});
+    const first = await CaseSupervisor.open(f.control, {host: f.host, agent: f.agent});
+    await tick(first);
+    f.host.observations.set(f.host.launches[0]!.identity.unit, {status: "paused", pauseReason: "free-space-reserve"});
+    await tick(first);
+    await first.close();
+    // Synthetic authorized resume intent, modelling both sides of a worker restart.
+    const saved = await loadCaseState(f.control);
+    const decision = saved.state.outbox[0]!;
+    decision.status = "processed";
+    decision.reply = {eventId: decision.event.eventId, revision: decision.event.revision,
+      action: {type: "resume", jobId: "job-000001"}};
+    saved.state.jobs[0]!.attempts.push({index: 0, token: randomUUID(), mode: "resume", status: "launching",
+      ...(inherited ? {dispatched: true} : {})});
+    saved.state.revision++;
+    await saveCaseState(f.control, saved.config, saved.state);
+    let reattachments = 0, readinessChecks = 0;
+    f.host.reattach = async () => { reattachments++; return undefined; };
+    f.host.resumeReady = async () => { readinessChecks++; return f.host.resumeCapacity === true; };
+    const launch = f.host.launch.bind(f.host), controller = new AbortController();
+    f.host.launch = async () => {
+      controller.abort();
+      // Only this explicit host proof authorizes restoring an inherited marker.
+      throw new EngineLaunchCancelledError();
+    };
+    const cancelled = await CaseSupervisor.open(f.control, {host: f.host, agent: new FakeAgent()});
+    try { await cancelled.run(controller.signal); } finally { await cancelled.close(); }
+    const pending = (await loadCaseState(f.control)).state.jobs[0]!.attempts.at(-1)!;
+    assert.equal(pending.status, "launching");
+    assert.equal(pending.dispatched, undefined);
+    assert.equal(pending.launchRefused, undefined);
+    assert.equal(reattachments, inherited ? 1 : 0);
+    const priorChecks = readinessChecks;
+    f.host.resumeCapacity = false;
+    f.host.launch = launch;
+    const restarted = await CaseSupervisor.open(f.control, {host: f.host, agent: new FakeAgent()});
+    try {
+      await tick(restarted, 2);
+      assert.ok(readinessChecks > priorChecks, "capacity is freshly checked after the proven cancellation");
+      assert.equal((await loadCaseState(f.control)).state.jobs[0]!.attempts[0]!.resumeReady, false);
+      assert.equal(f.host.launches.length, 1, "no resume unit is submitted while fresh capacity is unavailable");
+      f.host.resumeCapacity = true;
+      await tick(restarted);
+      assert.equal(f.host.launches.length, 2);
+      assert.equal(f.host.launches[1]!.mode, "resume");
+    } finally { await restarted.close(); }
+  });
+}
+
+for (const previousDeliveries of [0, 1]) {
+test(`cancellation during delivery commit preserves the last unused request slot${previousDeliveries ? " and prior retry history" : ""} across restart`, linuxOnly, async () => {
+  const f = await fixture({maxRequests: previousDeliveries + 1});
+  await initializeCase(f.filename, {execute: true});
+  let now = Date.now();
+  const supervisor = await CaseSupervisor.open(f.control, {host: f.host, agent: f.agent, clock: () => now});
+  await tick(supervisor);
+  f.host.observations.set(f.host.launches[0]!.identity.unit, {status: "failed"});
+  if (previousDeliveries > 0) {
+    await tick(supervisor);
+    f.agent.requests[0]!.reject(new Error("synthetic earlier delivery failure"));
+    await settle(); await tick(supervisor);
+    now = (await loadCaseState(f.control)).state.outbox[0]!.nextDeliveryAt;
+  }
+  const entered = barrier(), release = barrier(), controller = new AbortController();
+  const originalRename = fs.promises.rename;
+  let blocked = false;
+  fs.promises.rename = async (source, destination) => {
+    if (!blocked && destination === path.join(f.control, "case-state-sensitive.json")) {
+      const saved = JSON.parse(await readFile(source, "utf8")) as {state: CaseState};
+      if (saved.state.outbox.some(entry => entry.status === "delivering")) {
+        blocked = true; entered.resolve(); await release.promise;
+      }
+    }
+    await originalRename(source, destination);
+  };
+  syncBuiltinESMExports();
+  try {
+    const running = supervisor.run(controller.signal);
+    await entered.promise;
+    controller.abort(); release.resolve();
+    await running;
+  } finally {
+    controller.abort(); release.resolve(); fs.promises.rename = originalRename; syncBuiltinESMExports(); await supervisor.close();
+  }
+  const {state} = await loadCaseState(f.control);
+  assert.equal(f.agent.requests.length, previousDeliveries);
+  assert.equal(state.agentRequests, previousDeliveries);
+  assert.equal(state.outbox[0]!.deliveries, previousDeliveries);
+  assert.equal(state.outbox[0]!.status, "pending");
+  const agent = new FakeAgent();
+  const restarted = await CaseSupervisor.open(f.control, {host: f.host, agent, clock: () => now});
+  try {
+    await tick(restarted);
+    assert.equal(agent.requests.length, 1);
+    assert.equal((await loadCaseState(f.control)).state.agentRequests, previousDeliveries + 1);
+    assert.equal(agent.requests[0]!.event.eventId, state.outbox[0]!.event.eventId);
+  } finally { await restarted.close(); }
+});
+}
 
 for (const stage of ["configuration", "new-intent", "uncertain-intent"] as const) {
   test(`run cancellation during ${stage} prelaunch work does not submit an engine`, linuxOnly, async t => {

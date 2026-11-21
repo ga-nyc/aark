@@ -5,3 +5,11 @@ export class EngineLaunchRefusedError extends Error {
     this.name = "EngineLaunchRefusedError";
   }
 }
+
+/** The host proved cancellation before any submission for this token; its intent stays pending. */
+export class EngineLaunchCancelledError extends Error {
+  public constructor() {
+    super("case engine cancelled before submission");
+    this.name = "EngineLaunchCancelledError";
+  }
+}

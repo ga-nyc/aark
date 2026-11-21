@@ -16,7 +16,7 @@ import { loadWorkflowConfig } from "../workflow/config.js";
 import { runWorkflow } from "../workflow/runner.js";
 import { mkdtemp } from "./helpers.js";
 import { CaseSourceIdentityError } from "../case/sources.js";
-import { EngineLaunchRefusedError } from "../case/launch-error.js";
+import { EngineLaunchCancelledError, EngineLaunchRefusedError } from "../case/launch-error.js";
 
 const hash = (value: string) => createHash("sha256").update(value).digest("hex");
 async function fixture(): Promise<{root: string; attempt: PreparedAttempt}> {
@@ -95,8 +95,7 @@ for (const stage of ["probe", "logs"] as const) {
     syncBuiltinESMExports();
     try {
       const launching = engine.launch(f.attempt, "cancelled-token", "run", controller.signal);
-      const cancelled = assert.rejects(launching, error => error instanceof Error
-        && error.name === "AbortError" && !(error instanceof EngineLaunchRefusedError));
+      const cancelled = assert.rejects(launching, EngineLaunchCancelledError);
       await entered.promise;
       controller.abort(); release.resolve();
       await cancelled;
@@ -169,10 +168,14 @@ test("a submitted launch and its existing receipt never become definitive prelau
   const host = manager();
   let denyBinding = false;
   let submitted = 0;
+  let cancelOnBinding: AbortController | undefined;
   const engine = new SystemdEngineHost({cliPath: path.resolve("dist/cli.js"), controlRoot: path.join(f.root, "host"),
     command: async (executable, args, options) => {
       if (executable.endsWith("systemd-run")) { submitted++; return result(executable, args, "", {exitCode: 143, terminationReason: "timeout"}); }
-      if (args[1] === "binding" && denyBinding) return result(executable, args, '{"status":"unknown"}', {exitCode: 1});
+      if (args[1] === "binding") {
+        cancelOnBinding?.abort();
+        if (denyBinding) return result(executable, args, '{"status":"unknown"}', {exitCode: 1});
+      }
       return host.command(executable, args, options);
     }});
   const unknown = (error: unknown) => error instanceof Error && !(error instanceof EngineLaunchRefusedError);
@@ -183,6 +186,9 @@ test("a submitted launch and its existing receipt never become definitive prelau
   const invalid = {...f.attempt, configFile: path.join(f.root, "workflow%reviewed.json")};
   await assert.rejects(engine.launch(invalid, "uncertain-token", "run"), unknown);
   await assert.rejects(engine.reattach(invalid, "uncertain-token", "run"), unknown);
+  cancelOnBinding = new AbortController();
+  await assert.rejects(engine.launch(f.attempt, "uncertain-token", "run", cancelOnBinding.signal),
+    error => unknown(error) && !(error instanceof EngineLaunchCancelledError));
   assert.equal(submitted, 1);
 });
 

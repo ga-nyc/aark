@@ -8,7 +8,7 @@ import { CodexAgentError, validateAgentReply } from "./codex.js";
 import { FAILURE_CODES } from "../workflow/failure.js";
 import { acquireCaseLease, type CaseLease } from "./lease.js";
 import { CaseSourceIdentityError } from "./sources.js";
-import { EngineLaunchRefusedError } from "./launch-error.js";
+import { EngineLaunchCancelledError, EngineLaunchRefusedError } from "./launch-error.js";
 import { loadCaseState, redactedCaseStatus, saveCaseState, writeCaseCompletion } from "./store.js";
 import type { AgentBridge, AgentEvent, AgentReply, CaseAttempt, CaseConfig, CaseState, CompletionProof, EngineHost, EngineObservation, OutboxEntry, ReasonCode } from "./types.js";
 
@@ -173,6 +173,12 @@ export class CaseSupervisor {
       this.changed();
       await this.persist();
     } catch (error) {
+      if (error instanceof EngineLaunchCancelledError) {
+        // This trusted host result proves even an inherited intent was never
+        // submitted. A pending quota resume must recheck readiness next tick.
+        delete attempt.dispatched;
+        await this.persist(); return;
+      }
       if (error instanceof EngineLaunchRefusedError) {
         attempt.status = "failed"; attempt.launchRefused = true; attempt.observation = {status: "failed"};
         this.changed(); await this.persist(); return;
@@ -366,8 +372,8 @@ export class CaseSupervisor {
     return this.state.outbox.reduce((until, row) => row.deliveries > 0 ? Math.max(until, row.nextDeliveryAt) : until, 0);
   }
 
-  private async dispatch(): Promise<void> {
-    if (this.agentInFlight || !this.agentReady || this.state.desired !== "running") return;
+  private async dispatch(signal?: AbortSignal): Promise<void> {
+    if (signal?.aborted || this.agentInFlight || !this.agentReady || this.state.desired !== "running") return;
     // A new event must not bypass a failed request's durable transport cooldown.
     if (this.clock() < this.transportBackoffUntil()) return;
     const entry = this.state.outbox.find(row => row.status === "pending" && row.nextDeliveryAt <= this.clock());
@@ -375,11 +381,22 @@ export class CaseSupervisor {
     if (this.state.agentRequests >= this.config.agent.maxRequests) { this.state.health = "agent-unavailable"; return; }
     this.state.agentRequests++; entry.deliveries++; entry.status = "delivering";
     await this.persist();
+    if (signal?.aborted) {
+      // No request has entered the bridge. Undo only this undelivered debit,
+      // preserving earlier delivery attempts and their durable retry history.
+      this.state.agentRequests--; entry.deliveries--; entry.status = "pending";
+      await this.persist(); return;
+    }
     this.agentInFlight = true;
-    void Promise.resolve().then(() => this.options.agent.request(structuredClone(entry.event))).then(
-      reply => { if (!this.closed) this.agentResult = {entry, reply}; },
-      () => { if (!this.closed) this.agentResult = {entry, failed: true}; })
-      .finally(() => { this.agentInFlight = false; });
+    // Enter the bridge in this same turn, with no deferred microtask between
+    // the cancellation check and actual delivery.
+    void (async () => {
+      try {
+        const reply = await this.options.agent.request(structuredClone(entry.event));
+        if (!this.closed) this.agentResult = {entry, reply};
+      } catch { if (!this.closed) this.agentResult = {entry, failed: true}; }
+      finally { this.agentInFlight = false; }
+    })();
   }
 
   private async reconcile(signal?: AbortSignal): Promise<void> {
@@ -441,7 +458,7 @@ export class CaseSupervisor {
       : this.state.outbox.some(row => row.status !== "processed") ? "awaiting-agent"
       : this.capacityWaiting || statuses.some(status => status === "failed" || status === "paused") ? "degraded" : "healthy";
     await this.persist();
-    if (!signal?.aborted) await this.dispatch();
+    if (!signal?.aborted) await this.dispatch(signal);
   }
 
   public async run(signal: AbortSignal): Promise<void> {
