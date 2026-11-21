@@ -235,7 +235,7 @@ test("settled systemd startup failure is observed without native progress or out
   Object.assign(host.properties!, {ActiveState: "failed", SubState: "failed", Result: "exit-code",
     MainPID: "0", TasksCurrent: "0", ExecMainCode: "1", ExecMainStatus: "1"});
   assert.deepEqual(await engine.observe(identity, f.attempt), {status: "failed"});
-  assert.equal(nativeProbes, 0, "terminal failure must not depend on readable destination controls");
+  assert.ok(nativeProbes <= 1, "unavailable diagnostics must not hide proven failure or cause repeated probes");
   await assert.rejects(access(f.attempt.workflow.output));
   assert.deepEqual(await engine.launch(f.attempt, "startup-refusal-token", "run"), identity);
   assert.equal(host.calls.filter(call => call.executable.endsWith("systemd-run")).length, 1);
@@ -251,6 +251,16 @@ test("abruptly killed empty-cgroup invocation is failed even when native status 
     TasksCurrent: "[not set]", ControlGroup: "", ExecMainCode: "2", ExecMainStatus: "9"});
   assert.deepEqual(await engine.observe(identity, f.attempt), {status: "failed"});
   assert.equal(host.calls.some(call => call.args.some(arg => ["kill", "stop", "restart"].includes(arg))), false);
+});
+
+test("a confirmed engine failure still preserves available fixed diagnostics and progress", linux, async () => {
+  const f = await fixture(), host = manager();
+  const engine = new SystemdEngineHost({cliPath: path.resolve("dist/cli.js"), controlRoot: path.join(f.root, "host"), command: host.command});
+  const identity = await engine.launch(f.attempt, "failed-with-progress", "run");
+  Object.assign(host.properties!, {ActiveState: "failed", SubState: "failed", Result: "exit-code", MainPID: "0", ExecMainCode: "1",
+    ExecMainStatus: "1", TasksCurrent: "[not set]", ControlGroup: ""});
+  host.native = {status: "failed", failureCode: "scan-completed-with-errors", currentScanErrors: 1, currentScanBytesScanned: 128};
+  assert.deepEqual(await engine.observe(identity, f.attempt), {status: "failed", failureCode: "scan-completed-with-errors", scanErrors: 1, bytesScanned: 128});
 });
 
 test("missing native progress cannot turn unproven cgroup death into failure or authorize replacement", linux, async () => {

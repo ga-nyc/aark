@@ -197,6 +197,7 @@ export class SystemdEngineHost implements EngineHost {
   }
 
   private async observeOnce(identity: EngineIdentity, attempt: PreparedAttempt): Promise<EngineObservation> {
+    let confirmedFailure = false;
     try {
       if (!/^aark-case-engine-[a-f0-9]{40}\.service$/u.test(identity.unit) || !/^[a-f0-9]{32}$/u.test(identity.invocationId)) return {status: "unknown"};
       const receipt = await readJson<Receipt>(path.join(this.directory, `${identity.unit}.json`), 4096);
@@ -216,18 +217,19 @@ export class SystemdEngineHost implements EngineHost {
       // Startup refusals and crashes can precede the first progress checkpoint,
       // or leave its disk unreadable. An owned, settled failed invocation proves
       // failure independently; it never proves completion or a resumable pause.
-      if (settled && (values.ActiveState === "failed" || exitedWithError || killed)) return {status: "failed"};
+      confirmedFailure = settled && (values.ActiveState === "failed" || exitedWithError || killed);
       const result = await this.capture(process.execPath, [PROBE, "status", attempt.workflow.output]);
-      if (!successful(result)) return {status: "unknown"};
+      if (!successful(result)) return {status: confirmedFailure ? "failed" : "unknown"};
       const native: unknown = JSON.parse(result.stdout.toString());
-      if (typeof native !== "object" || native === null || Array.isArray(native)) return {status: "unknown"};
+      if (typeof native !== "object" || native === null || Array.isArray(native)) return {status: confirmedFailure ? "failed" : "unknown"};
       const status = native as Record<string, unknown>;
       const counters: EngineObservation = {status: "unknown"};
       for (const [source, target] of [["currentScanBytesScanned", "bytesScanned"], ["currentScanFilesScanned", "filesScanned"], ["currentScanErrors", "scanErrors"]] as const) {
         const value = status[source];
         if (typeof value === "number" && Number.isSafeInteger(value) && value >= 0) counters[target] = value;
       }
-      if (typeof status.failureCode === "string" && FAILURE_CODES.has(status.failureCode)) counters.failureCode = status.failureCode;
+      if (status.status === "failed" && typeof status.failureCode === "string" && FAILURE_CODES.has(status.failureCode)) counters.failureCode = status.failureCode;
+      if (confirmedFailure) return {...counters, status: "failed"};
       if (running) return {...counters, status: "running"};
       if (!settled) return counters;
       if (status.status === "paused" && status.resumable === true && values.Result === "success" && values.ExecMainCode === "1" && values.ExecMainStatus === "75"
@@ -241,7 +243,7 @@ export class SystemdEngineHost implements EngineHost {
       }
       if (status.status === "failed") return {...counters, status: "failed"};
       return counters;
-    } catch { return {status: "unknown"}; }
+    } catch { return {status: confirmedFailure ? "failed" : "unknown"}; }
   }
 
   public async verify(attempt: PreparedAttempt): Promise<CompletionProof> {
