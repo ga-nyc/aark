@@ -14,6 +14,8 @@ import { atomicWriteJson } from "../core/fs-safe.js";
 import type { WorkflowConfig } from "../workflow/config.js";
 import { mkdtemp } from "./helpers.js";
 import { inspectSourceSafety } from "../recovery/source-safety.js";
+import { loadRecoveryConfig } from "../recovery/config.js";
+import { RECOVERY_BINDING_TIMEOUT_MS, RECOVERY_CAPACITY_TIMEOUT_MS } from "../case/probe-budget.js";
 import { acquireCaseLease } from "../case/lease.js";
 
 const linuxOnly = { skip: process.platform !== "linux" };
@@ -323,6 +325,36 @@ test("case watchdog respects a supported long poll or first agent handshake inst
   const expired = await watchCaseService(f.control, f.commands.command, NOW + 961_001);
   assert.equal(expired.heartbeatStale, true);
   assert.equal(expired.notificationRequired, true);
+});
+
+test("case watchdog allows sequential recovery binding and readiness budgets but still detects worker death", linuxOnly, async context => {
+  const f = await fixture(context);
+  const root = path.dirname(f.control);
+  const recoveryFile = path.join(root, "recovery.json");
+  await writeFile(recoveryFile, JSON.stringify({version: 1, caseId: "synthetic-probe-budget", execute: true, requireReadOnlySource: true,
+    source: path.join(root, "source.img"), destination: path.join(root, "recovered"), image: {enabled: true},
+    stages: {deletedMetadata: false, ntfsUndelete: false, unallocatedStream: false, signatureCarving: false,
+      volumeShadows: false, residualMemory: false, deletedRegistryCells: false}}));
+  const attempt = f.config.jobs[0]!.attempts[0]!;
+  attempt.workflow.recovery = await loadRecoveryConfig(recoveryFile);
+  attempt.workflow.scans = [{inputs: [attempt.workflow.recovery.image.path], provenance: "allocated-reference"}];
+  attempt.configHash = digest(attempt.workflow);
+  f.config.jobs[0]!.resumeAfterQuota = true;
+  f.state.sourceBindings = {[attempt.configHash]: []};
+  f.state.configHash = caseConfigHash(f.config);
+  await f.save();
+  const aggregate = RECOVERY_BINDING_TIMEOUT_MS + RECOVERY_CAPACITY_TIMEOUT_MS;
+  const live = await watchCaseService(f.control, f.commands.command, NOW + aggregate);
+  assert.equal(live.heartbeatStale, false);
+  assert.equal(live.notificationRequired, false);
+  const limit = aggregate + 2 * f.config.probeTimeoutMs + f.config.pollMs + 60_000;
+  const expired = await watchCaseService(f.control, f.commands.command, NOW + limit + 1);
+  assert.equal(expired.heartbeatStale, true);
+  f.commands.observation = result("ActiveState=failed\nInvocationID=" + "2".repeat(32) + "\n");
+  const dead = await watchCaseService(f.control, f.commands.command, NOW + aggregate);
+  assert.equal(dead.heartbeatStale, false);
+  assert.equal(dead.notificationRequired, true);
+  assert.ok(f.commands.calls.filter(call => call.executable === "/usr/bin/systemctl").every(call => call.options.timeoutMs === 10_000));
 });
 
 test("case watchdog notices a dead worker without signaling any engine", linuxOnly, async (context) => {

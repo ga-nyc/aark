@@ -64,7 +64,7 @@ export interface EngineHost {
   /** Reconcile an uncertain launch without starting an absent engine. */
   reattach?(attempt: PreparedAttempt, token: string, mode: "run" | "resume"): Promise<EngineIdentity | undefined>;
   /** Fresh capacity check for an unchanged, clean free-space pause. */
-  resumeReady?(attempt: PreparedAttempt): Promise<boolean>;
+  resumeReady?(attempt: PreparedAttempt, signal?: AbortSignal): Promise<boolean>;
   observe(identity: EngineIdentity, attempt: PreparedAttempt): Promise<EngineObservation>;
   verify(attempt: PreparedAttempt): Promise<CompletionProof>;
 }

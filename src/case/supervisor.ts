@@ -8,7 +8,7 @@ import { CodexAgentError, validateAgentReply } from "./codex.js";
 import { FAILURE_CODES } from "../workflow/failure.js";
 import { acquireCaseLease, type CaseLease } from "./lease.js";
 import { CaseSourceIdentityError } from "./sources.js";
-import { EngineLaunchCancelledError, EngineLaunchRefusedError } from "./launch-error.js";
+import { EngineLaunchCancelledError, EngineLaunchDeferredError, EngineLaunchRefusedError } from "./launch-error.js";
 import { loadCaseState, redactedCaseStatus, saveCaseState, writeCaseCompletion } from "./store.js";
 import type { AgentBridge, AgentEvent, AgentReply, CaseAttempt, CaseConfig, CaseState, CompletionProof, EngineHost, EngineObservation, OutboxEntry, ReasonCode } from "./types.js";
 
@@ -186,6 +186,12 @@ export class CaseSupervisor {
       this.changed();
       await this.persist();
     } catch (error) {
+      if (error instanceof EngineLaunchDeferredError) {
+        if (error.unsubmitted) delete attempt.dispatched;
+        if (error.reason === "capacity-wait") this.capacityWaiting = true;
+        else this.observationUnavailable = true;
+        await this.persist(); return;
+      }
       if (error instanceof EngineLaunchCancelledError) {
         // This trusted host result proves even an inherited intent was never
         // submitted. A pending quota resume must recheck readiness next tick.
@@ -212,9 +218,10 @@ export class CaseSupervisor {
     this.changed();
   }
 
-  private async pollResumeReadiness(): Promise<void> {
+  private async pollResumeReadiness(signal?: AbortSignal): Promise<void> {
     this.capacityWaiting = false;
     for (let index = 0; index < this.state.jobs.length; index++) {
+      if (signal?.aborted) break;
       const saved = this.state.jobs[index]!;
       const latest = saved.attempts.at(-1);
       const paused = latest?.status === "paused" ? latest
@@ -227,7 +234,7 @@ export class CaseSupervisor {
       if (!this.config.jobs[index]!.resumeAfterQuota || paused.observation?.pauseReason !== "free-space-reserve") continue;
       let ready: boolean | undefined;
       try {
-        const observed = await this.options.host.resumeReady?.(this.config.jobs[index]!.attempts[paused.index]!);
+        const observed = await this.options.host.resumeReady?.(this.config.jobs[index]!.attempts[paused.index]!, signal);
         if (typeof observed === "boolean") ready = observed;
       } catch { /* Unavailable capacity observations do not authorize a resume. */ }
       if (paused.resumeReady !== ready) {
@@ -237,6 +244,9 @@ export class CaseSupervisor {
       }
       if (ready !== true) this.capacityWaiting = true;
       if (ready === undefined) this.observationUnavailable = true;
+      // A single source/capacity probe has its own aggregate deadline. Commit
+      // between probes so a queue of paused jobs cannot hide worker liveness.
+      this.refreshHealth(); await this.persist();
     }
   }
 
@@ -437,7 +447,7 @@ export class CaseSupervisor {
     await this.observe();
     const unavailableReattachments = await this.reattach();
     const unavailableBeforeCapacity = this.observationUnavailable;
-    await this.pollResumeReadiness();
+    await this.pollResumeReadiness(signal);
     this.processReply();
     // Listed independent jobs already have durable execution authorization.
     // Agent transport readiness gates decisions, not that approved native work;

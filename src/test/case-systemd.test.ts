@@ -10,13 +10,15 @@ import { entropyToMnemonic } from "@scure/bip39";
 import { wordlist } from "@scure/bip39/wordlists/english.js";
 import { SystemdEngineHost, engineUnitName } from "../case/systemd.js";
 import { verifyCompletedWorkflow } from "../case/verify.js";
-import type { PreparedAttempt } from "../case/types.js";
+import type { CaseConfig, PreparedAttempt } from "../case/types.js";
 import type { CommandOptions, CommandResult } from "../core/command.js";
 import { loadWorkflowConfig } from "../workflow/config.js";
 import { runWorkflow } from "../workflow/runner.js";
 import { mkdtemp } from "./helpers.js";
 import { CaseSourceIdentityError } from "../case/sources.js";
-import { EngineLaunchCancelledError, EngineLaunchRefusedError } from "../case/launch-error.js";
+import { EngineLaunchCancelledError, EngineLaunchDeferredError, EngineLaunchRefusedError } from "../case/launch-error.js";
+import { bindingProbeTimeoutMs, capacityProbeTimeoutMs, caseMetadataProbeBudget,
+  RECOVERY_BINDING_TIMEOUT_MS, RECOVERY_CAPACITY_TIMEOUT_MS } from "../case/probe-budget.js";
 
 const hash = (value: string) => createHash("sha256").update(value).digest("hex");
 async function fixture(): Promise<{root: string; attempt: PreparedAttempt}> {
@@ -31,6 +33,20 @@ async function fixture(): Promise<{root: string; attempt: PreparedAttempt}> {
     finalizationStorage: {minFreeGiB: 0, minFreePercent: 0}}));
   const workflow = await loadWorkflowConfig(configFile);
   return {root, attempt: {configFile, workflow, configHash: hash(JSON.stringify(workflow))}};
+}
+async function recoveryFixture() {
+  const f = await fixture();
+  const recoveryFile = path.join(f.root, "recovery.json"), source = path.join(f.root, "source.img"), destination = path.join(f.root, "recovered");
+  await writeFile(source, "ordinary synthetic image\n");
+  await writeFile(recoveryFile, JSON.stringify({version: 1, caseId: "synthetic-budget", execute: true, requireReadOnlySource: true,
+    source, destination, image: {enabled: false},
+    stages: {deletedMetadata: false, ntfsUndelete: false, unallocatedStream: true, signatureCarving: false,
+      volumeShadows: false, residualMemory: false, deletedRegistryCells: false}}));
+  const document = JSON.parse(await readFile(f.attempt.configFile, "utf8"));
+  await writeFile(f.attempt.configFile, JSON.stringify({...document, recoveryConfig: recoveryFile,
+    scans: [{inputs: [path.join(destination, "recovery", "unallocated", "free-space.raw")], provenance: "unallocated-stream"}]}));
+  const workflow = await loadWorkflowConfig(f.attempt.configFile);
+  return {...f, attempt: {...f.attempt, workflow, configHash: hash(JSON.stringify(workflow))}};
 }
 function result(executable: string, args: string[], stdout: string, extra: Partial<CommandResult> = {}): CommandResult {
   return {executable, args, exitCode: 0, signal: null, stdout: Buffer.from(stdout), stderr: Buffer.alloc(0),
@@ -57,6 +73,7 @@ function manager() {
       return result(executable, args, "", timeoutLaunch ? {exitCode: 143, terminationReason: "timeout"} : {});
     }
     if (args[1] === "binding") return result(executable, args, '{"valid":true}');
+    if (args[0]?.endsWith("capacity.js")) return result(executable, args, '{"ready":true}');
     if (args[1] === "status") return result(executable, args, JSON.stringify(native), timeoutProbe ? {exitCode: 143, terminationReason: "timeout"} : {});
     if (args[1] === "verify") return result(executable, args, JSON.stringify({sha256: "b".repeat(64), scansVerified: 1, filesVerified: 1}));
     throw new Error("unexpected synthetic command");
@@ -102,12 +119,12 @@ for (const stage of ["probe", "logs"] as const) {
     } finally { fs.promises.open = originalOpen; syncBuiltinESMExports(); }
     assert.equal(host.calls.some(call => call.executable.endsWith("systemd-run")), false);
     const receiptPath = path.join(controlRoot, "engines", `${engineUnitName("cancelled-token")}.json`);
-    if (stage === "probe") await assert.rejects(access(receiptPath));
-    else assert.equal(JSON.parse(await readFile(receiptPath, "utf8")).invocationId, undefined);
+    assert.equal(JSON.parse(await readFile(receiptPath, "utf8")).phase, "prepared");
+    assert.equal(JSON.parse(await readFile(receiptPath, "utf8")).invocationId, undefined);
     const identity = await engine.launch(f.attempt, "cancelled-token", "run");
     assert.equal(identity.unit, engineUnitName("cancelled-token"));
     assert.equal(host.calls.filter(call => call.executable.endsWith("systemd-run")).length, 1);
-    assert.ok(host.calls.every(call => call.options.signal === undefined));
+    assert.ok(host.calls.filter(call => call.args[1] !== "binding" && !call.args[0]?.endsWith("capacity.js")).every(call => call.options.signal === undefined));
     assert.equal(host.calls.some(call => call.args.some(arg => ["kill", "stop", "restart"].includes(arg))), false);
   });
 }
@@ -129,7 +146,7 @@ test("cancellation after systemd submission leaves the independent engine and cl
   const identity = await launching;
   assert.equal(identity.invocationId, "a".repeat(32));
   assert.equal(host.calls.filter(call => call.executable.endsWith("systemd-run")).length, 1);
-  assert.ok(host.calls.every(call => call.options.signal === undefined));
+  assert.ok(host.calls.filter(call => call.args[1] !== "binding" && !call.args[0]?.endsWith("capacity.js")).every(call => call.options.signal === undefined));
   assert.equal(host.calls.some(call => call.args.some(arg => ["kill", "stop", "restart"].includes(arg))), false);
 });
 
@@ -278,16 +295,17 @@ test("immutable local launch refusals are explicit and cannot create an engine o
   await assert.rejects(access(control));
 });
 
-test("an absent unit with no launch intent permits an explicit configuration refusal", linux, async context => {
+test("an unavailable binding observation defers an absent unit without failing its attempt", linux, async context => {
   const f = await fixture();
   context.after(() => rm(f.root, {recursive: true, force: true}));
   const host = manager();
   const engine = new SystemdEngineHost({cliPath: path.resolve("dist/cli.js"), controlRoot: path.join(f.root, "host"),
     command: async (executable, args, options) => args[1] === "binding" ? result(executable, args, '{"status":"unknown"}', {exitCode: 1})
       : host.command(executable, args, options)});
-  await assert.rejects(engine.launch(f.attempt, "refused-token", "run"), EngineLaunchRefusedError);
+  await assert.rejects(engine.launch(f.attempt, "refused-token", "run"), error => error instanceof EngineLaunchDeferredError
+    && error.unsubmitted === true && error.reason === "observation-unavailable");
   assert.equal(host.calls.some(call => call.executable.endsWith("systemd-run")), false);
-  await assert.rejects(access(path.join(f.root, "host", "engines", `${engineUnitName("refused-token")}.json`)));
+  assert.equal(JSON.parse(await readFile(path.join(f.root, "host", "engines", `${engineUnitName("refused-token")}.json`), "utf8")).phase, "prepared");
   await assert.rejects(access(f.attempt.workflow.output));
 });
 
@@ -386,6 +404,136 @@ test("quota readiness uses an isolated bounded helper and rejects unavailable or
   for (let index = 0; index < 4; index++) await assert.rejects(engine.resumeReady(f.attempt), /readiness observation unavailable/);
   assert.equal(calls, 6);
   await assert.rejects(access(path.join(f.root, "host")));
+});
+
+test("recovery metadata budgets cover sequential binding and quota probes without changing ordinary status deadlines", linux, async context => {
+  const ordinary = await fixture(), f = await recoveryFixture(), host = manager();
+  context.after(() => rm(ordinary.root, {recursive: true, force: true}));
+  context.after(() => rm(f.root, {recursive: true, force: true}));
+  assert.equal(bindingProbeTimeoutMs(ordinary.attempt, 123), 123);
+  assert.equal(capacityProbeTimeoutMs(ordinary.attempt, 123), 123);
+  assert.equal(bindingProbeTimeoutMs(f.attempt, 123), RECOVERY_BINDING_TIMEOUT_MS);
+  assert.equal(capacityProbeTimeoutMs(f.attempt, 123), RECOVERY_CAPACITY_TIMEOUT_MS);
+  const config = {probeTimeoutMs: 123, jobs: [{attempts: [f.attempt], resumeAfterQuota: false}]} as CaseConfig;
+  assert.equal(caseMetadataProbeBudget(config), RECOVERY_BINDING_TIMEOUT_MS);
+  config.jobs[0]!.resumeAfterQuota = true;
+  assert.equal(caseMetadataProbeBudget(config), RECOVERY_BINDING_TIMEOUT_MS + RECOVERY_CAPACITY_TIMEOUT_MS);
+  const signal = new AbortController().signal;
+  const engine = new SystemdEngineHost({cliPath: path.resolve("dist/cli.js"), controlRoot: path.join(f.root, "host"), probeTimeoutMs: 123,
+    sourceBindings: {[f.attempt.configHash]: []}, command: async (executable, args, options) => {
+      const binding = args[1] === "binding", capacity = args[0]?.endsWith("capacity.js");
+      assert.equal(options.timeoutMs, binding ? RECOVERY_BINDING_TIMEOUT_MS : capacity ? RECOVERY_CAPACITY_TIMEOUT_MS : 123);
+      assert.equal(options.signal, binding || capacity ? signal : undefined);
+      return await host.command(executable, args, options);
+    }});
+  const identity = await engine.launch(f.attempt, "aggregate-budget", "resume", signal);
+  await engine.observe(identity, f.attempt);
+  assert.ok(host.calls.some(call => call.args[1] === "binding"));
+  assert.ok(host.calls.some(call => call.args[0]?.endsWith("capacity.js")));
+  assert.ok(host.calls.some(call => call.args[1] === "status"));
+});
+
+for (const phase of ["prepared", "submitting", "legacy"] as const) {
+  test(`an absent ${phase} resume waits for fresh host capacity after binding and log work`, linux, async context => {
+    const f = await fixture(), host = manager(), order: string[] = [];
+    context.after(() => rm(f.root, {recursive: true, force: true}));
+    const controlRoot = path.join(f.root, "host");
+    let ready = false;
+    const command = async (executable: string, args: string[], options: CommandOptions) => {
+      if (args[1] === "binding") order.push("binding");
+      if (args[0]?.endsWith("capacity.js")) { order.push("capacity"); return result(executable, args, JSON.stringify({ready})); }
+      if (executable.endsWith("systemd-run")) order.push("submit");
+      return await host.command(executable, args, options);
+    };
+    const engine = new SystemdEngineHost({cliPath: path.resolve("dist/cli.js"), controlRoot, command});
+    await assert.rejects(engine.launch(f.attempt, "capacity-boundary", "resume"), error => error instanceof EngineLaunchDeferredError
+      && error.unsubmitted === true && error.reason === "capacity-wait");
+    const receiptPath = path.join(controlRoot, "engines", `${engineUnitName("capacity-boundary")}.json`);
+    const receipt = JSON.parse(await readFile(receiptPath, "utf8"));
+    if (phase !== "prepared") await writeFile(receiptPath, JSON.stringify(phase === "legacy"
+      ? {version: 1, binding: receipt.binding} : {...receipt, phase: "submitting"}));
+    const restarted = new SystemdEngineHost({cliPath: path.resolve("dist/cli.js"), controlRoot, command});
+    await assert.rejects(restarted.launch(f.attempt, "capacity-boundary", "resume"), error => error instanceof EngineLaunchDeferredError
+      && error.unsubmitted === (phase === "prepared") && error.reason === "capacity-wait");
+    assert.equal(host.calls.some(call => call.executable.endsWith("systemd-run")), false);
+    const pending = JSON.parse(await readFile(receiptPath, "utf8"));
+    assert.equal(pending.version, phase === "legacy" ? 1 : 2);
+    assert.equal(pending.phase, phase === "legacy" ? undefined : phase);
+    ready = true;
+    await restarted.launch(f.attempt, "capacity-boundary", "resume");
+    assert.deepEqual(order, ["binding", "capacity", "binding", "capacity", "binding", "capacity", "submit"]);
+  });
+}
+
+test("metadata timeout and helper unavailability defer the same prepared attempt and recover later", linux, async context => {
+  const f = await fixture(), host = manager();
+  context.after(() => rm(f.root, {recursive: true, force: true}));
+  let observation: "timeout" | "unavailable" | "ready" = "timeout";
+  const controlRoot = path.join(f.root, "host");
+  const engine = new SystemdEngineHost({cliPath: path.resolve("dist/cli.js"), controlRoot, bindingTimeoutMs: 2,
+    command: async (executable, args, options) => {
+      if (args[1] === "binding") {
+        assert.equal(options.timeoutMs, 2);
+        const prepared = JSON.parse(await readFile(path.join(controlRoot, "engines", `${engineUnitName("deferred-binding")}.json`), "utf8"));
+        assert.equal(prepared.phase, "prepared", "the durable unsubmitted proof precedes the slow observation");
+        if (observation === "unavailable") throw new Error("synthetic unavailable metadata helper");
+        if (observation === "timeout") return result(executable, args, "", {exitCode: 143, terminationReason: "timeout"});
+      }
+      return await host.command(executable, args, options);
+    }});
+  for (const state of ["timeout", "unavailable"] as const) {
+    observation = state;
+    await assert.rejects(engine.launch(f.attempt, "deferred-binding", "run"), error => error instanceof EngineLaunchDeferredError
+      && error.unsubmitted && error.reason === "observation-unavailable");
+  }
+  assert.equal(host.calls.some(call => call.executable.endsWith("systemd-run")), false);
+  observation = "ready";
+  const identity = await engine.launch(f.attempt, "deferred-binding", "run");
+  assert.equal(identity.unit, engineUnitName("deferred-binding"));
+  assert.equal(host.calls.filter(call => call.executable.endsWith("systemd-run")).length, 1);
+});
+
+test("unavailable host quota probes defer instead of submitting", linux, async context => {
+  const f = await fixture(), host = manager();
+  context.after(() => rm(f.root, {recursive: true, force: true}));
+  const engine = new SystemdEngineHost({cliPath: path.resolve("dist/cli.js"), controlRoot: path.join(f.root, "host"), capacityTimeoutMs: 3,
+    command: async (executable, args, options) => {
+      if (args[0]?.endsWith("capacity.js")) {
+        assert.equal(options.timeoutMs, 3);
+        return result(executable, args, '{"ready":true}', {exitCode: 143, terminationReason: "timeout"});
+      }
+      return await host.command(executable, args, options);
+    }});
+  await assert.rejects(engine.launch(f.attempt, "deferred-capacity", "resume"), error => error instanceof EngineLaunchDeferredError
+    && error.unsubmitted && error.reason === "observation-unavailable");
+  assert.equal(host.calls.some(call => call.executable.endsWith("systemd-run")), false);
+});
+
+test("the host boundary waits for a fresh quota probe instead of reusing a timed-out helper", linux, async context => {
+  const f = await fixture(), host = manager();
+  context.after(() => rm(f.root, {recursive: true, force: true}));
+  let calls = 0, release!: () => void;
+  const waiting = new Promise<void>(resolve => { release = resolve; });
+  context.after(() => release());
+  const engine = new SystemdEngineHost({cliPath: path.resolve("dist/cli.js"), controlRoot: path.join(f.root, "host"), capacityTimeoutMs: 1,
+    command: async (executable, args, options) => {
+      if (args[0]?.endsWith("capacity.js")) {
+        calls++;
+        if (calls === 1) await waiting;
+        return result(executable, args, '{"ready":true}');
+      }
+      return await host.command(executable, args, options);
+    }});
+  await assert.rejects(engine.resumeReady(f.attempt), /deadline exceeded/);
+  await assert.rejects(engine.launch(f.attempt, "fresh-capacity", "resume"), error => error instanceof EngineLaunchDeferredError
+    && error.unsubmitted && error.reason === "observation-unavailable");
+  assert.equal(calls, 1);
+  assert.equal(host.calls.some(call => call.executable.endsWith("systemd-run")), false);
+  release();
+  await new Promise<void>(resolve => setImmediate(resolve));
+  await engine.launch(f.attempt, "fresh-capacity", "resume");
+  assert.equal(calls, 2);
+  assert.equal(host.calls.filter(call => call.executable.endsWith("systemd-run")).length, 1);
 });
 
 test("host preflight checks privilege, binary versions, CLI availability, and manager connectivity without launching", linux, async t => {

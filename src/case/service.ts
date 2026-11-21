@@ -11,6 +11,7 @@ import { assertCaseDirectory, loadCaseState, redactedCaseStatus } from "./store.
 import type { CaseConfig } from "./types.js";
 import { caseRecoverySourcesToInspect } from "./sources.js";
 import { acquireCaseLease } from "./lease.js";
+import { caseMetadataProbeBudget } from "./probe-budget.js";
 export { caseRecoverySourcesToInspect } from "./sources.js";
 
 type Command = (executable: string, args: string[], options: CommandOptions) => Promise<CommandResult>;
@@ -157,6 +158,11 @@ async function watchCaseServiceHeld(control: string, command: Command, now: numb
     status = redactedCaseStatus(loaded.config, loaded.state);
     // Respect supported polling intervals and a bounded first agent handshake.
     staleAfter = Math.max(staleAfter, loaded.config.pollMs * 3, loaded.config.agent.timeoutMs + loaded.config.pollMs + 60_000);
+    // A resume may perform binding and capacity probes sequentially. Readiness
+    // observations are committed between jobs, rather than granting an entire
+    // case's queue one enormous heartbeat window.
+    staleAfter = Math.max(staleAfter, caseMetadataProbeBudget(loaded.config)
+      + 2 * loaded.config.probeTimeoutMs + loaded.config.pollMs + 60_000);
   } catch { /* Fixed failure alert below. */ }
   const stale = status === undefined || now - Date.parse(String(status.updatedAt)) > staleAfter;
   const unhealthy = !active || stale || ["degraded", "awaiting-permission", "agent-unavailable", "observation-unavailable"].includes(String(status?.health));

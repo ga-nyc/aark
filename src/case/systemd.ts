@@ -8,7 +8,8 @@ import { atomicWriteJson, ensurePrivateDirectory, readJson, stableHandleStat } f
 import { FAILURE_CODES } from "../workflow/failure.js";
 import { CaseSourceIdentityError } from "./sources.js";
 import { isSupportedCasePath } from "./config.js";
-import { EngineLaunchCancelledError, EngineLaunchRefusedError } from "./launch-error.js";
+import { EngineLaunchCancelledError, EngineLaunchDeferredError, EngineLaunchRefusedError } from "./launch-error.js";
+import { bindingProbeTimeoutMs, capacityProbeTimeoutMs } from "./probe-budget.js";
 import type { CaseSourceBinding, CaseSourceBindings, CompletionProof, EngineHost, EngineIdentity, EngineObservation, PreparedAttempt } from "./types.js";
 
 type Command = (executable: string, args: string[], options: CommandOptions) => Promise<CommandResult>;
@@ -17,6 +18,9 @@ export interface SystemdEngineHostOptions {
   controlRoot: string;
   probeTimeoutMs?: number;
   verificationTimeoutMs?: number;
+  /** Test seams for aggregate metadata deadlines; production uses probe-budget defaults. */
+  bindingTimeoutMs?: number;
+  capacityTimeoutMs?: number;
   sourceBindings?: CaseSourceBindings;
   /** Test seam; production always uses captureCommand. */
   command?: Command;
@@ -53,20 +57,22 @@ export class SystemdEngineHost implements EngineHost {
     }
     this.timeout = options.probeTimeoutMs ?? 10_000;
     this.verificationTimeout = options.verificationTimeoutMs ?? 30 * 60_000;
-    for (const value of [this.timeout, this.verificationTimeout]) {
+    for (const value of [this.timeout, this.verificationTimeout, options.bindingTimeoutMs, options.capacityTimeoutMs].filter(value => value !== undefined)) {
       if (!Number.isSafeInteger(value) || value < 1) throw new Error("invalid case helper deadline");
     }
     this.command = options.command ?? captureCommand;
     this.directory = path.join(options.controlRoot, "engines");
   }
 
-  private async capture(executable: string, args: string[], timeoutMs = this.timeout, beforeStart?: () => void): Promise<CommandResult> {
+  private async capture(executable: string, args: string[], timeoutMs = this.timeout, beforeStart?: () => void, signal?: AbortSignal): Promise<CommandResult> {
     const key = JSON.stringify([executable, args]);
     let helper = this.helpers.get(key);
     if (helper === undefined) {
       helper = Promise.resolve().then(() => {
+        signal?.throwIfAborted();
         beforeStart?.();
-        return this.command(executable, args, {timeoutMs, killGraceMs: 250, maxCaptureBytes: 64 * 1024});
+        return this.command(executable, args, {timeoutMs, killGraceMs: 250, maxCaptureBytes: 64 * 1024,
+          ...(signal === undefined ? {} : {signal})});
       })
         .finally(() => this.helpers.delete(key));
       this.helpers.set(key, helper);
@@ -74,11 +80,21 @@ export class SystemdEngineHost implements EngineHost {
     // An uninterruptible helper can outlive SIGKILL. Keep its slot until it really
     // exits, while returning observation-unavailable instead of piling up probes.
     let timer: ReturnType<typeof setTimeout> | undefined;
+    let onAbort: (() => void) | undefined;
     try {
-      return await Promise.race([helper, new Promise<never>((_resolve, reject) => {
+      const aborted = new Promise<never>((_resolve, reject) => {
+        if (signal === undefined) return;
+        onAbort = () => reject(signal.reason);
+        signal.addEventListener("abort", onAbort, {once: true});
+        if (signal.aborted) onAbort();
+      });
+      return await Promise.race([helper, aborted, new Promise<never>((_resolve, reject) => {
         timer = setTimeout(() => reject(new Error("case helper observation deadline exceeded")), timeoutMs + 1000);
       })]);
-    } finally { if (timer !== undefined) clearTimeout(timer); }
+    } finally {
+      if (timer !== undefined) clearTimeout(timer);
+      if (onAbort !== undefined) signal?.removeEventListener("abort", onAbort);
+    }
   }
 
   public async preflight(): Promise<void> {
@@ -218,12 +234,19 @@ export class SystemdEngineHost implements EngineHost {
       try {
       signal?.throwIfAborted();
       await ensurePrivateDirectory(this.directory);
-      const config = await this.capture(process.execPath, [PROBE, "binding", attempt.configFile, attempt.configHash, JSON.stringify(this.sourcePolicy(attempt))]);
+      if (receipt === undefined) await atomicWriteJson(receiptPath, {version: 2, phase: "prepared", binding});
+      let config: CommandResult;
+      try {
+        config = await this.capture(process.execPath, [PROBE, "binding", attempt.configFile, attempt.configHash, JSON.stringify(this.sourcePolicy(attempt))],
+          this.options.bindingTimeoutMs ?? bindingProbeTimeoutMs(attempt, this.timeout), undefined, signal);
+      } catch (error) {
+        if (signal?.aborted) throw error;
+        throw new EngineLaunchDeferredError(phase === "prepared", "observation-unavailable");
+      }
       signal?.throwIfAborted();
       if (config.exitCode === 2 && config.terminationReason === null && !config.stdoutTruncated && !config.stderrTruncated
         && config.stdout.toString().trim() === '{"valid":false,"reason":"source-identity-changed"}') throw new CaseSourceIdentityError();
-      if (!successful(config) || config.stdout.toString().trim() !== '{"valid":true}') throw new Error("case engine configuration binding changed");
-      if (receipt === undefined) await atomicWriteJson(receiptPath, {version: 2, phase: "prepared", binding});
+      if (!successful(config) || config.stdout.toString().trim() !== '{"valid":true}') throw new EngineLaunchDeferredError(phase === "prepared", "observation-unavailable");
       const logs = ["stdout", "stderr"].map(kind => path.join(this.directory, `${unit}.${kind}.log`));
       for (const filename of logs) {
         const handle = await open(filename, constants.O_CREAT | constants.O_APPEND | constants.O_WRONLY | constants.O_NOFOLLOW, 0o600);
@@ -239,6 +262,16 @@ export class SystemdEngineHost implements EngineHost {
         ...(mode === "run" ? ["--config", attempt.configFile] : ["--output", attempt.workflow.output]), "--expected-config-hash", attempt.configHash,
         ...(attempt.workflow.recovery === undefined ? [] : ["--expected-source-bindings", JSON.stringify(this.sourcePolicy(attempt))]), "--execute"];
       signal?.throwIfAborted();
+      if (mode === "resume") {
+        let ready: boolean;
+        try { ready = await this.quotaReadiness(attempt, signal, true); }
+        catch (error) {
+          if (signal?.aborted) throw error;
+          throw new EngineLaunchDeferredError(phase === "prepared", "observation-unavailable");
+        }
+        if (!ready) throw new EngineLaunchDeferredError(phase === "prepared", "capacity-wait");
+        signal?.throwIfAborted();
+      }
       // Once this write is attempted, a crash or write failure can leave a
       // durable submission intent. Never downgrade it to prepared afterward.
       phase = "submitting";
@@ -264,6 +297,7 @@ export class SystemdEngineHost implements EngineHost {
           throw error;
         }
         if (error instanceof CaseSourceIdentityError) throw error;
+        if (error instanceof EngineLaunchDeferredError) throw error;
         // An absent unit and no prior receipt prove this is a pre-submit
         // refusal. Once submission starts, even a timeout remains unknown.
         if (phase === "prepared") throw new EngineLaunchRefusedError();
@@ -349,8 +383,17 @@ export class SystemdEngineHost implements EngineHost {
     } catch { throw new Error("case workflow completion verification failed"); }
   }
 
-  public async resumeReady(attempt: PreparedAttempt): Promise<boolean> {
-    const result = await this.capture(process.execPath, [CAPACITY, attempt.configFile, attempt.configHash]);
+  public async resumeReady(attempt: PreparedAttempt, signal?: AbortSignal): Promise<boolean> {
+    return await this.quotaReadiness(attempt, signal);
+  }
+
+  private async quotaReadiness(attempt: PreparedAttempt, signal?: AbortSignal, fresh = false): Promise<boolean> {
+    const args = [CAPACITY, attempt.configFile, attempt.configHash];
+    // An old helper can outlive its deadline. A launch must wait for a new
+    // observation rather than reuse that earlier helper's eventual snapshot.
+    if (fresh && this.helpers.has(JSON.stringify([process.execPath, args]))) throw new Error("case quota readiness observation unavailable");
+    const result = await this.capture(process.execPath, args,
+      this.options.capacityTimeoutMs ?? capacityProbeTimeoutMs(attempt, this.timeout), undefined, signal);
     if (!successful(result)) throw new Error("case quota readiness observation unavailable");
     let response: unknown;
     try { response = JSON.parse(result.stdout.toString()); } catch { throw new Error("case quota readiness observation unavailable"); }

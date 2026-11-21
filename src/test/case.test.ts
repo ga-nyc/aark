@@ -13,7 +13,7 @@ import { CaseSupervisor } from "../case/supervisor.js";
 import { caseConfigHash, casePlan, digest, loadCaseConfig, MAX_CASE_BYTES } from "../case/config.js";
 import { engineUnitName } from "../case/systemd.js";
 import { CaseSourceIdentityError } from "../case/sources.js";
-import { EngineLaunchCancelledError, EngineLaunchRefusedError } from "../case/launch-error.js";
+import { EngineLaunchCancelledError, EngineLaunchDeferredError, EngineLaunchRefusedError } from "../case/launch-error.js";
 import { captureCommand } from "../core/command.js";
 import { mkdtemp } from "./helpers.js";
 
@@ -55,7 +55,7 @@ class FakeHost implements EngineHost {
     if (proof instanceof Error) throw proof;
     return proof ?? {sha256: "a".repeat(64), scansVerified: attempt.workflow.scans.length, filesVerified: 1};
   }
-  async resumeReady(): Promise<boolean> {
+  async resumeReady(_attempt: PreparedAttempt, _signal?: AbortSignal): Promise<boolean> {
     if (this.resumeCapacity instanceof Error) throw this.resumeCapacity;
     return this.resumeCapacity;
   }
@@ -615,6 +615,76 @@ test("run cancellation during quota readiness settles the observation without la
   assert.equal(state.jobs[0]!.attempts[0]!.resumeReady, true);
   assert.equal(state.jobs[1]!.attempts.length, 0);
   assert.equal(f.host.launches.length, 1);
+});
+
+test("metadata availability defers the same reviewed attempt until a later observation succeeds", linuxOnly, async t => {
+  const f = await fixture({attempts: 2});
+  await initializeCase(f.filename, {execute: true});
+  const launch = f.host.launch.bind(f.host);
+  const tokens: string[] = [];
+  f.host.launch = async (_attempt, token) => { tokens.push(token); throw new EngineLaunchDeferredError(true, "observation-unavailable"); };
+  const supervisor = await CaseSupervisor.open(f.control, {host: f.host, agent: f.agent});
+  t.after(() => supervisor.close());
+  await tick(supervisor, 3);
+  const deferred = (await loadCaseState(f.control)).state;
+  assert.equal(new Set(tokens).size, 1, "metadata retries retain the persisted idempotency token");
+  assert.equal(deferred.jobs[0]!.attempts.length, 1);
+  assert.equal(deferred.jobs[0]!.attempts[0]!.index, 0);
+  assert.equal(deferred.jobs[0]!.attempts[0]!.status, "launching");
+  assert.equal(deferred.jobs[0]!.attempts[0]!.dispatched, undefined);
+  assert.equal(deferred.jobs[0]!.attempts[0]!.launchRefused, undefined);
+  assert.equal(deferred.health, "observation-unavailable");
+  assert.equal(deferred.agentRequests, 0);
+  f.host.launch = launch;
+  await tick(supervisor);
+  const recovered = (await loadCaseState(f.control)).state;
+  assert.equal(recovered.jobs[0]!.attempts.length, 1);
+  assert.equal(recovered.jobs[0]!.attempts[0]!.status, "running");
+  assert.equal(f.host.launches[0]!.token, tokens[0]);
+});
+
+test("a deferred observation cannot downgrade an ambiguous submission receipt", linuxOnly, async t => {
+  const f = await fixture();
+  await initializeCase(f.filename, {execute: true});
+  const saved = await loadCaseState(f.control);
+  saved.state.jobs[0]!.attempts.push({index: 0, token: randomUUID(), mode: "run", status: "launching", dispatched: true});
+  await saveCaseState(f.control, saved.config, saved.state);
+  f.host.reattach = async () => undefined;
+  f.host.launch = async () => { throw new EngineLaunchDeferredError(false, "observation-unavailable"); };
+  const supervisor = await CaseSupervisor.open(f.control, {host: f.host, agent: f.agent});
+  t.after(() => supervisor.close());
+  await tick(supervisor);
+  const attempt = (await loadCaseState(f.control)).state.jobs[0]!.attempts[0]!;
+  assert.equal(attempt.dispatched, true);
+  assert.equal(attempt.status, "launching");
+  assert.equal(attempt.launchRefused, undefined);
+});
+
+test("readiness observations commit a heartbeat between bounded metadata probes", linuxOnly, async t => {
+  const f = await fixture({jobs: 2, maxConcurrent: 2});
+  for (const job of f.config.jobs) job.resumeAfterQuota = true;
+  await writeFile(f.filename, JSON.stringify(f.config));
+  await initializeCase(f.filename, {execute: true});
+  let now = Date.now();
+  const supervisor = await CaseSupervisor.open(f.control, {host: f.host, agent: f.agent, clock: () => now});
+  t.after(() => supervisor.close());
+  await tick(supervisor);
+  for (const launch of f.host.launches) f.host.observations.set(launch.identity.unit, {status: "paused", pauseReason: "free-space-reserve"});
+  let probes = 0;
+  f.host.resumeReady = async () => {
+    probes++;
+    if (probes === 1) now += 360_000;
+    else {
+      const {state} = await loadCaseState(f.control);
+      assert.equal(state.updatedAt, new Date(now).toISOString());
+      assert.equal(state.jobs[0]!.attempts[0]!.resumeReady, false);
+      assert.equal(state.health, "degraded");
+    }
+    return false;
+  };
+  await tick(supervisor);
+  assert.equal(probes, 2);
+  assert.equal(f.host.launches.length, 2);
 });
 
 for (const inherited of [false, true]) {
