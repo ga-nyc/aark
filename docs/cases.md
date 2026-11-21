@@ -75,9 +75,11 @@ a reboot, and legacy raw checkpoints without this binding require local review
 and new authorization. This cannot attest a physical change the driver has not
 reported. Inputs that will be produced by an approved dependency remain
 subject to that producer's exact verified attempt and native launch checks.
-Device-mapper sources additionally require Python 3.7 or newer and `dmsetup`. A bounded
-offline helper fingerprints the active mapping table; raw table and key bytes
-never reach case reports, logs, or agent packets. The digest binds exported table
+Device-mapper sources additionally require Python 3.7 or newer. A bounded Python
+stdlib helper uses a read-only kernel ioctl to fingerprint the active mapping
+table without a child command. It disables process dumpability before fetching
+the table, including for piped crash collectors. Raw table and key bytes never
+reach case reports, logs, or agent packets. The digest binds exported table
 parameters, including literal keys and offsets; opaque kernel key references are
 bound as references and do not attest non-exported key contents.
 
@@ -187,6 +189,23 @@ output is complete. The case status distinguishes running work, degraded work,
 unavailable observation, an outstanding agent request, and required permission.
 Use its aggregate redacted status for routine monitoring rather than opening
 sensitive workflow controls.
+
+Recovery source-binding probes have a 120-second aggregate deadline; recovery
+quota-readiness probes have a separate 360-second aggregate deadline. These
+allow multiple bounded mapper queries without enlarging the configured
+`probeTimeoutMs` for systemd and ordinary status checks. They are aggregate caps,
+not a promise that every supported 1,024-mapper graph finishes within them.
+Metadata timeout or unavailability leaves the same reviewed intent pending and
+visible as an unknown observation rather than consuming a failed attempt.
+Before submitting any absent-unit resume, the host checks quota readiness again,
+including when an earlier submission outcome is uncertain. Native resume still
+enforces the authoritative storage and checkpoint checks.
+
+The watchdog allows the sequential binding-plus-readiness deadline and its
+polling margin. The worker commits observations between readiness probes so a
+queue of paused jobs does not extend that heartbeat window across the whole
+case. A stopped worker is still detected from its systemd state independently
+of heartbeat age.
 
 ## Completion and retention
 
