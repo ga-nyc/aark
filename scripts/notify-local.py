@@ -22,11 +22,13 @@ import stat
 import subprocess
 import sys
 import tempfile
+from urllib.parse import unquote_to_bytes
 
 EVENTS = {'failed', 'paused', 'complete', 'notification-test'}
 NOTIFICATION_TIMEOUT_MS = 15000
 DEFAULT_STATE_DIRECTORY = Path('/var/lib/aark-alerts')
 UNIT_STEM_PATTERN = r'(?:[A-Za-z0-9_@.:-]|\\x[0-9a-fA-F]{2})+'
+COMMAND_ENV = {'PATH': '/usr/sbin:/usr/bin:/sbin:/bin', 'LANG': 'C.UTF-8', 'LC_ALL': 'C.UTF-8'}
 
 
 def _now():
@@ -61,6 +63,31 @@ def _boot_id():
             or value.rstrip('\n') == '00000000-0000-0000-0000-000000000000'):
         raise RuntimeError('Kernel boot identity unavailable')
     return value.rstrip('\n')
+
+
+def _local_bus_address(value):
+    # D-Bus permits semicolon-separated transports. Accept one connectable
+    # Unix endpoint only, using the specification's escaped-value grammar.
+    if not isinstance(value, str) or not value.startswith('unix:'):
+        return False
+    properties = {}
+    for item in value[5:].split(','):
+        key, separator, encoded = item.partition('=')
+        if (not separator or key not in ('path', 'abstract', 'guid') or key in properties
+                or not re.fullmatch(r'(?:[-0-9A-Za-z_/.*]|%[0-9a-fA-F]{2})+', encoded)):
+            return False
+        decoded = unquote_to_bytes(encoded)
+        if any(byte < 32 or byte == 127 for byte in decoded):
+            return False
+        properties[key] = decoded
+    endpoints = set(properties).intersection(('path', 'abstract'))
+    if len(endpoints) != 1:
+        return False
+    if 'path' in properties and not properties['path'].startswith(b'/'):
+        return False
+    if 'guid' in properties and not re.fullmatch(b'[0-9a-fA-F]{32}', properties['guid']):
+        return False
+    return True
 
 
 def _validate_identifiers(unit, event, invocation_id=None):
@@ -101,7 +128,7 @@ class LocalNotifier:
             raise ValueError('Configure an explicit allowlist of systemd unit names')
         if not re.fullmatch(r'[A-Za-z_][A-Za-z0-9_.-]*[$]?', session_user):
             raise ValueError('Configure a valid desktop session user')
-        if not bus_address.startswith('unix:') or any(char in bus_address for char in '\r\n\0'):
+        if not _local_bus_address(bus_address):
             raise ValueError('Configure the local desktop session bus address')
         self.root = Path(state_directory)
         self.historical_journal = Path(historical_journal) if historical_journal else None
@@ -265,10 +292,10 @@ class LocalNotifier:
 
     def _unit_status(self, unit):
         result = subprocess.run(
-            ['systemctl', 'show', unit + '.service', '--no-pager',
+            ['/usr/bin/systemctl', 'show', unit + '.service', '--no-pager',
              '-p', 'ActiveState', '-p', 'InvocationID',
              '-p', 'ExecMainStartTimestampMonotonic', '-p', 'ExecMainExitTimestampMonotonic'],
-            capture_output=True, text=True, timeout=10)
+            capture_output=True, text=True, timeout=10, env=COMMAND_ENV)
         if result.returncode:
             raise RuntimeError('systemctl status query failed')
         fields = dict(line.split('=', 1) for line in result.stdout.splitlines() if '=' in line)
@@ -303,7 +330,7 @@ class LocalNotifier:
             '-t', str(NOTIFICATION_TIMEOUT_MS), '-a', 'AARK']
         command += ['AARK: ' + event, unit + ': inspect the local redacted status.']
         try:
-            result = subprocess.run(command, capture_output=True, text=True, errors='replace', timeout=15)
+            result = subprocess.run(command, capture_output=True, text=True, errors='replace', timeout=15, env=COMMAND_ENV)
             record['desktopDeliveryAccepted'] = result.returncode == 0
             if result.returncode:
                 record['deliveryError'] = 'notify-send returned ' + str(result.returncode)
@@ -470,6 +497,8 @@ def main(arguments=None):
     action.add_argument('--watch', action='store_true')
     action.add_argument('--on-failure', action='store_true',
                         help='Use systemd MONITOR_UNIT and MONITOR_INVOCATION_ID from OnFailure=')
+    action.add_argument('--retry-pending-failure', action='store_true',
+                        help='Retry at most one persisted unaccepted failure without querying systemd')
     parser.add_argument('--event', choices=sorted(EVENTS), default='failed')
     identity = parser.add_mutually_exclusive_group()
     identity.add_argument('--seed-accepted-history', metavar='INVOCATION',
@@ -481,14 +510,16 @@ def main(arguments=None):
         parser.error('--seed-accepted-history requires --unit and --historical-journal')
     if args.invocation_id is not None and not args.unit:
         parser.error('--invocation-id requires --unit')
-    if args.on_failure and args.event != 'failed':
-        parser.error('--on-failure requires the failed event')
+    if (args.on_failure or args.retry_pending_failure) and args.event != 'failed':
+        parser.error('Failure delivery actions require the failed event')
     notifier = LocalNotifier(allow_units=args.allow_unit, session_user=args.session_user,
                              bus_address=args.bus_address, state_directory=args.state_directory,
                              historical_journal=args.historical_journal)
     if args.watch:
         return int(any(delivery_failed(record) for record in notifier.watch()))
-    if args.on_failure:
+    if args.retry_pending_failure:
+        record = notifier._retry_failed_delivery(set())
+    elif args.on_failure:
         try:
             record = notifier.on_failure(os.environ.get('MONITOR_UNIT'), os.environ.get('MONITOR_INVOCATION_ID'))
         except ValueError:
