@@ -51,6 +51,8 @@ interface WorkflowState {
 }
 export interface WorkflowOptions {
   execute: boolean;
+  /** Bind an external supervisor's authorization to the config actually loaded. */
+  expectedConfigHash?: string;
   signal?: AbortSignal;
   progress?: (value: Record<string, unknown>) => void;
 }
@@ -348,6 +350,8 @@ async function execute(state: WorkflowState, options: WorkflowOptions, workflowL
 export async function runWorkflow(filename: string, options: WorkflowOptions): Promise<Record<string, unknown>> {
   const configFile = path.resolve(filename);
   const config = await loadWorkflowConfig(configFile);
+  if (options.expectedConfigHash !== undefined && (!/^[a-f0-9]{64}$/u.test(options.expectedConfigHash)
+    || hash(JSON.stringify(config)) !== options.expectedConfigHash)) throw new Error("workflow configuration differs from the supervisor authorization");
   workflowPlan(config);
   if (!config.execute || !options.execute || (config.recovery !== undefined && !config.recovery.execute)) {
     throw new Error("workflow execution requires reviewed execute=true configuration and --execute");
@@ -380,6 +384,8 @@ export async function resumeWorkflow(directory: string, options: WorkflowOptions
   const mounted = await mountForPath(output);
   if (mounted === undefined || await mountIsNetworkBacked(mounted)) throw new Error("workflow resume requires a local output mount");
   const state = await loadState(output);
+  if (options.expectedConfigHash !== undefined && (!/^[a-f0-9]{64}$/u.test(options.expectedConfigHash)
+    || hash(JSON.stringify(state.config)) !== options.expectedConfigHash)) throw new Error("workflow configuration differs from the supervisor authorization");
   if (state.status !== "paused") throw new Error("only an explicitly paused workflow may resume; abrupt stops require local review");
   if (await outputIdentity(output, state.config.finalizationStorage) !== state.outputIdentity) throw new Error("workflow output identity changed since its pause");
   const lock = await acquireExclusiveLock(output, ".aark-workflow.lock");

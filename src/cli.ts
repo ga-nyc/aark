@@ -15,6 +15,7 @@ import { planCleanup, runCleanup } from "./cleanup.js";
 import type { Provenance } from "./core/types.js";
 import { loadWorkflowConfig } from "./workflow/config.js";
 import { resumeWorkflow, runWorkflow, workflowPlan, workflowStatus } from "./workflow/runner.js";
+import { registerCaseCommands } from "./case/cli.js";
 
 const VERSION = "0.1.0";
 const PROVENANCE: Provenance[] = [
@@ -101,15 +102,17 @@ workflow.command("plan")
 for (const mode of ["run", "resume"] as const) {
   const command = workflow.command(mode)
     .option("--execute", "confirm the reviewed workflow execution", false)
+    .addOption(new Option("--expected-config-hash <sha256>", "bind supervised execution to its reviewed configuration").hideHelp())
     .option("--quiet", "suppress aggregate workflow progress", false);
   if (mode === "run") command.requiredOption("-c, --config <path>", "workflow configuration JSON");
   else command.requiredOption("-o, --output <directory>", "explicitly paused workflow directory");
-  command.action(async (options: {config: string; output: string; execute: boolean; quiet: boolean}) => {
+  command.action(async (options: {config: string; output: string; execute: boolean; quiet: boolean; expectedConfigHash?: string}) => {
     const controller = new AbortController();
     const interrupt = (): void => controller.abort();
     process.on("SIGINT", interrupt); process.on("SIGTERM", interrupt);
     try {
       const execution = {execute: options.execute, signal: controller.signal,
+        ...(options.expectedConfigHash === undefined ? {} : {expectedConfigHash: options.expectedConfigHash}),
         ...(options.quiet ? {} : {progress: (snapshot: Record<string, unknown>) => { process.stderr.write(`workflow=${JSON.stringify(snapshot)}\n`); }})};
       const result = mode === "run" ? await runWorkflow(options.config, execution) : await resumeWorkflow(options.output, execution);
       json(result);
@@ -397,6 +400,8 @@ cleanup.command("run")
       process.removeListener("SIGTERM", interrupt);
     }
   });
+
+registerCaseCommands(program);
 
 program.parseAsync(process.argv).catch((error: unknown) => {
   process.stderr.write(`error: ${redactedError(error)}\n`);

@@ -416,11 +416,16 @@ def main(arguments=None):
     action.add_argument('--unit')
     action.add_argument('--watch', action='store_true')
     parser.add_argument('--event', choices=sorted(EVENTS), default='failed')
-    parser.add_argument('--seed-accepted-history', metavar='INVOCATION',
-                        help='Seed a known unit invocation from accepted historical rows')
+    identity = parser.add_mutually_exclusive_group()
+    identity.add_argument('--seed-accepted-history', metavar='INVOCATION',
+                          help='Seed a known unit invocation from accepted historical rows')
+    identity.add_argument('--invocation-id', metavar='IDENTIFIER',
+                          help='Explicit stable redacted event token; requires --unit')
     args = parser.parse_args(arguments)
     if args.seed_accepted_history and (not args.unit or not args.historical_journal):
         parser.error('--seed-accepted-history requires --unit and --historical-journal')
+    if args.invocation_id is not None and not args.unit:
+        parser.error('--invocation-id requires --unit')
     notifier = LocalNotifier(allow_units=args.allow_unit, session_user=args.session_user,
                              bus_address=args.bus_address, state_directory=args.state_directory,
                              historical_journal=args.historical_journal)
@@ -429,7 +434,7 @@ def main(arguments=None):
     if args.seed_accepted_history:
         record = notifier.seed_accepted_history(args.unit, args.seed_accepted_history, args.event)
     else:
-        record = notifier.alert(args.unit, args.event)
+        record = notifier.alert(args.unit, args.event, invocation_id=args.invocation_id)
     if record is not None:
         print(json.dumps(record, sort_keys=True), flush=True)
     return int(delivery_failed(record))

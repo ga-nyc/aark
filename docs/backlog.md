@@ -2,9 +2,9 @@
 
 ## WFL-003: observable unattended failure and notification delivery
 
-Status: fixed diagnostics, scan error counters, and a tested local notification
-adapter implemented; native event delivery and multi-workflow hosting remain
-follow-up work.
+Status: fixed diagnostics, scan error counters, a tested local notification
+adapter, and opt-in persistent multi-workflow hosting implemented. Broader
+recovery-stage adoption and notification channels remain follow-up work.
 
 A process can correctly return failure while its user remains unaware. Generic
 exception classes are insufficient to diagnose a stopped workflow. Fixed codes
@@ -35,6 +35,16 @@ Acceptance criteria for the remaining supervision work:
 
 These requirements also apply to external case supervisors. A systemd service
 and log alone do not constitute unattended user notification.
+
+The [`case` layer](cases.md) now requires a managed worker, independent watchdog,
+fresh desktop-channel preflight, stable notification tokens, and a restricted
+Codex decision thread for autonomous continuation. Durable intent/outbox records handle
+worker restart and lost replies; unknown observations and verification timeouts
+retain truthful engine state. Only preapproved fresh workflows and explicitly
+authorized quota resumes can be selected. Completion covers all registered jobs
+and their aggregate report. Existing failed cases, arbitrary follow-up stages,
+hardware repair, backup/export, and cleanup require their own reviewed plans;
+this change does not adopt them from directory existence or weaken WFL-001.
 
 Implemented follow-up: degraded scans now report `scan-completed-with-errors`
 and aggregate error counters; `mine diagnose` verifies terminal controls and
