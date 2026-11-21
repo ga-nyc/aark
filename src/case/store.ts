@@ -214,13 +214,15 @@ export async function initializeCase(configFile: string, options: {execute: bool
   const config = await loadCaseConfig(configFile);
   if (!config.execute) throw new Error("case configuration requires execute confirmation");
   const sourceBindings = await captureCaseSourceBindings(config);
-  await assertNoSymlinkComponents(path.parse(config.control).root, config.control);
-  await mkdir(config.control, {mode: 0o700}); // Never adopt or overwrite an existing control directory.
-  await assertCaseDirectory(config.control);
   const now = new Date().toISOString();
   const state: CaseState = {version: 1, caseId: randomUUID(), revision: 0, configHash: caseConfigHash(config), sourceBindings, desired: "running",
     health: "healthy", jobs: config.jobs.map(job => ({id: job.id, attempts: []})), outbox: [], agentRequests: 0,
     startedAt: now, updatedAt: now, complete: false, completionDeliveredToAgent: false};
+  // The prepared configuration can fit by itself while its complete envelope
+  // does not. Refuse before creating a directory that cannot be initialized.
+  serializeCaseState(config.control, config, state);
+  await assertNoSymlinkComponents(path.parse(config.control).root, config.control);
+  await mkdir(config.control, {mode: 0o700}); // Never adopt or overwrite an existing control directory.
   await saveCaseState(config.control, config, state);
   return state;
 }
@@ -250,13 +252,19 @@ export function redactedCaseStatus(config: CaseConfig, state: CaseState): Record
         filesScanned: job.attempts.at(-1)?.observation?.filesScanned ?? null, errors: job.attempts.at(-1)?.observation?.scanErrors ?? null}})), cleanupAuthorized: false};
 }
 
-export async function saveCaseState(control: string, config: CaseConfig, state: CaseState): Promise<void> {
-  await assertCaseDirectory(control);
+function serializeCaseState(control: string, config: CaseConfig, state: CaseState): string {
   validate(config, state, control);
   const payload = {config, state};
   const envelope: Envelope = {version: 1, sha256: digest(payload), ...payload};
-  if (Buffer.byteLength(JSON.stringify(envelope)) > MAX_CASE_BYTES) throw new Error("case controls exceed bounded capacity");
-  await atomicWriteJson(path.join(control, STATE), envelope);
+  const serialized = JSON.stringify(envelope) + "\n";
+  if (Buffer.byteLength(serialized) > MAX_CASE_BYTES) throw new Error("case controls exceed bounded capacity");
+  return serialized;
+}
+
+export async function saveCaseState(control: string, config: CaseConfig, state: CaseState): Promise<void> {
+  await assertCaseDirectory(control);
+  const serialized = serializeCaseState(control, config, state);
+  await atomicWriteFile(path.join(control, STATE), serialized);
   await atomicWriteJson(path.join(control, "case-progress-redacted.json"), redactedCaseStatus(config, state));
 }
 

@@ -7,7 +7,7 @@ import { assertNoSymlinkComponents, stableHandleStat, stableLstat } from "../cor
 export interface CaseLease { assertHeld(): Promise<void>; release(): Promise<void> }
 
 /** The worker retains the flocked open file description. Worker death releases it. */
-export async function acquireCaseLease(control: string): Promise<CaseLease> {
+export async function acquireCaseLease(control: string, owner: "supervisor" | "watchdog" = "supervisor"): Promise<CaseLease> {
   if (process.platform !== "linux") throw new Error("case supervision requires Linux");
   if (!path.isAbsolute(control) || path.resolve(control) !== control) throw new Error("invalid case control directory");
   await assertNoSymlinkComponents(path.parse(control).root, control);
@@ -15,7 +15,7 @@ export async function acquireCaseLease(control: string): Promise<CaseLease> {
   const workerUid = process.getuid?.();
   if (!directory.raw.isDirectory() || directory.raw.isSymbolicLink() || workerUid === undefined
     || directory.raw.uid !== BigInt(workerUid) || (directory.raw.mode & 0o077n) !== 0n) throw new Error("case control requires a private worker-owned directory");
-  const filename = path.join(control, ".case-service.lock");
+  const filename = path.join(control, owner === "watchdog" ? ".case-watch.lock" : ".case-service.lock");
   await assertNoSymlinkComponents(control, filename);
   const handle = await open(filename, constants.O_CREAT | constants.O_RDWR | constants.O_NOFOLLOW, 0o600);
   let released = false;

@@ -125,22 +125,37 @@ export async function loadCaseConfig(filename: string): Promise<CaseConfig> {
   for (const job of jobs) ancestors(job.id);
   const outputs = jobs.flatMap(job => job.attempts.flatMap(attempt => [attempt.workflow.output,
     ...(attempt.workflow.recovery === undefined ? [] : [attempt.workflow.recovery.destination])].map(root => ({job: job.id, root}))));
+  const protectedPaths = [...configurationFiles, control, ...outputs.map(output => output.root),
+    ...jobs.flatMap(job => job.attempts.flatMap(sourceRoots))];
+  // Admission and the supervisor must agree on producers reached through an
+  // alias, including outputs that do not exist yet. Resolve each distinct path
+  // only once, using filesystem metadata without creating any case artifacts.
+  const resolved = new Map<string, string>();
+  for (const candidate of new Set(protectedPaths)) resolved.set(candidate, await resolvedLocation(candidate));
+  const intersects = (left: string, right: string): boolean => overlaps(left, right) || overlaps(right, left)
+    || overlaps(resolved.get(left)!, resolved.get(right)!) || overlaps(resolved.get(right)!, resolved.get(left)!);
   for (let i = 0; i < outputs.length; i++) for (let j = i + 1; j < outputs.length; j++) {
-    if (overlaps(outputs[i]!.root, outputs[j]!.root) || overlaps(outputs[j]!.root, outputs[i]!.root)) throw new Error("case attempt outputs must be independent non-overlapping directories");
+    if (intersects(outputs[i]!.root, outputs[j]!.root)) throw new Error("case attempt outputs must be independent non-overlapping directories");
   }
   for (const configFile of configurationFiles) {
-    if (overlaps(configFile, control) || overlaps(control, configFile)) throw new Error("case control overlaps a source, configuration, or job output");
-    if (outputs.some(output => overlaps(configFile, output.root) || overlaps(output.root, configFile))) {
+    if (intersects(configFile, control)) throw new Error("case control overlaps a source, configuration, or job output");
+    if (outputs.some(output => intersects(configFile, output.root))) {
       throw new Error("case configurations must remain outside job outputs");
     }
   }
   for (const job of jobs) for (const attempt of job.attempts) {
-    const inputs = sourceRoots(attempt);
+    const inputs = [...new Set(sourceRoots(attempt))];
     for (const candidate of [attempt.configFile, ...inputs, ...outputs.map(output => output.root)]) {
-      if (overlaps(candidate, control) || overlaps(control, candidate)) throw new Error("case control overlaps a source, configuration, or job output");
+      if (intersects(candidate, control)) throw new Error("case control overlaps a source, configuration, or job output");
+    }
+    if (inputs.some(input => intersects(input, attempt.workflow.output))) throw new Error("case workflow inputs and output must be distinct non-overlapping paths");
+    const recovery = attempt.workflow.recovery;
+    if (recovery !== undefined && [recovery.source, recovery.mountedReadOnlyRoot, recovery.unallocatedStreamFromCase]
+      .some(input => input !== undefined && intersects(input, recovery.destination))) {
+      throw new Error("case recovery inputs and destination must be distinct non-overlapping paths");
     }
     for (const input of inputs) for (const output of outputs) {
-      if (output.job !== job.id && (overlaps(output.root, input) || overlaps(input, output.root)) && !dependencies.get(job.id)!.has(output.job)) {
+      if (output.job !== job.id && intersects(output.root, input) && !dependencies.get(job.id)!.has(output.job)) {
         throw new Error("case inputs produced by another job require a successful dependency");
       }
     }
@@ -152,10 +167,8 @@ export async function loadCaseConfig(filename: string): Promise<CaseConfig> {
   if (!Array.isArray(inputAgent.readableRoots) || inputAgent.readableRoots.length < 1 || inputAgent.readableRoots.length > 16) throw new Error("case agent requires restricted code/report roots");
   const readableRoots = inputAgent.readableRoots.map(location);
   if (new Set(readableRoots).size !== readableRoots.length) throw new Error("case agent read roots must be unique");
-  const protectedPaths = [...configurationFiles, control, ...outputs.map(output => output.root),
-    ...jobs.flatMap(job => job.attempts.flatMap(sourceRoots))];
   const protectedSpellings = new Set(protectedPaths);
-  for (const candidate of new Set(protectedPaths)) protectedSpellings.add(await resolvedLocation(candidate));
+  for (const candidate of resolved.values()) protectedSpellings.add(candidate);
   const protectedLocations = [...protectedSpellings];
   for (const root of readableRoots) {
     const spellings = new Set([root, await resolvedLocation(root)]);

@@ -93,7 +93,11 @@ may share a healthy destination filesystem outside the protected source trees.
 starting services. The worker restarts after a process failure; a separate
 30-second systemd timer detects worker death, stale heartbeats, degraded work,
 and required permission. Desktop acceptance and human acknowledgement are
-distinct. Failed deliveries retry the same durable event token. No watchdog
+distinct. Failed deliveries retry the same durable event token. An observed
+healthy interval closes a failure incident so a later failure alerts again;
+continuous worker restart loops remain deduplicated. The notifier has a
+45-second deadline and its watchdog service a 70-second deadline to accommodate
+bounded desktop bus probes. No watchdog
 action stops, kills, or restarts a forensic engine. These transient systemd units
 survive a worker restart, not a host reboot or lost live-session power.
 
@@ -157,6 +161,10 @@ reserves still apply. An output-cap pause needs a new reviewed plan, since an
 unchanged logical cap cannot be repaired by restarting the engine. Signal
 pauses and failed or interrupted outputs do not become automatic quota retries.
 Corrected failed work requires the next listed fresh attempt.
+Recovery-phase free-space resumes require a native clean ddrescue pause, matching
+run controls, an unchanged image and nonempty mapfile, protected source bindings,
+and sufficient space at both workflow and recovery destinations. Mapfiles over
+16 MiB leave readiness unknown and require local assessment.
 
 Unknown or timed-out observations remain observation failures. They do not
 establish that an engine failed, authorize a duplicate launch, or prove that its

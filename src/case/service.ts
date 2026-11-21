@@ -1,4 +1,5 @@
 import path from "node:path";
+import { randomUUID } from "node:crypto";
 import { lstat, realpath } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import { captureCommand, type CommandOptions, type CommandResult } from "../core/command.js";
@@ -9,6 +10,7 @@ import { digest } from "./config.js";
 import { assertCaseDirectory, loadCaseState, redactedCaseStatus } from "./store.js";
 import type { CaseConfig } from "./types.js";
 import { caseRecoverySourcesToInspect } from "./sources.js";
+import { acquireCaseLease } from "./lease.js";
 export { caseRecoverySourcesToInspect } from "./sources.js";
 
 type Command = (executable: string, args: string[], options: CommandOptions) => Promise<CommandResult>;
@@ -18,6 +20,10 @@ const RUN = "/usr/bin/systemd-run";
 const NOTIFIER = fileURLToPath(new URL("../../scripts/notify-local.py", import.meta.url));
 const ok = (result: CommandResult) => result.exitCode === 0 && result.terminationReason === null && !result.stdoutTruncated && !result.stderrTruncated;
 const options = {timeoutMs: 10_000, killGraceMs: 250, maxCaptureBytes: 16384};
+// Two bus identity probes (10s each) and notify-send (15s) must fit inside
+// the outer deadline. The watchdog also needs its lease and status-query budget.
+const notificationOptions = {...options, timeoutMs: 45_000};
+const watchdogTimeoutSeconds = (notificationOptions.timeoutMs + options.timeoutMs + 15_000) / 1000;
 
 async function trustedHostFile(filename: string): Promise<void> {
   if (await realpath(filename) !== filename) throw new Error("case hosting requires canonical installed files");
@@ -52,7 +58,7 @@ export async function assertProductionCaseStorage(config: CaseConfig): Promise<v
 async function notify(control: string, receipt: HostReceipt, event: "failed" | "paused" | "complete" | "notification-test", token: string, command: Command): Promise<boolean> {
   const result = await command("/usr/bin/python3", [NOTIFIER, "--state-directory", path.join(control, "notifications"),
     "--allow-unit", receipt.unit, "--session-user", receipt.user, "--bus-address", receipt.bus,
-    "--unit", receipt.unit, "--event", event, "--invocation-id", token], options);
+    "--unit", receipt.unit, "--event", event, "--invocation-id", token], notificationOptions);
   return ok(result);
 }
 
@@ -98,7 +104,7 @@ export async function startCaseService(control: string, cli: string, command: Co
       || !/^LoadState=not-found$/mu.test(query.stdout.toString())) throw new Error("case service observation unavailable");
     const result = await command(RUN, ["--system", "--no-ask-password", "--quiet", "--expand-environment=no", "--unit=" + name,
       "--description=" + description,
-      ...(timer ? ["--on-active=1s", "--on-unit-active=30s", "--timer-property=AccuracySec=1s", "--timer-property=Description=" + description, "--property=Type=oneshot", "--property=TimeoutStartSec=20s"]
+      ...(timer ? ["--on-active=1s", "--on-unit-active=30s", "--timer-property=AccuracySec=1s", "--timer-property=Description=" + description, "--property=Type=oneshot", "--property=TimeoutStartSec=" + watchdogTimeoutSeconds + "s"]
         : ["--property=Type=exec", "--property=Restart=on-failure", "--property=RestartSec=15s", "--property=StartLimitIntervalSec=0"]),
       "--property=UMask=0077", "--property=KillMode=control-group", "--property=StandardOutput=null", "--property=StandardError=journal",
       process.execPath, cli, "case", ...args, "--control", control, "--execute"], options);
@@ -112,6 +118,17 @@ export async function startCaseService(control: string, cli: string, command: Co
 
 export async function watchCaseService(control: string, command: Command = captureCommand, now = Date.now()): Promise<Record<string, unknown>> {
   await assertCaseDirectory(control);
+  // The watchdog's own lease serializes incident receipts without contending
+  // with the independently running supervisor.
+  const lease = await acquireCaseLease(control, "watchdog");
+  try {
+    const result = await watchCaseServiceHeld(control, command, now);
+    await lease.assertHeld();
+    return result;
+  } finally { await lease.release(); }
+}
+
+async function watchCaseServiceHeld(control: string, command: Command, now: number): Promise<Record<string, unknown>> {
   const receipt = await readJson<HostReceipt>(path.join(control, "host-private.json"), 16384);
   if (receipt.version !== 1 || receipt.unit !== caseServiceUnit(control) || receipt.watchUnit !== receipt.unit.replace(".service", "-watch")
     || !/^[A-Za-z_][A-Za-z0-9_.-]*[$]?$/u.test(receipt.user) || !/^unix:path=\/run\/user\/[1-9][0-9]*\/bus$/u.test(receipt.bus)) throw new Error("invalid case host registration");
@@ -145,12 +162,26 @@ export async function watchCaseService(control: string, command: Command = captu
   const unhealthy = !active || stale || ["degraded", "awaiting-permission", "agent-unavailable", "observation-unavailable"].includes(String(status?.health));
   const complete = status?.complete === true;
   const event = complete ? "complete" : unhealthy ? "failed" : status?.desired === "user-paused" ? "paused" : undefined;
+  // Persist the incident before notification. Retries and crash loops reuse it;
+  // an observed healthy interval closes it so the next failure alerts again,
+  // including failures within the same systemd invocation.
+  const incidentPath = path.join(control, "notification-incident.json");
+  let incident: {version: 1; unit: string; event: string | null; token: string} | undefined;
+  try {
+    const value = await readJson<typeof incident>(incidentPath, 4096);
+    if (value?.version === 1 && value.unit === receipt.unit && [null, "failed", "paused", "complete"].includes(value.event)
+      && /^[a-f0-9-]{36}$/u.test(value.token)) incident = value;
+  } catch { /* An unavailable incident receipt must not suppress a failure alert. */ }
+  if (incident === undefined || incident.event !== (event ?? null)) {
+    incident = {version: 1, unit: receipt.unit, event: event ?? null, token: randomUUID()};
+    await atomicWriteJson(incidentPath, incident);
+  }
   let delivered: boolean | null = null;
   if (event !== undefined) {
     const jobs = Array.isArray(status?.jobs) ? status.jobs.map((job: Record<string, unknown>) => ({id: job.id, status: job.status,
       attemptsUsed: job.attemptsUsed, verified: job.verified, failureCode: job.failureCode, pauseReason: job.pauseReason})) : [];
     const key = complete ? digest({case: receipt.unit, event: "complete"})
-      : digest({case: receipt.unit, event, active, stale, health: status?.health ?? "state-unavailable", jobs});
+      : digest({case: receipt.unit, event, incident: incident.token, active, stale, health: status?.health ?? "state-unavailable", jobs});
     try { delivered = await notify(control, receipt, event, key, command); } catch { delivered = false; }
     await atomicWriteJson(path.join(control, "notification-status-redacted.json"), {version: 1, event, deliveryAccepted: delivered,
       userAcknowledged: false, checkedAt: new Date(now).toISOString()});

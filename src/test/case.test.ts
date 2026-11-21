@@ -8,7 +8,7 @@ import type { AgentAction, AgentBridge, AgentEvent, AgentReply, CompletionProof,
   EngineObservation, PreparedAttempt, CaseConfig, CaseState } from "../case/types.js";
 import { initializeCase, loadCaseState, redactedCaseStatus, saveCaseState, writeCaseCompletion } from "../case/store.js";
 import { CaseSupervisor } from "../case/supervisor.js";
-import { caseConfigHash, casePlan, digest, loadCaseConfig } from "../case/config.js";
+import { caseConfigHash, casePlan, digest, loadCaseConfig, MAX_CASE_BYTES } from "../case/config.js";
 import { engineUnitName } from "../case/systemd.js";
 import { CaseSourceIdentityError } from "../case/sources.js";
 import { captureCommand } from "../core/command.js";
@@ -132,6 +132,44 @@ async function fixture(options: {jobs?: number; attempts?: number; maxConcurrent
   return {root, control, filename, config, workflowFiles, host: new FakeHost(), agent: new FakeAgent()};
 }
 
+/** Large valid plans with repeated synthetic paths keep metadata work bounded. */
+async function largeCaseFixture(preparedBytes: number) {
+  const f = await fixture({jobs: 16});
+  const prepared = await loadCaseConfig(f.filename);
+  const inputs = Array.from({length: 32}, (_, index) => path.join(f.root, "bulk", `input-${String(index).padStart(3, "0")}-${"é".repeat(20)}`));
+  for (const job of prepared.jobs) job.attempts[0]!.workflow.scans = Array.from({length: 128}, () => ({inputs: [...inputs], provenance: "unknown"}));
+  const extra = preparedBytes - Buffer.byteLength(JSON.stringify(prepared));
+  assert.ok(extra >= 0);
+  const slotsPerJob = 128 * inputs.length;
+  let jobRemainder = extra % prepared.jobs.length;
+  for (const job of prepared.jobs) {
+    const jobExtra = Math.floor(extra / prepared.jobs.length) + (jobRemainder-- > 0 ? 1 : 0);
+    const padding = Math.floor(jobExtra / slotsPerJob);
+    let remainder = jobExtra % slotsPerJob;
+    const attempt = job.attempts[0]!;
+    for (const scan of attempt.workflow.scans) scan.inputs = scan.inputs.map(input => input + "x".repeat(padding + (remainder-- > 0 ? 1 : 0)));
+    attempt.configHash = digest(attempt.workflow);
+    const document = JSON.stringify(attempt.workflow);
+    assert.ok(Buffer.byteLength(document) <= 1024 * 1024, "each workflow remains within its own input limit");
+    await writeFile(attempt.configFile, document);
+  }
+  assert.equal(Buffer.byteLength(JSON.stringify(prepared)), preparedBytes);
+  return {...f, prepared};
+}
+
+function growSyntheticCase(saved: {config: CaseConfig; state: CaseState}, bytes: number): void {
+  const sourceBindings: CaseState["sourceBindings"] = {};
+  for (const job of saved.config.jobs) for (const attempt of job.attempts) {
+    const bindings = saved.state.sourceBindings[attempt.configHash]!;
+    for (const scan of attempt.workflow.scans) for (let index = 0; index < scan.inputs.length && bytes > 0; index++, bytes--) scan.inputs[index] += "x";
+    attempt.configHash = digest(attempt.workflow);
+    sourceBindings[attempt.configHash] = bindings;
+  }
+  assert.equal(bytes, 0, "fixture has enough independent path slots");
+  saved.state.sourceBindings = sourceBindings;
+  saved.state.configHash = caseConfigHash(saved.config);
+}
+
 async function recoverySourceFixture(missingSource = false) {
   const f = await fixture({attempts: 2});
   const source = path.join(f.root, "synthetic-original.img");
@@ -189,6 +227,42 @@ test("case initialization requires both confirmations and every workflow authori
   await writeFile(workflowFile, JSON.stringify({...workflow, execute: false}));
   await assert.rejects(initializeCase(f.filename, {execute: true}), /execut|confirmation/i);
   await assert.rejects(access(f.control));
+});
+
+test("case state uses exact UTF-8 serialized bytes including its newline and preserves the last good state on overflow", linuxOnly, async () => {
+  const f = await largeCaseFixture(MAX_CASE_BYTES - 16_384);
+  await initializeCase(f.filename, {execute: true});
+  const saved = await loadCaseState(f.control);
+  const stateFile = path.join(f.control, "case-state-sensitive.json");
+  const progressFile = path.join(f.control, "case-progress-redacted.json");
+  const serialized = () => JSON.stringify({version: 1, sha256: digest(saved), ...saved}) + "\n";
+  const initial = serialized();
+  assert.ok(Buffer.byteLength(initial) > initial.length, "multibyte paths distinguish bytes from UTF-16 string length");
+  assert.ok(Buffer.byteLength(JSON.stringify(JSON.parse(initial), null, 2) + "\n") > MAX_CASE_BYTES,
+    "the former pretty writer would create an unreadable state");
+  assert.equal((await readFile(stateFile)).toString(), initial);
+  growSyntheticCase(saved, MAX_CASE_BYTES - Buffer.byteLength(initial));
+  assert.equal(Buffer.byteLength(serialized()), MAX_CASE_BYTES);
+  await saveCaseState(f.control, saved.config, saved.state);
+  const accepted = await readFile(stateFile);
+  const progress = await readFile(progressFile);
+  assert.equal(accepted.length, MAX_CASE_BYTES);
+  assert.equal(accepted.at(-1), 10, "the trailing newline counts toward the reader's size limit");
+  assert.equal((await loadCaseState(f.control)).state.configHash, saved.state.configHash);
+  growSyntheticCase(saved, 1);
+  assert.equal(Buffer.byteLength(serialized()), MAX_CASE_BYTES + 1);
+  await assert.rejects(saveCaseState(f.control, saved.config, saved.state), /controls exceed bounded capacity/);
+  assert.deepEqual(await readFile(stateFile), accepted);
+  assert.deepEqual(await readFile(progressFile), progress);
+  assert.notEqual((await loadCaseState(f.control)).state.configHash, saved.state.configHash);
+});
+
+test("an oversized initial envelope is rejected before creating case controls or outputs", linuxOnly, async () => {
+  const f = await largeCaseFixture(MAX_CASE_BYTES - 1024);
+  assert.equal(Buffer.byteLength(JSON.stringify(await loadCaseConfig(f.filename))), MAX_CASE_BYTES - 1024);
+  await assert.rejects(initializeCase(f.filename, {execute: true}), /controls exceed bounded capacity/);
+  await assert.rejects(access(f.control));
+  for (const job of f.prepared.jobs) await assert.rejects(access(job.attempts[0]!.workflow.output));
 });
 
 test("case initialization pins every reviewed recovery source/view and keeps those bindings out of public status", linuxOnly, async () => {

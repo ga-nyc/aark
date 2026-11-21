@@ -14,6 +14,7 @@ import { atomicWriteJson } from "../core/fs-safe.js";
 import type { WorkflowConfig } from "../workflow/config.js";
 import { mkdtemp } from "./helpers.js";
 import { inspectSourceSafety } from "../recovery/source-safety.js";
+import { acquireCaseLease } from "../case/lease.js";
 
 const linuxOnly = { skip: process.platform !== "linux" };
 const NOW = Date.parse("2030-01-02T03:04:05.000Z");
@@ -117,6 +118,7 @@ test("case watchdog detects auto-restart crash loops despite fresh healthy heart
   const f = await fixture(context);
   f.commands.observation = result("ActiveState=activating\nSubState=auto-restart\nMainPID=0\nResult=exit-code\nExecMainStatus=1\nInvocationID=" + "2".repeat(32) + "\n");
   for (const offset of [0, 30_000, 60_000]) {
+    f.commands.observation = result("ActiveState=activating\nSubState=auto-restart\nMainPID=0\nResult=exit-code\nExecMainStatus=1\nInvocationID=" + String(offset / 30_000 + 2).repeat(32) + "\n");
     f.state.updatedAt = new Date(NOW + offset).toISOString();
     await f.save();
     const status = await watchCaseService(f.control, f.commands.command, NOW + offset);
@@ -126,6 +128,48 @@ test("case watchdog detects auto-restart crash loops despite fresh healthy heart
     assert.equal(f.commands.event(), "failed");
   }
   assert.equal(new Set(f.commands.notifications().map((_, index) => f.commands.token(index))).size, 1);
+});
+
+test("case watchdog alerts again after a healthy interval with either the same or a new worker invocation", linuxOnly, async context => {
+  const f = await fixture(context);
+  f.state.health = "degraded"; await f.save();
+  await watchCaseService(f.control, f.commands.command, NOW);
+  const firstToken = f.commands.token();
+  for (const identity of ["1", "2"]) {
+    f.state.health = "healthy"; await f.save();
+    assert.equal((await watchCaseService(f.control, f.commands.command, NOW)).notificationRequired, false);
+    f.commands.observation = result(ACTIVE.replace("1".repeat(32), identity.repeat(32)));
+    f.state.health = "degraded"; await f.save();
+    await watchCaseService(f.control, f.commands.command, NOW);
+    assert.notEqual(f.commands.token(), firstToken);
+    await watchCaseService(f.control, f.commands.command, NOW);
+    assert.equal(f.commands.token(), f.commands.token(f.commands.notifications().length - 2));
+  }
+  assert.equal(new Set(f.commands.notifications().map((_, index) => f.commands.token(index))).size, 3);
+});
+
+test("case watchdog serializes incident updates independently of the supervisor", linuxOnly, async context => {
+  const f = await fixture(context);
+  const supervisor = await acquireCaseLease(f.control);
+  const watcher = await acquireCaseLease(f.control, "watchdog");
+  try {
+    await assert.rejects(watchCaseService(f.control, f.commands.command, NOW), /lease unavailable/u);
+    assert.equal(f.commands.calls.length, 0);
+    await supervisor.assertHeld();
+  } finally { await watcher.release(); }
+  try { assert.equal((await watchCaseService(f.control, f.commands.command, NOW)).notificationRequired, false); }
+  finally { await supervisor.release(); }
+});
+
+test("case watchdog allows the notifier's nested bus and desktop deadlines", linuxOnly, async context => {
+  const f = await fixture(context);
+  f.state.health = "degraded"; await f.save();
+  const slowSuccessfulDelivery = async (executable: string, args: string[], options: CommandOptions): Promise<CommandResult> => {
+    if (executable === "/usr/bin/python3" && (options.timeoutMs ?? 0) <= 35_000) return result("", {exitCode: 1, terminationReason: "timeout"});
+    return f.commands.command(executable, args, options);
+  };
+  assert.equal((await watchCaseService(f.control, slowSuccessfulDelivery, NOW)).deliveryAccepted, true);
+  assert.ok(f.commands.notifications()[0]!.options.timeoutMs! > 35_000);
 });
 
 test("case watchdog requires a complete successful running identity before remaining quiet", linuxOnly, async context => {

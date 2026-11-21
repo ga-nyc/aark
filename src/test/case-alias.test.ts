@@ -4,6 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { loadCaseConfig } from "../case/config.js";
+import { initializeCase } from "../case/store.js";
 import { mkdtemp } from "./helpers.js";
 
 const symlinks = {skip: process.platform === "win32"};
@@ -69,4 +70,125 @@ test("case admission rejects dangling aliases in future protected output paths",
     scans: [{inputs: [f.publicRoot], provenance: "unknown"}]}));
   await assert.rejects(loadCaseConfig(f.filename), /symbolic-link output component/);
   await assert.rejects(access(target));
+});
+
+test("case admission rejects an alias-hidden producer cycle before plan or initialization has effects", symlinks, async () => {
+  const f = await fixture();
+  const outputA = path.join(f.root, "outA");
+  const outputB = path.join(f.protectedRoot, "outB");
+  await writeFile(f.workflowFile, JSON.stringify({...f.workflow, output: outputA,
+    scans: [{inputs: [path.join(f.alias, "outB", "input")], provenance: "unknown"}]}));
+  const workflowB = path.join(f.root, "workflowB.json");
+  await writeFile(workflowB, JSON.stringify({...f.workflow, output: outputB,
+    scans: [{inputs: [path.join(outputA, "input")], provenance: "unknown"}]}));
+  await writeFile(f.filename, JSON.stringify({...f.config,
+    jobs: [f.config.jobs[0], {id: "job-000002", dependsOn: ["job-000001"], attempts: [workflowB], resumeAfterQuota: false}],
+    agent: {...f.config.agent, readableRoots: [f.publicRoot]}}));
+  await assert.rejects(loadCaseConfig(f.filename), /produced by another job require a successful dependency/);
+  await assert.rejects(initializeCase(f.filename, {execute: true}), /produced by another job require a successful dependency/);
+  for (const directory of [f.config.control, outputA, outputB]) await assert.rejects(access(directory));
+});
+
+test("case admission accepts an aliased producer input with its explicit dependency", symlinks, async () => {
+  const f = await fixture();
+  const source = path.join(f.root, "source");
+  await mkdir(source);
+  const outputA = path.join(f.protectedRoot, "outA");
+  const outputB = path.join(f.root, "outB");
+  await writeFile(f.workflowFile, JSON.stringify({...f.workflow, output: outputA,
+    scans: [{inputs: [source], provenance: "unknown"}]}));
+  const workflowB = path.join(f.root, "workflowB.json");
+  await writeFile(workflowB, JSON.stringify({...f.workflow, output: outputB,
+    scans: [{inputs: [path.join(f.alias, "outA", "input")], provenance: "unknown"}]}));
+  await writeFile(f.filename, JSON.stringify({...f.config,
+    jobs: [f.config.jobs[0], {id: "job-000002", dependsOn: ["job-000001"], attempts: [workflowB], resumeAfterQuota: false}],
+    agent: {...f.config.agent, readableRoots: [f.publicRoot]}}));
+  const prepared = await loadCaseConfig(f.filename);
+  assert.deepEqual(prepared.jobs[1]!.dependsOn, ["job-000001"]);
+  for (const directory of [f.config.control, outputA, outputB]) await assert.rejects(access(directory));
+  const state = await initializeCase(f.filename, {execute: true});
+  assert.equal(state.jobs.length, 2);
+  for (const directory of [outputA, outputB]) await assert.rejects(access(directory));
+});
+
+test("case admission rejects control/source and same-workflow output/source aliases without effects", symlinks, async () => {
+  const f = await fixture();
+  const agent = {...f.config.agent, readableRoots: [f.publicRoot]};
+  const aliasedControl = path.join(f.protectedRoot, "new-control");
+  await writeFile(f.filename, JSON.stringify({...f.config, control: aliasedControl, agent}));
+  await assert.rejects(initializeCase(f.filename, {execute: true}), /control overlaps/);
+  await assert.rejects(access(aliasedControl));
+  const aliasedOutput = path.join(f.protectedRoot, "new-output");
+  await writeFile(f.workflowFile, JSON.stringify({...f.workflow, output: aliasedOutput}));
+  await writeFile(f.filename, JSON.stringify({...f.config, agent}));
+  await assert.rejects(initializeCase(f.filename, {execute: true}), /inputs and output.*non-overlapping/);
+  for (const directory of [f.config.control, aliasedOutput]) await assert.rejects(access(directory));
+});
+
+test("case admission rejects separate output spellings resolving into the same producer tree", symlinks, async () => {
+  const f = await fixture();
+  const source = path.join(f.root, "source");
+  await mkdir(source);
+  const output = path.join(f.protectedRoot, "out");
+  await writeFile(f.workflowFile, JSON.stringify({...f.workflow, output, scans: [{inputs: [source], provenance: "unknown"}]}));
+  const workflowB = path.join(f.root, "workflowB.json");
+  await writeFile(workflowB, JSON.stringify({...f.workflow, output: path.join(f.alias, "out", "nested"),
+    scans: [{inputs: [source], provenance: "unknown"}]}));
+  await writeFile(f.filename, JSON.stringify({...f.config,
+    jobs: [f.config.jobs[0], {id: "job-000002", dependsOn: [], attempts: [workflowB], resumeAfterQuota: false}],
+    agent: {...f.config.agent, readableRoots: [f.publicRoot]}}));
+  await assert.rejects(initializeCase(f.filename, {execute: true}), /outputs must be independent non-overlapping/);
+  for (const directory of [f.config.control, output]) await assert.rejects(access(directory));
+});
+
+test("case admission protects configuration/control and configuration/output overlaps reached through aliases", symlinks, async () => {
+  const f = await fixture();
+  const source = path.join(f.root, "source");
+  await mkdir(source);
+  const actualWorkflow = path.join(f.protectedRoot, "workflow.json");
+  const workflow = {...f.workflow, scans: [{inputs: [source], provenance: "unknown"}]};
+  await writeFile(actualWorkflow, JSON.stringify(workflow));
+  const config = {...f.config, jobs: [{...f.config.jobs[0], attempts: [actualWorkflow]}],
+    agent: {...f.config.agent, readableRoots: [f.publicRoot]}};
+  await writeFile(f.filename, JSON.stringify({...config, control: f.alias}));
+  await assert.rejects(loadCaseConfig(f.filename), /control overlaps/);
+  await writeFile(actualWorkflow, JSON.stringify({...workflow, output: f.alias}));
+  await writeFile(f.filename, JSON.stringify(config));
+  await assert.rejects(initializeCase(f.filename, {execute: true}), /configurations must remain outside job outputs/);
+  await assert.rejects(access(f.config.control));
+  await assert.rejects(access(f.workflow.output));
+});
+
+test("case metadata planning permits an existing raw-source alias separate from all destinations", symlinks, async () => {
+  const f = await fixture();
+  const source = path.join(f.protectedRoot, "synthetic-device.img");
+  const sourceAlias = path.join(f.root, "synthetic-by-id");
+  await writeFile(source, "ordinary synthetic image\n");
+  await symlink(source, sourceAlias, "file");
+  const recovery = path.join(f.root, "recovery.json");
+  const destination = path.join(f.root, "recovered");
+  await writeFile(recovery, JSON.stringify({version: 1, caseId: "synthetic-alias", source: sourceAlias, destination,
+    execute: true, requireReadOnlySource: true, image: {enabled: false},
+    stages: {deletedMetadata: false, ntfsUndelete: false, unallocatedStream: true, signatureCarving: false,
+      volumeShadows: false, residualMemory: false, deletedRegistryCells: false}}));
+  await writeFile(f.workflowFile, JSON.stringify({...f.workflow, recoveryConfig: recovery,
+    scans: [{inputs: [path.join(destination, "recovery", "unallocated", "free-space.raw")], provenance: "unallocated-stream"}]}));
+  await writeFile(f.filename, JSON.stringify({...f.config, agent: {...f.config.agent, readableRoots: [f.publicRoot]}}));
+  const prepared = await loadCaseConfig(f.filename);
+  assert.equal(prepared.jobs[0]!.attempts[0]!.workflow.recovery!.source, sourceAlias);
+  for (const directory of [f.config.control, f.workflow.output, destination]) await assert.rejects(access(directory));
+});
+
+test("case admission rejects a recovery source resolving inside its own destination", symlinks, async () => {
+  const f = await fixture();
+  const recovery = path.join(f.root, "recovery.json");
+  await writeFile(recovery, JSON.stringify({version: 1, caseId: "synthetic-alias", source: path.join(f.alias, "source.img"),
+    destination: f.protectedRoot, execute: true, requireReadOnlySource: true, image: {enabled: false},
+    stages: {deletedMetadata: false, ntfsUndelete: false, unallocatedStream: true, signatureCarving: false,
+      volumeShadows: false, residualMemory: false, deletedRegistryCells: false}}));
+  await writeFile(f.workflowFile, JSON.stringify({...f.workflow, recoveryConfig: recovery,
+    scans: [{inputs: [path.join(f.protectedRoot, "recovery", "unallocated", "free-space.raw")], provenance: "unallocated-stream"}]}));
+  await writeFile(f.filename, JSON.stringify({...f.config, agent: {...f.config.agent, readableRoots: [f.publicRoot]}}));
+  await assert.rejects(initializeCase(f.filename, {execute: true}), /recovery inputs and destination.*non-overlapping/);
+  for (const directory of [f.config.control, f.workflow.output, path.join(f.protectedRoot, "recovery")]) await assert.rejects(access(directory));
 });
