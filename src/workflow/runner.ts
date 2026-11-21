@@ -12,12 +12,14 @@ import { loadScanState } from "../mining/resume.js";
 import { buildRecoveryPlan } from "../recovery/plan.js";
 import { redactedPlan, runRecoveryPlan } from "../recovery/runner.js";
 import type { MiningProgress } from "../mining/types.js";
-import { inspectSourceSafety } from "../recovery/source-safety.js";
+import { inspectSourceSafety, recoverySourceIdentity } from "../recovery/source-safety.js";
 import { loadWorkflowConfig, MAX_WORKFLOW_CONFIG_BYTES, overlaps } from "./config.js";
 import type { WorkflowConfig } from "./config.js";
 import { finalizeWorkflow } from "./finalize.js";
 import { FAILURE_CODES, workflowFailureCode } from "./failure.js";
 import { controlIdentity, fileDigest, interrupted, miningDirectory, outputIdentity, samePath, verifyScan, workflowSourceIdentity } from "./verify.js";
+import { assertSourceBindings, workflowExternalSources } from "../case/sources.js";
+import type { CaseSourceBinding } from "../case/types.js";
 
 type Phase = "recovery" | "mining" | "verification" | "packaging" | "complete";
 type Status = "running" | "paused" | "complete" | "failed";
@@ -51,6 +53,10 @@ interface WorkflowState {
 }
 export interface WorkflowOptions {
   execute: boolean;
+  /** Bind an external supervisor's authorization to the config actually loaded. */
+  expectedConfigHash?: string;
+  /** Bind supervised execution to its original source identities, not paths alone. */
+  expectedSourceBindings?: CaseSourceBinding[];
   signal?: AbortSignal;
   progress?: (value: Record<string, unknown>) => void;
 }
@@ -236,9 +242,13 @@ async function execute(state: WorkflowState, options: WorkflowOptions, workflowL
     if (config.recovery !== undefined) {
       if (state.recoveryProof === undefined) {
         state.phase = "recovery"; await update();
+        const sources = workflowExternalSources(config);
+        if (state.resultsSafety.length !== sources.length) throw new Error("recovery source identity differs from workflow authorization");
+        const sourceIdentities = new Map(sources.map((source, index) => [source,
+          recoverySourceIdentity(state.resultsSafety[index]!)]));
         const result = await runRecoveryPlan(config.recovery, buildRecoveryPlan(config.recovery), true, controller.signal, snapshot => {
           state.recoveryProgress = redactedProgress(snapshot, "recovery");
-        });
+        }, sourceIdentities);
         if (result.status === "paused") {
           const stop = result.storageStop;
           if (typeof stop === "object" && stop !== null && !Array.isArray(stop)
@@ -348,6 +358,8 @@ async function execute(state: WorkflowState, options: WorkflowOptions, workflowL
 export async function runWorkflow(filename: string, options: WorkflowOptions): Promise<Record<string, unknown>> {
   const configFile = path.resolve(filename);
   const config = await loadWorkflowConfig(configFile);
+  if (options.expectedConfigHash !== undefined && (!/^[a-f0-9]{64}$/u.test(options.expectedConfigHash)
+    || hash(JSON.stringify(config)) !== options.expectedConfigHash)) throw new Error("workflow configuration differs from the supervisor authorization");
   workflowPlan(config);
   if (!config.execute || !options.execute || (config.recovery !== undefined && !config.recovery.execute)) {
     throw new Error("workflow execution requires reviewed execute=true configuration and --execute");
@@ -360,6 +372,7 @@ export async function runWorkflow(filename: string, options: WorkflowOptions): P
   await assertLoopBackingsOutside(backing.loopBackings, [...config.scans.flatMap(scan => scan.inputs),
     ...(config.recovery === undefined ? [] : [config.recovery.destination])], "workflow input or recovery case");
   const expectedResultsSafety = await resultsSafety(config);
+  if (options.expectedSourceBindings !== undefined) await assertSourceBindings(config, options.expectedSourceBindings, expectedResultsSafety);
   await assertStorageCapacity(parent, storagePolicy(config));
   await assertNoSymlinkComponents(path.parse(config.output).root, config.output);
   await mkdir(config.output, {mode: 0o700});
@@ -380,8 +393,11 @@ export async function resumeWorkflow(directory: string, options: WorkflowOptions
   const mounted = await mountForPath(output);
   if (mounted === undefined || await mountIsNetworkBacked(mounted)) throw new Error("workflow resume requires a local output mount");
   const state = await loadState(output);
+  if (options.expectedConfigHash !== undefined && (!/^[a-f0-9]{64}$/u.test(options.expectedConfigHash)
+    || hash(JSON.stringify(state.config)) !== options.expectedConfigHash)) throw new Error("workflow configuration differs from the supervisor authorization");
   if (state.status !== "paused") throw new Error("only an explicitly paused workflow may resume; abrupt stops require local review");
   if (await outputIdentity(output, state.config.finalizationStorage) !== state.outputIdentity) throw new Error("workflow output identity changed since its pause");
+  if (options.expectedSourceBindings !== undefined) await assertSourceBindings(state.config, options.expectedSourceBindings, state.resultsSafety);
   const lock = await acquireExclusiveLock(output, ".aark-workflow.lock");
   return await execute(state, options, lock);
 }

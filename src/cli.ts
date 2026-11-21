@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import process from "node:process";
+import path from "node:path";
 import { Command, Option } from "commander";
 import { dependencyReport } from "./recovery/dependencies.js";
 import { machineInventory } from "./recovery/inventory.js";
@@ -15,6 +16,8 @@ import { planCleanup, runCleanup } from "./cleanup.js";
 import type { Provenance } from "./core/types.js";
 import { loadWorkflowConfig } from "./workflow/config.js";
 import { resumeWorkflow, runWorkflow, workflowPlan, workflowStatus } from "./workflow/runner.js";
+import { registerCaseCommands } from "./case/cli.js";
+import type { CaseSourceBinding } from "./case/types.js";
 
 const VERSION = "0.1.0";
 const PROVENANCE: Provenance[] = [
@@ -48,6 +51,25 @@ function workers(value: string): number {
   const parsed = Number(value);
   if (!Number.isSafeInteger(parsed) || parsed < 1 || parsed > 4) throw new Error("workers must be an integer from 1 through 4");
   return parsed;
+}
+
+function sourceBindings(value: string): CaseSourceBinding[] {
+  const invalid = (): never => { throw new Error("invalid supervised source bindings"); };
+  if (Buffer.byteLength(value) > 16 * 1024) return invalid();
+  let parsed: unknown;
+  try { parsed = JSON.parse(value); } catch { return invalid(); }
+  if (!Array.isArray(parsed) || parsed.length > 2) return invalid();
+  const seen = new Set<string>();
+  return parsed.map((entry: unknown) => {
+    if (typeof entry !== "object" || entry === null || Array.isArray(entry)) return invalid();
+    const record = entry as Record<string, unknown>;
+    if (Object.keys(record).length !== 2 || !Object.hasOwn(record, "source") || !Object.hasOwn(record, "sha256")
+      || typeof record.source !== "string" || !path.isAbsolute(record.source) || path.resolve(record.source) !== record.source
+      || Buffer.byteLength(record.source) > 4096 || /[\x00-\x1f\x7f]/u.test(record.source) || seen.has(record.source)
+      || typeof record.sha256 !== "string" || !/^[a-f0-9]{64}$/u.test(record.sha256)) return invalid();
+    seen.add(record.source);
+    return {source: record.source, sha256: record.sha256};
+  });
 }
 
 function redactedError(error: unknown): string {
@@ -101,15 +123,19 @@ workflow.command("plan")
 for (const mode of ["run", "resume"] as const) {
   const command = workflow.command(mode)
     .option("--execute", "confirm the reviewed workflow execution", false)
+    .addOption(new Option("--expected-config-hash <sha256>", "bind supervised execution to its reviewed configuration").hideHelp())
+    .addOption(new Option("--expected-source-bindings <json>", "bind supervised execution to its reviewed source identities").argParser(sourceBindings).hideHelp())
     .option("--quiet", "suppress aggregate workflow progress", false);
   if (mode === "run") command.requiredOption("-c, --config <path>", "workflow configuration JSON");
   else command.requiredOption("-o, --output <directory>", "explicitly paused workflow directory");
-  command.action(async (options: {config: string; output: string; execute: boolean; quiet: boolean}) => {
+  command.action(async (options: {config: string; output: string; execute: boolean; quiet: boolean; expectedConfigHash?: string; expectedSourceBindings?: CaseSourceBinding[]}) => {
     const controller = new AbortController();
     const interrupt = (): void => controller.abort();
     process.on("SIGINT", interrupt); process.on("SIGTERM", interrupt);
     try {
       const execution = {execute: options.execute, signal: controller.signal,
+        ...(options.expectedConfigHash === undefined ? {} : {expectedConfigHash: options.expectedConfigHash}),
+        ...(options.expectedSourceBindings === undefined ? {} : {expectedSourceBindings: options.expectedSourceBindings}),
         ...(options.quiet ? {} : {progress: (snapshot: Record<string, unknown>) => { process.stderr.write(`workflow=${JSON.stringify(snapshot)}\n`); }})};
       const result = mode === "run" ? await runWorkflow(options.config, execution) : await resumeWorkflow(options.output, execution);
       json(result);
@@ -397,6 +423,8 @@ cleanup.command("run")
       process.removeListener("SIGTERM", interrupt);
     }
   });
+
+registerCaseCommands(program);
 
 program.parseAsync(process.argv).catch((error: unknown) => {
   process.stderr.write(`error: ${redactedError(error)}\n`);
