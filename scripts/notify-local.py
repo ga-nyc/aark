@@ -108,8 +108,13 @@ class LocalNotifier:
             os.close(fd)
 
     def _append_record(self, record):
-        fd = self._private_open(self.root / 'alerts-redacted.ndjson', os.O_WRONLY | os.O_APPEND | os.O_CREAT)
+        fd = self._private_open(self.root / 'alerts-redacted.ndjson', os.O_RDWR | os.O_APPEND | os.O_CREAT)
         with os.fdopen(fd, 'w', encoding='utf-8') as stream:
+            size = os.fstat(stream.fileno()).st_size
+            if size and os.pread(stream.fileno(), 1, size - 1) != b'\n':
+                # Preserve an interrupted tail, but keep it separate so journal
+                # replay can still recover this independently durable receipt.
+                stream.write('\n')
             stream.write(json.dumps(record, sort_keys=True) + '\n')
             stream.flush()
             os.fsync(stream.fileno())
