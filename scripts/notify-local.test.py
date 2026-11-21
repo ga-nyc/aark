@@ -273,6 +273,28 @@ class LocalNotifierTests(unittest.TestCase):
         self.assertEqual(len(records), 2)
         self.assertEqual(len({row['deliveryKey'] for row in records}), 2)
 
+    def test_watch_retry_fairness_survives_journal_failure_with_durable_state(self):
+        self.delivery_results = [(1, '')] * 8
+        self.notifier.alert(self.unit, invocation_id='aaa')
+        self.notifier.alert(self.unit, invocation_id='bbb')
+        self.status[self.unit] = ('active', 'successor')
+        retried = []
+        with mock.patch.object(self.notifier, '_append_record', side_effect=OSError('synthetic failure')), \
+                contextlib.redirect_stdout(io.StringIO()):
+            for _ in range(4):
+                records = self.notifier.watch()
+                self.assertEqual(len(records), 1)
+                self.assertEqual(records[0]['journalPersistenceError'], 'OSError')
+                self.assertNotIn('statePersistenceError', records[0])
+                retried.append((records[0]['invocationId'], records[0]['attempt']))
+        self.assertEqual(retried, [('aaa', 2), ('bbb', 2), ('aaa', 3), ('bbb', 3)])
+        state = self.state()
+        for invocation in ('aaa', 'bbb'):
+            key = notify_local._key(self.unit, invocation, 'failed')
+            self.assertEqual(state['deliveries'][key]['attempt'], 3)
+            self.assertFalse(state['deliveries'][key]['desktopDeliveryAccepted'])
+        self.assertEqual([row['attempt'] for row in self.journal()], [1, 1])
+
     def test_watch_never_retries_unallowed_historical_delivery(self):
         self.delivery_results = [(1, '')]
         self.notifier.alert(self.other_unit, invocation_id='old-unallowed-run')
@@ -401,6 +423,41 @@ class LocalNotifierTests(unittest.TestCase):
         self.assertIn('statePersistenceError', record)
         self.assertIsNone(self.notifier.alert(self.unit))
         self.assertEqual(len(self.notification_commands), 1)
+
+    def test_accepted_receipt_dominates_failed_receipts_in_cache_and_journal(self):
+        accepted = self.notifier.alert(self.unit)
+        failed = dict(accepted, attempt=10, desktopDeliveryAccepted=False,
+                      deliveryError='synthetic rejection')
+        path = self.root / 'alerts-redacted.ndjson'
+        # A stale failed record cannot replace a known accepted cache entry.
+        path.write_text(json.dumps(failed) + '\n')
+        self.assertIsNone(self.notifier.alert(self.unit))
+        # A journal-only accepted receipt recovers even over a higher failed
+        # cache attempt, regardless of the journal's replay order.
+        state = self.state()
+        state['deliveries'][accepted['deliveryKey']] = failed
+        (self.root / 'delivery-state.json').write_text(json.dumps(state))
+        for rows in ((accepted, failed), (failed, accepted)):
+            path.write_text('\n'.join(map(json.dumps, rows)) + '\n')
+            self.assertIsNone(self.notifier.alert(self.unit))
+        self.assertEqual(len(self.notification_commands), 1)
+
+    def test_receipt_merge_keeps_newer_attempts_and_is_idempotent_for_equal_attempts(self):
+        self.delivery_results = [(1, '')]
+        original = self.notifier.alert(self.unit)
+        state = self.state()
+        key = original['deliveryKey']
+        newer = dict(original, attempt=3, deliveryError='newer fixed status')
+        self.notifier._remember(state, newer)
+        self.notifier._remember(state, original)
+        self.notifier._remember(state, dict(newer, deliveryError='equal alternate status'))
+        self.assertEqual(state['deliveries'][key], newer)
+        self.notifier._remember(state, dict(newer, attempt=4, invocationId='mismatched-key'))
+        self.assertEqual(state['deliveries'][key], newer)
+        accepted = dict(original, desktopDeliveryAccepted=True)
+        self.notifier._remember(state, accepted)
+        self.notifier._remember(state, newer)
+        self.assertEqual(state['deliveries'][key], accepted)
 
     def test_torn_journal_tail_cannot_hide_a_new_durable_receipt(self):
         self.root.mkdir(mode=0o700)
