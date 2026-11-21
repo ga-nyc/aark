@@ -97,7 +97,7 @@ distinct. Failed deliveries retry the same durable event token. An observed
 healthy interval closes a failure incident so a later failure alerts again;
 continuous worker restart loops remain deduplicated. The notifier has a
 45-second deadline and its watchdog service a 70-second deadline to accommodate
-bounded desktop bus probes. No watchdog
+bounded desktop delivery, process startup, and worker observation. No watchdog
 action stops, kills, or restarts a forensic engine. These transient systemd units
 survive a worker restart, not a host reboot or lost live-session power.
 
@@ -128,7 +128,9 @@ The bridge answers approval requests only for its own decision thread and
 checks for an externally added or paused goal before every decision turn.
 
 Only one agent request is pending at a time. Events carry stable IDs and state
-revisions; stale replies cannot change a newer case state. Delivery retries and
+revisions; stale replies cannot authorize execution in a newer case state.
+Valid permission stops remain effective across unrelated revision changes.
+Delivery retries and
 the total number of agent requests are bounded. An unavailable agent or an
 exhausted request budget is visible in case health, while independent authorized
 engine work can continue. A transport failure is not an engine failure.

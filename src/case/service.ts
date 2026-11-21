@@ -20,8 +20,8 @@ const RUN = "/usr/bin/systemd-run";
 const NOTIFIER = fileURLToPath(new URL("../../scripts/notify-local.py", import.meta.url));
 const ok = (result: CommandResult) => result.exitCode === 0 && result.terminationReason === null && !result.stdoutTruncated && !result.stderrTruncated;
 const options = {timeoutMs: 10_000, killGraceMs: 250, maxCaptureBytes: 16384};
-// Two bus identity probes (10s each) and notify-send (15s) must fit inside
-// the outer deadline. The watchdog also needs its lease and status-query budget.
+// The notifier's 15s desktop deadline plus process startup must fit inside
+// this outer deadline. The watchdog also needs its lease and status-query budget.
 const notificationOptions = {...options, timeoutMs: 45_000};
 const watchdogTimeoutSeconds = (notificationOptions.timeoutMs + options.timeoutMs + 15_000) / 1000;
 

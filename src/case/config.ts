@@ -15,9 +15,12 @@ function object(value: unknown, keys: string[], label: string): Record<string, u
     || Object.keys(value).some(key => !keys.includes(key))) throw new Error(`invalid case ${label}`);
   return value as Record<string, unknown>;
 }
+export function isSupportedCasePath(value: unknown): value is string {
+  return typeof value === "string" && path.isAbsolute(value) && path.resolve(value) === value
+    && Buffer.byteLength(value) <= 4096 && !/[\x00-\x1f\x7f%]/.test(value);
+}
 function location(value: unknown): string {
-  if (typeof value !== "string" || !path.isAbsolute(value) || path.resolve(value) !== value
-    || Buffer.byteLength(value) > 4096 || /[\x00-\x1f\x7f]/.test(value)) throw new Error("case paths must be canonical absolute paths");
+  if (!isSupportedCasePath(value)) throw new Error("case paths must be canonical absolute paths without unsupported characters");
   return value;
 }
 function integer(value: unknown, fallback: number, min: number, max: number): number {
@@ -131,7 +134,7 @@ export async function loadCaseConfig(filename: string): Promise<CaseConfig> {
   // alias, including outputs that do not exist yet. Resolve each distinct path
   // only once, using filesystem metadata without creating any case artifacts.
   const resolved = new Map<string, string>();
-  for (const candidate of new Set(protectedPaths)) resolved.set(candidate, await resolvedLocation(candidate));
+  for (const candidate of new Set(protectedPaths)) resolved.set(candidate, await resolvedLocation(location(candidate)));
   const intersects = (left: string, right: string): boolean => overlaps(left, right) || overlaps(right, left)
     || overlaps(resolved.get(left)!, resolved.get(right)!) || overlaps(resolved.get(right)!, resolved.get(left)!);
   for (let i = 0; i < outputs.length; i++) for (let j = i + 1; j < outputs.length; j++) {

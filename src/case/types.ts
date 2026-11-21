@@ -97,6 +97,8 @@ export interface CaseAttempt {
   status: JobStatus;
   mode: "run" | "resume";
   dispatched?: boolean;
+  /** Proven refusal before engine submission, with no native invocation. */
+  launchRefused?: true;
   resumeReady?: boolean;
   identity?: EngineIdentity;
   observation?: EngineObservation;

@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { access, mkdir, symlink, writeFile } from "node:fs/promises";
+import { access, mkdir, rm, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -60,6 +60,27 @@ test("case admission still accepts public roots separate from protected aliases 
   await assert.rejects(access(f.config.control));
   await assert.rejects(access(f.workflow.output));
 });
+
+for (const target of ["workflow-config", "workflow-output", "control"] as const) {
+  test(`case admission rejects unsupported systemd characters in ${target} paths before initialization`, symlinks, async context => {
+    const f = await fixture();
+    context.after(() => rm(f.root, {recursive: true, force: true}));
+    f.config.agent.readableRoots = [f.publicRoot];
+    if (target === "workflow-config") {
+      const unsupported = path.join(f.root, "workflow%reviewed.json");
+      await writeFile(unsupported, JSON.stringify(f.workflow));
+      f.config.jobs[0]!.attempts = [unsupported];
+    } else if (target === "workflow-output") {
+      f.workflow.output = path.join(f.root, "output%reviewed");
+      await writeFile(f.workflowFile, JSON.stringify(f.workflow));
+    } else f.config.control = path.join(f.root, "control%reviewed");
+    await writeFile(f.filename, JSON.stringify(f.config));
+    await assert.rejects(loadCaseConfig(f.filename), /case paths.*unsupported/u);
+    await assert.rejects(initializeCase(f.filename, {execute: true}), /case paths.*unsupported/u);
+    await assert.rejects(access(f.config.control));
+    await assert.rejects(access(f.workflow.output));
+  });
+}
 
 test("case admission rejects dangling aliases in future protected output paths", symlinks, async () => {
   const f = await fixture();

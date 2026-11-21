@@ -134,7 +134,7 @@ function validateControls(config: CaseConfig, state: CaseState, control: string)
     }
     let lastIndex = -1;
     for (const attempt of saved.attempts) {
-      if (!fields(attempt, ["index", "token", "status", "mode"], ["dispatched", "identity", "observation", "proof", "resumeReady"])
+      if (!fields(attempt, ["index", "token", "status", "mode"], ["dispatched", "launchRefused", "identity", "observation", "proof", "resumeReady"])
         || !integer(attempt.index, job.attempts.length - 1) || !validId(attempt.token) || tokens.has(attempt.token)
         || !["launching", "running", "paused", "failed", "complete"].includes(attempt.status)
         || !["run", "resume"].includes(attempt.mode)
@@ -142,7 +142,9 @@ function validateControls(config: CaseConfig, state: CaseState, control: string)
         || (attempt.dispatched !== undefined && typeof attempt.dispatched !== "boolean")) throw new Error("invalid case attempt controls");
       lastIndex = attempt.index;
       tokens.add(attempt.token);
-      if (attempt.status !== "launching") requireValid(attempt.identity !== undefined);
+      if (attempt.launchRefused !== undefined) requireValid(attempt.launchRefused === true && attempt.status === "failed"
+        && attempt.dispatched === true && attempt.identity === undefined && attempt.observation?.status === "failed");
+      if (attempt.status !== "launching" && attempt.launchRefused !== true) requireValid(attempt.identity !== undefined);
       if (attempt.identity !== undefined) requireValid(fields(attempt.identity, ["unit", "invocationId"])
         && attempt.identity.unit === engineUnitName(attempt.token) && typeof attempt.identity.invocationId === "string" && /^[a-f0-9]{32}$/u.test(attempt.identity.invocationId));
       if (attempt.observation !== undefined) {

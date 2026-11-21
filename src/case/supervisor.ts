@@ -8,6 +8,7 @@ import { CodexAgentError, validateAgentReply } from "./codex.js";
 import { FAILURE_CODES } from "../workflow/failure.js";
 import { acquireCaseLease, type CaseLease } from "./lease.js";
 import { CaseSourceIdentityError } from "./sources.js";
+import { EngineLaunchRefusedError } from "./launch-error.js";
 import { loadCaseState, redactedCaseStatus, saveCaseState, writeCaseCompletion } from "./store.js";
 import type { AgentBridge, AgentEvent, AgentReply, CaseAttempt, CaseConfig, CaseState, CompletionProof, EngineHost, EngineObservation, OutboxEntry, ReasonCode } from "./types.js";
 
@@ -159,6 +160,10 @@ export class CaseSupervisor {
       this.changed();
       await this.persist();
     } catch (error) {
+      if (error instanceof EngineLaunchRefusedError) {
+        attempt.status = "failed"; attempt.launchRefused = true; attempt.observation = {status: "failed"};
+        this.changed(); await this.persist(); return;
+      }
       // A missing launch reply cannot establish whether an engine started.
       this.observationUnavailable = true;
       if (error instanceof CaseSourceIdentityError) {
@@ -262,7 +267,13 @@ export class CaseSupervisor {
             attempt.identity = identity; attempt.status = "running"; attempt.observation = {status: "running"};
             this.changed(); await this.persist(); continue;
           }
-        } catch { unavailable.add(attempt.token); }
+        } catch (error) {
+          if (error instanceof EngineLaunchRefusedError) {
+            attempt.status = "failed"; attempt.launchRefused = true; attempt.observation = {status: "failed"};
+            this.changed(); await this.persist(); continue;
+          }
+          unavailable.add(attempt.token);
+        }
       }
       attempt.observation = {status: "unknown"};
       this.observationUnavailable = true;
@@ -288,16 +299,23 @@ export class CaseSupervisor {
     entry.status = "processed";
     // A valid transport response ends the case-wide consecutive-failure period.
     for (const row of this.state.outbox) row.nextDeliveryAt = 0;
-    if (reply.eventId !== entry.event.eventId || reply.revision !== entry.event.revision || reply.revision !== this.state.revision) return;
-    entry.reply = reply;
+    if (reply.eventId !== entry.event.eventId || reply.revision !== entry.event.revision) return;
     const action = reply.action;
+    // A permission stop remains valid when unrelated engines advance the case.
+    // Only execution decisions and acknowledgements require its current revision.
+    if (action.type === "needs-permission") {
+      entry.reply = reply;
+      if (this.state.permissionReason === undefined) this.state.permissionReason = action.reason;
+      return;
+    }
+    if (reply.revision !== this.state.revision) return;
+    entry.reply = reply;
     if (this.state.permissionReason !== undefined) return;
     if (action.type === "acknowledge") {
       if (entry.event.reason === "case-completed") this.state.completionDeliveredToAgent = true;
       else if (["job-failed", "job-paused", "configuration-changed"].includes(entry.event.reason)) this.state.permissionReason = "new-plan-required";
       return;
     }
-    if (action.type === "needs-permission") { this.state.permissionReason = action.reason; return; }
     if (this.state.desired !== "running" || this.state.complete || this.state.permissionReason !== undefined) return;
     const index = this.config.jobs.findIndex(job => job.id === action.jobId);
     const previous = this.state.jobs[index]?.attempts.at(-1);
@@ -361,7 +379,10 @@ export class CaseSupervisor {
     const unavailableBeforeCapacity = this.observationUnavailable;
     await this.pollResumeReadiness();
     this.processReply();
-    if (this.state.desired === "running" && this.agentReady) {
+    // Listed independent jobs already have durable execution authorization.
+    // Agent transport readiness gates decisions, not that approved native work;
+    // explicit approval stops still gate both launch loops below.
+    if (this.state.desired === "running") {
       for (let i = 0; i < this.state.jobs.length; i++) {
         const job = this.state.jobs[i]!;
         const attempt = job.attempts.at(-1);

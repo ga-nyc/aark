@@ -16,6 +16,7 @@ import { loadWorkflowConfig } from "../workflow/config.js";
 import { runWorkflow } from "../workflow/runner.js";
 import { mkdtemp } from "./helpers.js";
 import { CaseSourceIdentityError } from "../case/sources.js";
+import { EngineLaunchRefusedError } from "../case/launch-error.js";
 
 const hash = (value: string) => createHash("sha256").update(value).digest("hex");
 async function fixture(): Promise<{root: string; attempt: PreparedAttempt}> {
@@ -66,6 +67,73 @@ function manager() {
 }
 const linux = {skip: process.platform !== "linux"};
 
+test("immutable local launch refusals are explicit and cannot create an engine or receipt", linux, async context => {
+  const f = await fixture();
+  context.after(() => rm(f.root, {recursive: true, force: true}));
+  const host = manager();
+  const control = path.join(f.root, "host");
+  const engine = new SystemdEngineHost({cliPath: path.resolve("dist/cli.js"), controlRoot: control, command: host.command});
+  const output = {...f.attempt.workflow, output: path.join(f.root, "output%reviewed")};
+  for (const attempt of [{...f.attempt, configFile: path.join(f.root, "workflow%reviewed.json")},
+    {...f.attempt, configHash: "0".repeat(64)}, {...f.attempt, workflow: output, configHash: hash(JSON.stringify(output))}]) {
+    await assert.rejects(engine.launch(attempt, "unsubmitted-token", "run"), EngineLaunchRefusedError);
+    await assert.rejects(engine.reattach(attempt, "unsubmitted-token", "run"), EngineLaunchRefusedError);
+  }
+  assert.equal(host.calls.length, 0);
+  await assert.rejects(access(control));
+});
+
+test("an absent unit with no launch intent permits an explicit configuration refusal", linux, async context => {
+  const f = await fixture();
+  context.after(() => rm(f.root, {recursive: true, force: true}));
+  const host = manager();
+  const engine = new SystemdEngineHost({cliPath: path.resolve("dist/cli.js"), controlRoot: path.join(f.root, "host"),
+    command: async (executable, args, options) => args[1] === "binding" ? result(executable, args, '{"status":"unknown"}', {exitCode: 1})
+      : host.command(executable, args, options)});
+  await assert.rejects(engine.launch(f.attempt, "refused-token", "run"), EngineLaunchRefusedError);
+  assert.equal(host.calls.some(call => call.executable.endsWith("systemd-run")), false);
+  await assert.rejects(access(path.join(f.root, "host", "engines", `${engineUnitName("refused-token")}.json`)));
+  await assert.rejects(access(f.attempt.workflow.output));
+});
+
+test("a submitted launch and its existing receipt never become definitive prelaunch refusals", linux, async context => {
+  const f = await fixture();
+  context.after(() => rm(f.root, {recursive: true, force: true}));
+  const host = manager();
+  let denyBinding = false;
+  let submitted = 0;
+  const engine = new SystemdEngineHost({cliPath: path.resolve("dist/cli.js"), controlRoot: path.join(f.root, "host"),
+    command: async (executable, args, options) => {
+      if (executable.endsWith("systemd-run")) { submitted++; return result(executable, args, "", {exitCode: 143, terminationReason: "timeout"}); }
+      if (args[1] === "binding" && denyBinding) return result(executable, args, '{"status":"unknown"}', {exitCode: 1});
+      return host.command(executable, args, options);
+    }});
+  const unknown = (error: unknown) => error instanceof Error && !(error instanceof EngineLaunchRefusedError);
+  await assert.rejects(engine.launch(f.attempt, "uncertain-token", "run"), unknown);
+  assert.equal(submitted, 1);
+  denyBinding = true;
+  await assert.rejects(engine.launch(f.attempt, "uncertain-token", "run"), unknown);
+  const invalid = {...f.attempt, configFile: path.join(f.root, "workflow%reviewed.json")};
+  await assert.rejects(engine.launch(invalid, "uncertain-token", "run"), unknown);
+  await assert.rejects(engine.reattach(invalid, "uncertain-token", "run"), unknown);
+  assert.equal(submitted, 1);
+});
+
+test("unavailable unit observations cannot prove a prelaunch refusal", linux, async context => {
+  const f = await fixture();
+  context.after(() => rm(f.root, {recursive: true, force: true}));
+  for (const observation of [{exitCode: 143, terminationReason: "timeout" as const}, {exitCode: 1}, {stdoutTruncated: true},
+    {stderrTruncated: true}, {text: "LoadState=loaded\nLoadState=not-found\n"}]) {
+    let commands = 0;
+    const {text, ...extra} = observation as Partial<CommandResult> & {text?: string};
+    const engine = new SystemdEngineHost({cliPath: path.resolve("dist/cli.js"), controlRoot: path.join(f.root, "host"),
+      command: async (executable, args) => { commands++; return result(executable, args, text ?? "LoadState=not-found\n", extra); }});
+    await assert.rejects(engine.launch(f.attempt, "unobserved-token", "run"), error => error instanceof Error && !(error instanceof EngineLaunchRefusedError));
+    assert.equal(commands, 1);
+  }
+  await assert.rejects(access(path.join(f.root, "host")));
+});
+
 test("changed case source authorization stops before any engine is started", linux, async () => {
   const f = await fixture();
   const recoveryConfig = path.join(f.root, "recovery.json");
@@ -91,6 +159,10 @@ test("changed case source authorization stops before any engine is started", lin
   await assert.rejects(engine.launch(attempt, "synthetic-source-token", "run"), CaseSourceIdentityError);
   assert.equal(host.calls.some(call => call.executable.endsWith("systemd-run")), false);
   await assert.rejects(access(workflow.output));
+  const unregistered = new SystemdEngineHost({cliPath: path.resolve("dist/cli.js"), controlRoot: path.join(f.root, "unregistered-host"), command: host.command});
+  const calls = host.calls.length;
+  await assert.rejects(unregistered.launch(attempt, "missing-source-authorization", "run"), error => error instanceof Error && !(error instanceof EngineLaunchRefusedError));
+  assert.equal(host.calls.length, calls, "missing authorization is not an absence proof");
 });
 
 test("quota readiness uses an isolated bounded helper and rejects unavailable or malformed replies", linux, async () => {

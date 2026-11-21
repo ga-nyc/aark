@@ -7,6 +7,8 @@ import { captureCommand, type CommandOptions, type CommandResult } from "../core
 import { atomicWriteJson, ensurePrivateDirectory, readJson, stableHandleStat } from "../core/fs-safe.js";
 import { FAILURE_CODES } from "../workflow/failure.js";
 import { CaseSourceIdentityError } from "./sources.js";
+import { isSupportedCasePath } from "./config.js";
+import { EngineLaunchRefusedError } from "./launch-error.js";
 import type { CaseSourceBinding, CaseSourceBindings, CompletionProof, EngineHost, EngineIdentity, EngineObservation, PreparedAttempt } from "./types.js";
 
 type Command = (executable: string, args: string[], options: CommandOptions) => Promise<CommandResult>;
@@ -45,7 +47,7 @@ export class SystemdEngineHost implements EngineHost {
 
   public constructor(private readonly options: SystemdEngineHostOptions) {
     for (const value of [options.cliPath, options.controlRoot, process.execPath]) {
-      if (!path.isAbsolute(value) || /[\u0000-\u001f\u007f%]/u.test(value)) throw new Error("case engine paths must be absolute supported local paths");
+      if (!isSupportedCasePath(value)) throw new Error("case engine paths must be absolute supported local paths");
     }
     this.timeout = options.probeTimeoutMs ?? 10_000;
     this.verificationTimeout = options.verificationTimeoutMs ?? 30 * 60_000;
@@ -98,17 +100,42 @@ export class SystemdEngineHost implements EngineHost {
     const values: Properties = {};
     for (const line of result.stdout.toString().trim().split("\n")) {
       const separator = line.indexOf("=");
-      if (separator > 0) values[line.slice(0, separator)] = line.slice(separator + 1);
+      if (separator > 0) {
+        const key = line.slice(0, separator);
+        if (Object.hasOwn(values, key)) throw new Error("case engine observation unavailable");
+        values[key] = line.slice(separator + 1);
+      }
     }
-    if (values.LoadState === "not-found") return undefined;
+    if (values.LoadState === "not-found") {
+      if (![0, 4].includes(result.exitCode)) throw new Error("case engine observation unavailable");
+      return undefined;
+    }
     if (!successful(result) || values.LoadState !== "loaded") throw new Error("case engine observation unavailable");
     return values;
   }
 
   private binding(attempt: PreparedAttempt, mode: "run" | "resume"): string {
-    if (!/^[a-f0-9]{64}$/u.test(attempt.configHash) || hash(JSON.stringify(attempt.workflow)) !== attempt.configHash || !path.isAbsolute(attempt.configFile)
-      || /[\u0000-\u001f\u007f%]/u.test(attempt.configFile + attempt.workflow.output)) throw new Error("invalid case engine binding");
+    if (!/^[a-f0-9]{64}$/u.test(attempt.configHash) || hash(JSON.stringify(attempt.workflow)) !== attempt.configHash
+      || !isSupportedCasePath(attempt.configFile) || !isSupportedCasePath(attempt.workflow.output)) throw new EngineLaunchRefusedError();
     return hash(JSON.stringify([attempt.configFile, attempt.configHash, attempt.workflow.output, mode, process.execPath, this.options.cliPath, this.sourcePolicy(attempt)]));
+  }
+
+  private async receipt(unit: string): Promise<Receipt | undefined> {
+    try { return await readJson<Receipt>(path.join(this.directory, `${unit}.json`), 4096); }
+    catch (error) {
+      if (error instanceof Error && "code" in error && error.code === "ENOENT") return undefined;
+      throw new Error("case engine receipt unavailable");
+    }
+  }
+
+  private checkedBinding(attempt: PreparedAttempt, mode: "run" | "resume", receipt: Receipt | undefined): string {
+    try { return this.binding(attempt, mode); }
+    catch (error) {
+      // A previous intent still requires reconciliation, even if the caller's
+      // immutable arguments have since become invalid.
+      if (error instanceof EngineLaunchRefusedError && receipt !== undefined) throw new Error("invalid case engine binding");
+      throw error;
+    }
   }
 
   private sourcePolicy(attempt: PreparedAttempt): CaseSourceBinding[] {
@@ -128,13 +155,12 @@ export class SystemdEngineHost implements EngineHost {
 
   public async reattach(attempt: PreparedAttempt, token: string, mode: "run" | "resume"): Promise<EngineIdentity | undefined> {
     const unit = engineUnitName(token);
-    const binding = this.binding(attempt, mode);
+    const receipt = await this.receipt(unit);
+    const binding = this.checkedBinding(attempt, mode, receipt);
     const values = await this.show(unit);
     if (values === undefined) return undefined;
     const receiptPath = path.join(this.directory, `${unit}.json`);
-    let receipt: Receipt;
-    try { receipt = await readJson<Receipt>(receiptPath, 4096); }
-    catch { throw new Error("case engine receipt unavailable"); }
+    if (receipt === undefined) throw new Error("case engine receipt unavailable");
     if (receipt.version !== 1 || receipt.binding !== binding
       || (receipt.invocationId !== undefined && !/^[a-f0-9]{32}$/u.test(receipt.invocationId))) throw new Error("case engine identity changed");
     const invocationId = this.assertUnit(values, binding);
@@ -146,18 +172,18 @@ export class SystemdEngineHost implements EngineHost {
 
   public async launch(attempt: PreparedAttempt, token: string, mode: "run" | "resume"): Promise<EngineIdentity> {
     const unit = engineUnitName(token);
-    const binding = this.binding(attempt, mode);
-    await ensurePrivateDirectory(this.directory);
     const receiptPath = path.join(this.directory, `${unit}.json`);
-    let receipt: Receipt | undefined;
-    try { receipt = await readJson<Receipt>(receiptPath, 4096); }
-    catch (error) { if (!(error instanceof Error && "code" in error && error.code === "ENOENT")) throw new Error("case engine receipt unavailable"); }
+    const receipt = await this.receipt(unit);
+    const binding = this.checkedBinding(attempt, mode, receipt);
     if (receipt !== undefined && (receipt.version !== 1 || receipt.binding !== binding
       || (receipt.invocationId !== undefined && !/^[a-f0-9]{32}$/u.test(receipt.invocationId)))) throw new Error("case engine identity changed");
     let values = await this.show(unit);
     if (values === undefined) {
       // A previously observed invocation must never be replaced under its old token.
       if (receipt?.invocationId !== undefined) throw new Error("case engine invocation disappeared");
+      let submitted = false;
+      try {
+      await ensurePrivateDirectory(this.directory);
       const config = await this.capture(process.execPath, [PROBE, "binding", attempt.configFile, attempt.configHash, JSON.stringify(this.sourcePolicy(attempt))]);
       if (config.exitCode === 2 && config.terminationReason === null && !config.stdoutTruncated && !config.stderrTruncated
         && config.stdout.toString().trim() === '{"valid":false,"reason":"source-identity-changed"}') throw new CaseSourceIdentityError();
@@ -178,9 +204,17 @@ export class SystemdEngineHost implements EngineHost {
         ...(mode === "run" ? ["--config", attempt.configFile] : ["--output", attempt.workflow.output]), "--expected-config-hash", attempt.configHash,
         ...(attempt.workflow.recovery === undefined ? [] : ["--expected-source-bindings", JSON.stringify(this.sourcePolicy(attempt))]), "--execute"];
       // A client timeout can leave a successfully started service. Always reconcile it.
+      submitted = true;
       try { await this.capture(SYSTEMD_RUN, args); } catch { /* Only the launch client may have failed. */ }
       values = await this.show(unit);
       if (values === undefined) throw new Error("case engine launch was not observed");
+      } catch (error) {
+        if (error instanceof CaseSourceIdentityError) throw error;
+        // An absent unit and no prior receipt prove this is a pre-submit
+        // refusal. Once submission starts, even a timeout remains unknown.
+        if (!submitted && receipt === undefined) throw new EngineLaunchRefusedError();
+        throw error;
+      }
     }
     const invocationId = this.assertUnit(values, binding);
     if (receipt?.invocationId !== undefined && receipt.invocationId !== invocationId) throw new Error("case engine identity changed");

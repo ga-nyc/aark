@@ -161,15 +161,15 @@ test("case watchdog serializes incident updates independently of the supervisor"
   finally { await supervisor.release(); }
 });
 
-test("case watchdog allows the notifier's nested bus and desktop deadlines", linuxOnly, async context => {
+test("case watchdog allows the notifier's desktop deadline and process startup", linuxOnly, async context => {
   const f = await fixture(context);
   f.state.health = "degraded"; await f.save();
   const slowSuccessfulDelivery = async (executable: string, args: string[], options: CommandOptions): Promise<CommandResult> => {
-    if (executable === "/usr/bin/python3" && (options.timeoutMs ?? 0) <= 35_000) return result("", {exitCode: 1, terminationReason: "timeout"});
+    if (executable === "/usr/bin/python3" && (options.timeoutMs ?? 0) <= 15_000) return result("", {exitCode: 1, terminationReason: "timeout"});
     return f.commands.command(executable, args, options);
   };
   assert.equal((await watchCaseService(f.control, slowSuccessfulDelivery, NOW)).deliveryAccepted, true);
-  assert.ok(f.commands.notifications()[0]!.options.timeoutMs! > 35_000);
+  assert.ok(f.commands.notifications()[0]!.options.timeoutMs! > 15_000);
 });
 
 test("case watchdog requires a complete successful running identity before remaining quiet", linuxOnly, async context => {

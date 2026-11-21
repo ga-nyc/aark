@@ -11,6 +11,7 @@ import { CaseSupervisor } from "../case/supervisor.js";
 import { caseConfigHash, casePlan, digest, loadCaseConfig, MAX_CASE_BYTES } from "../case/config.js";
 import { engineUnitName } from "../case/systemd.js";
 import { CaseSourceIdentityError } from "../case/sources.js";
+import { EngineLaunchRefusedError } from "../case/launch-error.js";
 import { captureCommand } from "../core/command.js";
 import { mkdtemp } from "./helpers.js";
 
@@ -763,6 +764,67 @@ test("stale agent event revisions cannot authorize a fresh attempt", linuxOnly, 
   assert.equal((await loadCaseState(f.control)).state.jobs[0]!.attempts.length, 1);
 });
 
+for (const reason of ["agent-approval-required", "new-media-required"] as const) {
+  test(`a stale ${reason} stop survives unrelated verification and prevents the next launch`, linuxOnly, async t => {
+    const f = await fixture({jobs: 4, attempts: 2, maxConcurrent: 2});
+    await initializeCase(f.filename, {execute: true});
+    const supervisor = await CaseSupervisor.open(f.control, {host: f.host, agent: f.agent});
+    t.after(() => supervisor.close());
+    await tick(supervisor);
+    f.host.observations.set(f.host.launches[0]!.identity.unit, {status: "failed", failureCode: "unclassified-failure"});
+    await tick(supervisor);
+    assert.equal(f.host.launches.length, 3, "job 3 occupies the slot left by job 1");
+    const event = f.agent.requests[0]!.event;
+    f.host.observations.set(f.host.launches[1]!.identity.unit, {status: "complete", scanErrors: 0});
+    await tick(supervisor); // Verification completes asynchronously before the next observation.
+    f.agent.reply(0, {type: "needs-permission", reason});
+    await settle();
+    await tick(supervisor, 2);
+    const {state} = await loadCaseState(f.control);
+    assert.ok(state.revision > event.revision);
+    assert.equal(state.jobs[1]!.attempts.at(-1)!.status, "complete");
+    assert.equal(state.permissionReason, reason);
+    assert.equal(state.health, "awaiting-permission");
+    assert.equal(state.outbox[0]!.status, "processed");
+    assert.deepEqual(state.outbox[0]!.reply?.action, {type: "needs-permission", reason});
+    assert.equal(state.jobs[3]!.attempts.length, 0);
+    assert.equal(state.jobs[2]!.attempts.at(-1)!.status, "running");
+    assert.equal(f.host.launches.length, 3);
+    await supervisor.close();
+    const restarted = await CaseSupervisor.open(f.control, {host: f.host, agent: new FakeAgent()});
+    try {
+      await tick(restarted, 2);
+      assert.equal((await loadCaseState(f.control)).state.permissionReason, reason);
+      assert.equal(f.host.launches.length, 3, "the persisted stop also holds job 4 after restart");
+    } finally { await restarted.close(); }
+  });
+}
+
+test("a stale agent resume cannot authorize work after unrelated verification advances the case", linuxOnly, async t => {
+  const f = await fixture({jobs: 2, maxConcurrent: 2});
+  f.config.jobs[0]!.resumeAfterQuota = true;
+  await writeFile(f.filename, JSON.stringify(f.config));
+  await initializeCase(f.filename, {execute: true});
+  const supervisor = await CaseSupervisor.open(f.control, {host: f.host, agent: f.agent});
+  t.after(() => supervisor.close());
+  await tick(supervisor);
+  f.host.observations.set(f.host.launches[0]!.identity.unit, {status: "paused", pauseReason: "free-space-reserve"});
+  await tick(supervisor);
+  const event = f.agent.requests[0]!.event;
+  assert.equal(event.reason, "job-paused");
+  f.host.observations.set(f.host.launches[1]!.identity.unit, {status: "complete", scanErrors: 0});
+  await tick(supervisor);
+  f.agent.reply(0, {type: "resume", jobId: "job-000001"});
+  await settle();
+  await tick(supervisor, 2);
+  const {state} = await loadCaseState(f.control);
+  assert.ok(state.revision > event.revision);
+  assert.equal(state.jobs[0]!.attempts.length, 1);
+  assert.equal(state.jobs[0]!.attempts[0]!.status, "paused");
+  assert.equal(state.permissionReason, undefined);
+  assert.equal(f.host.launches.length, 2);
+});
+
 test("agent retries preserve event identity and stop at the persisted request budget", linuxOnly, async t => {
   const f = await fixture({maxRequests: 2});
   await initializeCase(f.filename, {execute: true});
@@ -1085,7 +1147,7 @@ test("new failures and supervisor restart preserve consecutive transport backoff
   } finally { await second.close(); }
 });
 
-test("agent registration preflight retries reuse the bridge after the bounded wait", linuxOnly, async t => {
+test("agent registration retries reuse the bridge while approved native work continues", linuxOnly, async t => {
   const f = await fixture();
   f.agent.unavailablePreflights = 1;
   await initializeCase(f.filename, {execute: true});
@@ -1093,7 +1155,7 @@ test("agent registration preflight retries reuse the bridge after the bounded wa
   const supervisor = await CaseSupervisor.open(f.control, {host: f.host, agent: f.agent, clock: () => now});
   t.after(() => supervisor.close());
   await tick(supervisor, 2);
-  assert.equal(f.host.launches.length, 0);
+  assert.equal(f.host.launches.length, 1);
   assert.equal(f.agent.preflights, 1);
   assert.equal((await loadCaseState(f.control)).state.health, "agent-unavailable");
   now += 60_000;
@@ -1102,6 +1164,64 @@ test("agent registration preflight retries reuse the bridge after the bounded wa
   assert.equal(f.agent.closed, 0);
   assert.equal(f.host.launches.length, 1);
 });
+
+test("unavailable startup agent permits independent jobs but cannot authorize fresh retries", linuxOnly, async t => {
+  const f = await fixture({jobs: 3, attempts: 2, maxConcurrent: 1});
+  f.agent.unavailablePreflights = 100;
+  await initializeCase(f.filename, {execute: true});
+  let now = Date.now();
+  const supervisor = await CaseSupervisor.open(f.control, {host: f.host, agent: f.agent, clock: () => now});
+  t.after(() => supervisor.close());
+  for (let index = 0; index < 3; index++) {
+    await tick(supervisor);
+    assert.equal(f.host.launches.length, index + 1);
+    assert.equal(f.host.launches[index]!.attempt.configFile, f.workflowFiles[index]![0]);
+    f.host.observations.set(f.host.launches[index]!.identity.unit, {status: "failed", failureCode: "unclassified-failure"});
+    now += 60_000;
+  }
+  await tick(supervisor, 3);
+  const {state} = await loadCaseState(f.control);
+  assert.equal(state.health, "agent-unavailable");
+  assert.equal(f.host.launches.length, 3);
+  assert.equal(f.agent.requests.length, 0);
+  assert.ok(state.jobs.every(job => job.attempts.length === 1));
+  assert.ok(state.outbox.some(entry => entry.status === "pending"));
+});
+
+for (const recovered of [false, true]) {
+  test(`a proven pre-launch refusal releases its slot${recovered ? " after restart reconciliation" : ""}`, linuxOnly, async t => {
+    const f = await fixture({jobs: 2, maxConcurrent: 1});
+    await initializeCase(f.filename, {execute: true});
+    const saved = await loadCaseState(f.control);
+    if (recovered) {
+      saved.state.jobs[0]!.attempts.push({index: 0, token: randomUUID(), mode: "run", status: "launching", dispatched: true});
+      await saveCaseState(f.control, saved.config, saved.state);
+      f.host.reattach = async attempt => {
+        if (attempt.configFile === f.workflowFiles[0]![0]) throw new EngineLaunchRefusedError();
+        return undefined;
+      };
+    } else {
+      const launch = f.host.launch.bind(f.host);
+      f.host.launch = async (attempt, token, mode) => {
+        if (attempt.configFile === f.workflowFiles[0]![0]) throw new EngineLaunchRefusedError();
+        return launch(attempt, token, mode);
+      };
+    }
+    const supervisor = await CaseSupervisor.open(f.control, {host: f.host, agent: f.agent});
+    t.after(() => supervisor.close());
+    await tick(supervisor, 2);
+    const {config, state} = await loadCaseState(f.control);
+    const refused = state.jobs[0]!.attempts[0]!;
+    assert.equal(refused.status, "failed");
+    assert.equal(refused.launchRefused, true);
+    assert.equal(refused.identity, undefined);
+    assert.equal(state.jobs[1]!.attempts[0]!.status, "running");
+    assert.equal(f.host.identities.size, 1);
+    delete refused.launchRefused;
+    await assert.rejects(saveCaseState(f.control, config, state), /case control integrity validation failed/u,
+      "an ordinary unknown launch cannot be reclassified as failed without an invocation");
+  });
+}
 
 test("the last permitted request remains awaiting-agent until it actually fails", linuxOnly, async t => {
   const f = await fixture({maxRequests: 1});
