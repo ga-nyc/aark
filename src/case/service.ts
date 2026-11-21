@@ -178,10 +178,8 @@ async function watchCaseServiceHeld(control: string, command: Command, now: numb
   }
   let delivered: boolean | null = null;
   if (event !== undefined) {
-    const jobs = Array.isArray(status?.jobs) ? status.jobs.map((job: Record<string, unknown>) => ({id: job.id, status: job.status,
-      attemptsUsed: job.attemptsUsed, verified: job.verified, failureCode: job.failureCode, pauseReason: job.pauseReason})) : [];
     const key = complete ? digest({case: receipt.unit, event: "complete"})
-      : digest({case: receipt.unit, event, incident: incident.token, active, stale, health: status?.health ?? "state-unavailable", jobs});
+      : digest({case: receipt.unit, event, incident: incident.token});
     try { delivered = await notify(control, receipt, event, key, command); } catch { delivered = false; }
     await atomicWriteJson(path.join(control, "notification-status-redacted.json"), {version: 1, event, deliveryAccepted: delivered,
       userAcknowledged: false, checkedAt: new Date(now).toISOString()});

@@ -12,13 +12,13 @@ import { loadScanState } from "../mining/resume.js";
 import { buildRecoveryPlan } from "../recovery/plan.js";
 import { redactedPlan, runRecoveryPlan } from "../recovery/runner.js";
 import type { MiningProgress } from "../mining/types.js";
-import { inspectSourceSafety } from "../recovery/source-safety.js";
+import { inspectSourceSafety, recoverySourceIdentity } from "../recovery/source-safety.js";
 import { loadWorkflowConfig, MAX_WORKFLOW_CONFIG_BYTES, overlaps } from "./config.js";
 import type { WorkflowConfig } from "./config.js";
 import { finalizeWorkflow } from "./finalize.js";
 import { FAILURE_CODES, workflowFailureCode } from "./failure.js";
 import { controlIdentity, fileDigest, interrupted, miningDirectory, outputIdentity, samePath, verifyScan, workflowSourceIdentity } from "./verify.js";
-import { assertSourceBindings } from "../case/sources.js";
+import { assertSourceBindings, workflowExternalSources } from "../case/sources.js";
 import type { CaseSourceBinding } from "../case/types.js";
 
 type Phase = "recovery" | "mining" | "verification" | "packaging" | "complete";
@@ -242,9 +242,13 @@ async function execute(state: WorkflowState, options: WorkflowOptions, workflowL
     if (config.recovery !== undefined) {
       if (state.recoveryProof === undefined) {
         state.phase = "recovery"; await update();
+        const sources = workflowExternalSources(config);
+        if (state.resultsSafety.length !== sources.length) throw new Error("recovery source identity differs from workflow authorization");
+        const sourceIdentities = new Map(sources.map((source, index) => [source,
+          recoverySourceIdentity(state.resultsSafety[index]!)]));
         const result = await runRecoveryPlan(config.recovery, buildRecoveryPlan(config.recovery), true, controller.signal, snapshot => {
           state.recoveryProgress = redactedProgress(snapshot, "recovery");
-        });
+        }, sourceIdentities);
         if (result.status === "paused") {
           const stop = result.storageStop;
           if (typeof stop === "object" && stop !== null && !Array.isArray(stop)

@@ -46,7 +46,7 @@ async function imageFixture(context: TestContext) {
   const workflow = await loadWorkflowConfig(filename);
   const expected = createHash("sha256").update(JSON.stringify(workflow)).digest("hex");
   const pins = await captureSourceBindings(workflow);
-  return {root, source, recovery, filename, output, expected, pins};
+  return {root, source, recovery, recoveryFile, filename, output, expected, pins};
 }
 
 test("supervised CLI rejects a changed loaded configuration before creating output", async () => {
@@ -125,6 +125,48 @@ test("matching source pins pass the native captured-safety baseline before outpu
   await assert.rejects(access(f.output));
   await assert.rejects(access(f.recovery));
 });
+
+for (const replace of ["source", "analysisSource", "neither"] as const) {
+  test(`native recovery binds the workflow's captured ${replace} authorization before destination writes`, {skip: process.platform !== "linux"}, async context => {
+    const f = await imageFixture(context);
+    const analysisSource = path.join(f.root, "synthetic-analysis.img");
+    await writeFile(analysisSource, Buffer.alloc(4096, 0x41));
+    const recovery = JSON.parse(await readFile(f.recoveryFile, "utf8"));
+    await writeFile(f.recoveryFile, JSON.stringify({...recovery, analysisSource, storage: {minFreeGiB: 0, minFreePercent: 0}}));
+    const workflow = await loadWorkflowConfig(f.filename);
+    const expected = createHash("sha256").update(JSON.stringify(workflow)).digest("hex");
+    const pins = await captureSourceBindings(workflow);
+    const replacement = path.join(f.root, "synthetic-replacement.img");
+    await writeFile(replacement, Buffer.alloc(4096, replace === "source" ? 0x53 : 0x41));
+    let updates = 0;
+    let nativeDestinationReached = false;
+    const originalMkdir = fs.promises.mkdir;
+    // Stop a matching baseline before any native write or forensic command.
+    // With the old handoff, replacement sources also reached this sentinel.
+    fs.promises.mkdir = (async (directory: Parameters<typeof fs.promises.mkdir>[0], options?: unknown) => {
+      if (directory === f.recovery) { nativeDestinationReached = true; throw new Error("synthetic native baseline accepted"); }
+      return await originalMkdir(directory, options as Parameters<typeof fs.promises.mkdir>[1]);
+    }) as typeof fs.promises.mkdir;
+    syncBuiltinESMExports();
+    try {
+      await assert.rejects(runWorkflow(f.filename, {execute: true, expectedConfigHash: expected, expectedSourceBindings: pins,
+        progress: snapshot => {
+          if (snapshot.status === "running" && snapshot.phase === "recovery" && ++updates === 2 && replace !== "neither") {
+            // The last workflow guard has finished; only the native capture
+            // can bind this next read to the original authorization.
+            fs.renameSync(replacement, replace === "source" ? f.source : analysisSource);
+          }
+        }}), error => {
+          assert.ok(error instanceof Error);
+          assert.match(error.message, replace === "neither" ? /unclassified-failure/u : /source-identity-changed/u, String(error.cause));
+          return true;
+        });
+    } finally { fs.promises.mkdir = originalMkdir; syncBuiltinESMExports(); }
+    assert.ok(updates >= 2);
+    assert.equal(nativeDestinationReached, replace === "neither");
+    await assert.rejects(access(f.recovery), "no native output directory or engine invocation is permitted by these tests");
+  });
+}
 
 test("hidden source-binding CLI input is bounded, strict, and rejects invalid JSON without echoing values", async () => {
   const f = await fixture();

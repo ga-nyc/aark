@@ -356,6 +356,45 @@ test("case watchdog retries failed notification delivery using the same event to
   assert.equal(JSON.stringify(f.commands.calls).includes("synthetic-private-transport-error"), false);
 });
 
+for (const accepted of [true, false]) {
+  test(`case watchdog keeps one continuous incident token after ${accepted ? "accepted delivery" : "failed delivery"} despite changing observations`, linuxOnly, async context => {
+    const f = await fixture(context);
+    f.state.health = "degraded"; await f.save();
+    f.commands.delivery = accepted ? result() : result("", {exitCode: 1});
+    assert.equal((await watchCaseService(f.control, f.commands.command, NOW)).deliveryAccepted, accepted);
+    const incident = await readFile(path.join(f.control, "notification-incident.json"), "utf8");
+
+    f.commands.observation = result("ActiveState=failed\n");
+    const dead = await watchCaseService(f.control, f.commands.command, NOW + 1000);
+    assert.equal(dead.workerObservedActive, false);
+    assert.equal(dead.heartbeatStale, false);
+    assert.equal(dead.deliveryAccepted, accepted);
+
+    const stale = await watchCaseService(f.control, f.commands.command, NOW + 240_000);
+    assert.equal(stale.heartbeatStale, true);
+    assert.equal(stale.deliveryAccepted, accepted);
+
+    f.state.health = "agent-unavailable";
+    f.state.updatedAt = new Date(NOW + 240_000).toISOString();
+    f.state.jobs[0]!.attempts[0]!.status = "failed";
+    f.state.jobs[0]!.attempts[0]!.observation = {status: "failed", failureCode: "unclassified-failure"};
+    await f.save();
+    f.commands.observation = result(ACTIVE);
+    const changed = await watchCaseService(f.control, f.commands.command, NOW + 241_000);
+    assert.equal(changed.workerObservedActive, true);
+    assert.equal(changed.heartbeatStale, false);
+    assert.equal(changed.deliveryAccepted, accepted);
+
+    // A retry that finally reaches the desktop must retain the receipt key
+    // used before liveness, heartbeat, health and job observations changed.
+    f.commands.delivery = result();
+    assert.equal((await watchCaseService(f.control, f.commands.command, NOW + 242_000)).deliveryAccepted, true);
+    assert.equal(f.commands.notifications().length, 5);
+    assert.equal(new Set(f.commands.notifications().map((_, index) => f.commands.token(index))).size, 1);
+    assert.equal(await readFile(path.join(f.control, "notification-incident.json"), "utf8"), incident);
+  });
+}
+
 test("case watchdog reports clean user pause with a paused event", linuxOnly, async (context) => {
   const f = await fixture(context);
   f.state.desired = "user-paused";

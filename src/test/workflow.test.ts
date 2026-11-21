@@ -12,6 +12,7 @@ import { captureCommand } from "../core/command.js";
 import { loadWorkflowConfig } from "../workflow/config.js";
 import { resumeWorkflow, runWorkflow, workflowPlan, workflowStatus } from "../workflow/runner.js";
 import { workflowSourceIdentity } from "../workflow/verify.js";
+import { recoverySourceIdentity } from "../recovery/source-safety.js";
 import type { SourceSafety } from "../recovery/source-safety.js";
 import type { LoopBackingIdentity } from "../core/mounts.js";
 
@@ -281,10 +282,15 @@ test("source guards tolerate destination writes while preserving source and cont
     bytes: 1000, offset: 0, sizeLimit: 0, mount: "synthetic-mount", modifiedNs: "1", changedNs: "1"} as unknown as LoopBackingIdentity;
   const base = {sourceLoopBackings: [backing], destinationLoopBackings: [backing]} as unknown as SourceSafety;
   const expected = workflowSourceIdentity(base);
+  assert.equal(recoverySourceIdentity(base), recoverySourceIdentity(expected), "block-source fingerprints survive the native handoff");
+  assert.equal(recoverySourceIdentity({...base, destinationDevice: "different-output", destinationLoopBackings: []}), recoverySourceIdentity(base));
+  assert.notEqual(recoverySourceIdentity({...base, sourceLoopBackings: [{...backing, modifiedNs: "2"}]}), recoverySourceIdentity(base));
   assert.equal(workflowSourceIdentity({...base, destinationLoopBackings: [{...backing, modifiedNs: "2", changedNs: "2"}]}), expected);
   assert.notEqual(workflowSourceIdentity({...base, sourceLoopBackings: [{...backing, modifiedNs: "2"}]}), expected);
   assert.notEqual(workflowSourceIdentity({...base, destinationLoopBackings: [{...backing, fileInode: "3"}]}), expected);
   const image = {...base, kind: "regular-file"} as SourceSafety;
+  assert.equal(recoverySourceIdentity(image), recoverySourceIdentity(workflowSourceIdentity(image)), "normalized image loop metadata must not be normalized twice");
+  assert.notEqual(recoverySourceIdentity({...image, sourceLoopBackings: [{...backing, fileInode: "3"}]}), recoverySourceIdentity(image));
   assert.equal(workflowSourceIdentity({...image, sourceLoopBackings: [{...backing, modifiedNs: "2"}]}), workflowSourceIdentity(image));
 });
 

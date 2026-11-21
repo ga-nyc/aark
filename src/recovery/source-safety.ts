@@ -3,7 +3,7 @@ import { access, realpath, stat } from "node:fs/promises";
 import path from "node:path";
 import { captureCommand } from "../core/command.js";
 import { nearestExistingParent } from "../core/fs-safe.js";
-import { assertLoopBackingsOutside, blockTransportIsNetwork, filesystemIsNetwork, mountForPath, mountIsNetworkBacked, mountIsReadOnly, resolveBlockBacking, type LoopBackingIdentity } from "../core/mounts.js";
+import { assertLoopBackingsOutside, blockTransportIsNetwork, filesystemIsNetwork, mountForPath, mountIsNetworkBacked, mountIsReadOnly, resolveBlockBacking, stableLoopBackingIdentity, type LoopBackingIdentity } from "../core/mounts.js";
 
 interface LsblkNode {
   path?: string;
@@ -39,6 +39,20 @@ export interface SourceSafety {
   destinationOnSourceDevice: boolean;
   safe: boolean;
   reasons: string[];
+}
+
+/** Compare native metadata with an existing workflow fingerprint independently of its destination. */
+export function recoverySourceIdentity(safety: SourceSafety | string): string {
+  // Workflow fingerprints already serialize regular-image loop identities as
+  // stable strings. Preserve that representation instead of normalizing twice.
+  const captured: Omit<SourceSafety, "sourceLoopBackings"> & {sourceLoopBackings: SourceSafety["sourceLoopBackings"] | string}
+    = typeof safety === "string" ? JSON.parse(safety) : safety;
+  return JSON.stringify({resolvedSource: captured.resolvedSource, kind: captured.kind, bytes: captured.bytes,
+    regularFileIdentity: captured.regularFileIdentity, blockDeviceIdentity: captured.blockDeviceIdentity,
+    kernelReadOnly: captured.kernelReadOnly, writableMounts: captured.writableMounts,
+    sourceTopDevices: captured.sourceTopDevices, sourceTopDevice: captured.sourceTopDevice,
+    sourceLoopBackings: captured.kind === "regular-file" && typeof captured.sourceLoopBackings !== "string"
+      ? stableLoopBackingIdentity(captured.sourceLoopBackings) : captured.sourceLoopBackings});
 }
 
 function flatten(nodes: LsblkNode[]): LsblkNode[] {

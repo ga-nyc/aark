@@ -998,10 +998,46 @@ test("stale pending events are replaced in the same tick without bypassing trans
   assert.notEqual(current[0]!.event.eventId, failed.event.eventId);
   assert.equal(state.outbox.find(entry => entry.event.eventId === failed.event.eventId)!.status, "processed");
   assert.equal(f.agent.requests.length, 1);
+  assert.equal(state.health, "agent-unavailable");
   now = failed.nextDeliveryAt;
   await tick(supervisor);
   assert.equal(f.agent.requests.length, 2);
   assert.equal(f.agent.requests[1]!.event.eventId, current[0]!.event.eventId);
+  assert.equal((await loadCaseState(f.control)).state.health, "awaiting-agent");
+});
+
+test("retired observation delivery failures do not mask a native signal pause after recovery", linuxOnly, async t => {
+  const f = await fixture();
+  await initializeCase(f.filename, {execute: true});
+  let now = Date.now();
+  const supervisor = await CaseSupervisor.open(f.control, {host: f.host, agent: f.agent, clock: () => now});
+  t.after(() => supervisor.close());
+  await tick(supervisor);
+  const identity = f.host.launches[0]!.identity;
+  f.host.observations.set(identity.unit, {status: "unknown"});
+  await tick(supervisor);
+  assert.equal(f.agent.requests[0]!.event.reason, "observation-unavailable");
+  f.agent.requests[0]!.reject(new Error("synthetic retired transport failure"));
+  await settle();
+  await tick(supervisor);
+  const failed = (await loadCaseState(f.control)).state;
+  const deadline = failed.outbox[0]!.nextDeliveryAt;
+  assert.ok(deadline > now);
+  assert.equal(failed.health, "agent-unavailable");
+  f.host.observations.set(identity.unit, {status: "paused", pauseReason: "signal"});
+  await tick(supervisor);
+  const paused = (await loadCaseState(f.control)).state;
+  assert.equal(paused.outbox[0]!.status, "processed");
+  assert.equal(paused.outbox[0]!.nextDeliveryAt, deadline, "retiring work preserves the durable dispatch cooldown");
+  assert.equal(paused.health, "degraded", "a historical failure does not affect health without a pending delivery");
+  now += 10 * 60_000;
+  await tick(supervisor, 2);
+  const recovered = (await loadCaseState(f.control)).state;
+  assert.ok(recovered.outbox[0]!.nextDeliveryAt < now);
+  assert.equal(recovered.health, "degraded");
+  assert.equal(recovered.jobs[0]!.attempts[0]!.observation?.pauseReason, "signal");
+  assert.equal(f.agent.requests.length, 1);
+  assert.equal(f.host.launches.length, 1);
 });
 
 test("new failures and supervisor restart preserve consecutive transport backoff", linuxOnly, async () => {

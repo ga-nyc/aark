@@ -13,7 +13,7 @@ import type { CommandProgress } from "../core/command.js";
 import { assertStageMinimumCapacity, estimateStageBytes, stageCapacityForecast } from "./assessment.js";
 import type { RecoveryConfig, RecoveryPlan, RecoveryRunStatus, RecoveryStep } from "./types.js";
 import { buildRecoveryPlan } from "./plan.js";
-import { inspectSourceSafety } from "./source-safety.js";
+import { inspectSourceSafety, recoverySourceIdentity } from "./source-safety.js";
 import type { SourceSafety } from "./source-safety.js";
 import { renderRecoveryRedactedReport, renderRecoverySensitiveReport } from "./report.js";
 import { acquireReusedUnallocatedStream } from "./reuse-unallocated.js";
@@ -457,6 +457,7 @@ export async function runRecoveryPlan(
   cliExecute: boolean,
   signal?: AbortSignal,
   onProgress?: (snapshot: Record<string, unknown>) => void,
+  expectedSourceIdentities?: ReadonlyMap<string, string>,
 ): Promise<Record<string, JsonValue>> {
   if (!config.execute || !cliExecute) throw new Error("execution requires execute=true in the case config and --execute on the CLI");
   if (JSON.stringify(plan) !== JSON.stringify(buildRecoveryPlan(config))) {
@@ -465,7 +466,7 @@ export async function runRecoveryPlan(
   const reused = config.unallocatedStreamFromCase === undefined ? undefined : await acquireReusedUnallocatedStream(config);
   let failure: unknown;
   try {
-    return await runRecoveryPlanWithSource(config, plan, cliExecute, signal, onProgress, reused);
+    return await runRecoveryPlanWithSource(config, plan, cliExecute, signal, onProgress, reused, expectedSourceIdentities);
   } catch (error) {
     failure = error;
     throw error;
@@ -485,18 +486,34 @@ async function runRecoveryPlanWithSource(
   signal?: AbortSignal,
   onProgress?: (snapshot: Record<string, unknown>) => void,
   reused?: ReusedUnallocatedStream,
+  expectedSourceIdentities?: ReadonlyMap<string, string>,
 ): Promise<Record<string, JsonValue>> {
   if (!config.execute || !cliExecute) throw new Error("execution requires execute=true in the case config and --execute on the CLI");
   const canonicalPlan = buildRecoveryPlan(config);
   if (JSON.stringify(plan) !== JSON.stringify(canonicalPlan)) {
     throw new Error("refusing to execute a recovery plan that does not exactly match the supplied configuration");
   }
+  const analysisGeneratedByPlan = config.image.enabled
+    && path.resolve(plan.analysisSource) === path.resolve(config.image.path);
+  const originalSources = [config.source, ...(config.analysisSource === undefined
+    || path.resolve(config.analysisSource) === path.resolve(config.source) || analysisGeneratedByPlan ? [] : [config.analysisSource])];
+  if (expectedSourceIdentities !== undefined && (expectedSourceIdentities.size !== originalSources.length
+    || originalSources.some(source => !expectedSourceIdentities.has(source)))) throw new Error("recovery source identity differs from workflow authorization");
+  const authorize = (source: string, safety: SourceSafety): void => {
+    if (expectedSourceIdentities !== undefined && expectedSourceIdentities.get(source) !== recoverySourceIdentity(safety)) {
+      throw new Error("recovery source identity differs from workflow authorization");
+    }
+  };
   const storagePolicy = storagePolicyFromGiB(plan.storage.minFreeGiB, plan.storage.minFreePercent, plan.storage.maxOutputGiB);
   const destinationParent = await nearestExistingParent(plan.destination);
   await reused?.assertCurrent();
   assertSupportedOutputMount(await mountForPath(destinationParent));
   await assertStorageCapacity(destinationParent, storagePolicy);
   const safety = await inspectSourceSafety(config.source, plan.destination);
+  // Bind the actual native baseline before creating outputs or starting engines.
+  // Subsequent native checks retain this same baseline rather than recapturing
+  // authorization from a potentially rebound path.
+  authorize(config.source, safety);
   await assertLoopBackingCapacity(safety.destinationLoopBackings, storagePolicy);
   if (inside(plan.destination, safety.resolvedSource)) {
     throw new Error("the canonical recovery source must not be stored inside its case destination");
@@ -510,8 +527,6 @@ async function runRecoveryPlanWithSource(
   if (config.requireReadOnlySource && safety.kind === "block-device" && (!safety.kernelReadOnly || safety.writableMounts.length > 0)) {
     throw new Error(`source safety preflight failed: ${safety.reasons.join("; ")}`);
   }
-  const analysisGeneratedByPlan = config.image.enabled
-    && path.resolve(plan.analysisSource) === path.resolve(config.image.path);
   const evidenceRoot = path.join(plan.destination, "evidence");
   let analysisDestinationResident = analysisGeneratedByPlan;
   let analysisSafety: Awaited<ReturnType<typeof inspectSourceSafety>> | undefined;
@@ -521,6 +536,7 @@ async function runRecoveryPlanWithSource(
     && !analysisGeneratedByPlan
   ) {
     analysisSafety = await inspectSourceSafety(config.analysisSource, plan.destination);
+    authorize(config.analysisSource, analysisSafety);
     analysisDestinationResident = inside(evidenceRoot, analysisSafety.resolvedSource);
     if (inside(plan.destination, analysisSafety.resolvedSource) && !analysisDestinationResident) {
       throw new Error("the canonical case-local analysisSource escaped its reserved evidence directory");

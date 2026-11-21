@@ -393,8 +393,12 @@ export class CaseSupervisor {
     else if (statuses.includes("failed")) this.queueDecision("job-failed");
     else if (this.state.jobs.some(job => { const latest = job.attempts.at(-1); return latest?.status === "paused" && latest.resumeReady === true; })) this.queueDecision("job-paused");
     else if (unavailableBeforeCapacity) this.queueDecision("observation-unavailable");
+    const pendingDelivery = this.state.outbox.some(row => row.status === "pending");
+    // Historical failures still constrain dispatch, but health describes work
+    // that is currently waiting and only while its transport deadline is live.
+    const transportBlocked = pendingDelivery && this.clock() < this.transportBackoffUntil();
     this.state.health = this.state.permissionReason !== undefined ? "awaiting-permission"
-      : !this.agentReady || this.transportBackoffUntil() > 0 || (this.state.agentRequests >= this.config.agent.maxRequests && this.state.outbox.some(row => row.status === "pending")) ? "agent-unavailable"
+      : !this.agentReady || transportBlocked || (this.state.agentRequests >= this.config.agent.maxRequests && pendingDelivery) ? "agent-unavailable"
       : this.observationUnavailable ? "observation-unavailable"
       : this.state.outbox.some(row => row.status !== "processed") ? "awaiting-agent"
       : this.capacityWaiting || statuses.some(status => status === "failed" || status === "paused") ? "degraded" : "healthy";
