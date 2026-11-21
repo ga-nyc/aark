@@ -2,7 +2,6 @@
 """Synthetic tests; every subprocess is mocked and state stays in temp dirs."""
 import concurrent.futures
 import contextlib
-import datetime
 import importlib.util
 import io
 import json
@@ -125,34 +124,50 @@ class LocalNotifierTests(unittest.TestCase):
         self.assertTrue(all(command[1] == 'show' for command in self.all_commands
                             if command[0] == 'systemctl'))
 
-    def test_live_notification_id_replaced_only_on_same_bus_and_server(self):
-        self.notifier.alert(self.unit)
-        record = self.notifier.alert(self.unit, invocation_id='run-two')
-        self.assertEqual(record['replacesNotificationId'], 17)
-        self.assertIn('--replace-id', self.notification_commands[-1])
-        self.server = 'another-bus|:1.15'
-        record = self.notifier.alert(self.unit, invocation_id='run-three')
-        self.assertNotIn('replacesNotificationId', record)
-        self.assertNotIn('--replace-id', self.notification_commands[-1])
-        self.server = 'another-bus|:1.16'
-        record = self.notifier.alert(self.unit, invocation_id='run-four')
-        self.assertNotIn('replacesNotificationId', record)
+    def check_restart_does_not_replace_a_reused_notification_id(self, successor):
+        legacy = self.notifier.alert(self.unit)
+        legacy['notificationServerId'] = self.server
+        state = self.state()
+        state['deliveries'][legacy['deliveryKey']] = legacy
+        state['notifications'][self.unit] = {'id': 17, 'serverId': self.server,
+            'acceptedTime': legacy['deliveryAcceptedTime'], 'expireTimeoutMs': 15000}
+        (self.root / 'delivery-state.json').write_text(json.dumps(state))
+        (self.root / 'alerts-redacted.ndjson').write_text(json.dumps(legacy) + '\n')
+        unrelated = {17: 'unrelated notification in successor'}
+        self.delivery_results = [(0, '23\n')]
 
-    def test_expired_notification_id_is_not_replaced(self):
-        self.notifier.alert(self.unit)
-        later = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(minutes=1)
-        with mock.patch.object(notify_local.datetime, 'datetime', wraps=datetime.datetime) as clock:
-            clock.now.return_value = later
-            record = self.notifier.alert(self.unit, invocation_id='run-two')
-        self.assertNotIn('replacesNotificationId', record)
+        def restart_during_delivery(command, **kwargs):
+            if '/usr/bin/notify-send' in command:
+                self.server = successor
+                if '--replace-id' in command:
+                    unrelated[int(command[command.index('--replace-id') + 1])] = 'replaced'
+            return self.run_command(command, **kwargs)
 
-    def test_unknown_server_identity_delivers_without_replacement(self):
-        self.notifier.alert(self.unit)
-        with mock.patch.object(self.notifier, '_notification_server_id', side_effect=RuntimeError('private')):
+        with mock.patch.object(notify_local.subprocess, 'run', side_effect=restart_during_delivery):
             record = self.notifier.alert(self.unit, invocation_id='run-two')
+        self.assertEqual(unrelated[17], 'unrelated notification in successor')
         self.assertTrue(record['desktopDeliveryAccepted'])
-        self.assertIn('notificationServerIdentityError', record)
+        self.assertEqual(record['notificationId'], 23)
         self.assertNotIn('--replace-id', self.notification_commands[-1])
+        self.assertNotIn('replacesNotificationId', record)
+        self.assertNotIn('notificationServerId', record)
+        self.assertNotIn('notificationServerIdentityError', record)
+        self.assertFalse(any('/usr/bin/busctl' in command for command in self.all_commands))
+        self.assertIsNone(self.notifier.alert(self.unit, invocation_id='run-two'))
+        self.assertEqual(len(self.notification_commands), 2)
+        return legacy
+
+    def test_daemon_restart_cannot_replace_a_successors_reused_id_or_claim_old_owner(self):
+        self.check_restart_does_not_replace_a_reused_notification_id('synthetic-bus|:1.16')
+
+    def test_bus_restart_cannot_replace_reused_id_even_when_unique_owner_is_reused(self):
+        self.check_restart_does_not_replace_a_reused_notification_id('successor-bus|:1.15')
+
+    def test_legacy_owner_receipts_remain_deduplicated_after_state_loss(self):
+        legacy = self.check_restart_does_not_replace_a_reused_notification_id('synthetic-bus|:1.16')
+        (self.root / 'delivery-state.json').unlink()
+        self.assertIsNone(self.notifier.alert(self.unit, invocation_id=legacy['invocationId']))
+        self.assertEqual(len(self.notification_commands), 2)
 
     def test_watch_skips_active_units_and_suppresses_repeated_failure(self):
         with contextlib.redirect_stdout(io.StringIO()):

@@ -17,7 +17,6 @@ import json
 import os
 from pathlib import Path
 import re
-import shlex
 import stat
 import subprocess
 import sys
@@ -171,14 +170,6 @@ class LocalNotifier:
         old = state['deliveries'].get(key, {})
         if not old.get('desktopDeliveryAccepted') or record.get('desktopDeliveryAccepted'):
             state['deliveries'][key] = record
-        notification_id = record.get('notificationId')
-        server_id = record.get('notificationServerId')
-        if record.get('desktopDeliveryAccepted') and notification_id and server_id:
-            state['notifications'][record['unit']] = {
-                'id': notification_id, 'serverId': server_id,
-                'acceptedTime': record.get('deliveryAcceptedTime'),
-                'expireTimeoutMs': record.get('expireTimeoutMs'),
-            }
 
     def _valid_delivery(self, record):
         try:
@@ -191,6 +182,8 @@ class LocalNotifier:
             return False
 
     def _load_state(self):
+        # Keep accepting the legacy notifications cache, but never use its IDs
+        # for replacement: independent bus probes cannot bind notify-send to it.
         state = {'version': 2, 'deliveries': {}, 'notifications': {}, 'statusErrors': {}}
         warning = None
         try:
@@ -256,29 +249,6 @@ class LocalNotifier:
                 invocation_id = 'systemd-' + start + '-' + end
         return active, invocation_id
 
-    def _notification_server_id(self):
-        values = []
-        for method, arguments in (
-                ('GetId', []), ('GetNameOwner', ['s', 'org.freedesktop.Notifications'])):
-            result = subprocess.run(
-                self.user_command + ['/usr/bin/busctl', '--address=' + self.bus_address, '--no-pager',
-                                'call', 'org.freedesktop.DBus', '/org/freedesktop/DBus',
-                                'org.freedesktop.DBus', method] + arguments,
-                capture_output=True, text=True, timeout=10)
-            words = shlex.split(result.stdout)
-            if result.returncode or len(words) != 2 or words[0] != 's' or not words[1]:
-                raise RuntimeError('Notification server identity unavailable')
-            values.append(words[1])
-        return '|'.join(values)
-
-    def _notification_is_live(self, notification):
-        try:
-            accepted = datetime.datetime.fromisoformat(notification['acceptedTime'])
-            age = (datetime.datetime.now(datetime.timezone.utc) - accepted).total_seconds()
-            return 0 <= age < notification['expireTimeoutMs'] / 1000
-        except (KeyError, TypeError, ValueError):
-            return False
-
     def _deliver(self, state, unit, event, invocation_id, state_warning=None):
         key = _key(unit, invocation_id, event)
         previous = state['deliveries'].get(key, {})
@@ -293,22 +263,9 @@ class LocalNotifier:
         }
         if state_warning:
             record['stateRecoveredAfterError'] = state_warning
-        server_id = None
-        try:
-            server_id = self._notification_server_id()
-            record['notificationServerId'] = server_id
-        except (OSError, RuntimeError, ValueError, subprocess.SubprocessError) as exc:
-            record['notificationServerIdentityError'] = _error(exc)
         command = self.user_command + [
             '/usr/bin/notify-send', '--print-id', '-u', 'normal',
             '-t', str(NOTIFICATION_TIMEOUT_MS), '-a', 'AARK']
-        previous_notification = state['notifications'].get(unit, {})
-        if (server_id and previous_notification.get('serverId') == server_id
-                and self._notification_is_live(previous_notification)):
-            notification_id = previous_notification.get('id')
-            if type(notification_id) is int and 0 < notification_id <= 0xffffffff:
-                command += ['--replace-id', str(notification_id)]
-                record['replacesNotificationId'] = notification_id
         command += ['AARK: ' + event, unit + ': inspect the local redacted status.']
         try:
             result = subprocess.run(command, capture_output=True, text=True, timeout=15)
