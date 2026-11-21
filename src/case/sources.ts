@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import { lstat, realpath } from "node:fs/promises";
 import path from "node:path";
 import { assertNoSymlinkComponents, nearestExistingParent } from "../core/fs-safe.js";
-import { inspectSourceSafety } from "../recovery/source-safety.js";
+import { hasBlockMediaIdentity, inspectSourceSafety } from "../recovery/source-safety.js";
 import { overlaps, type WorkflowConfig } from "../workflow/config.js";
 import { workflowSourceIdentity } from "../workflow/verify.js";
 import type { CaseConfig, CaseSourceBinding, CaseSourceBindings } from "./types.js";
@@ -70,7 +70,7 @@ export async function captureSourceBindings(config: WorkflowConfig, sources = wo
     if (!originals.has(source) || seen.has(source)) throw new CaseSourceIdentityError();
     seen.add(source);
     const safety = await inspectSourceSafety(source, config.output);
-    if (!safety.safe) throw new CaseSourceIdentityError();
+    if (!safety.safe || !hasBlockMediaIdentity(safety)) throw new CaseSourceIdentityError();
     result.push({source, sha256: fingerprint(workflowSourceIdentity(safety))});
   }
   return result;
@@ -91,6 +91,7 @@ export async function assertSourceBindings(config: WorkflowConfig, bindings: Cas
   if (!Array.isArray(bindings) || (resultsSafety !== undefined && (!Array.isArray(resultsSafety) || resultsSafety.length !== originals.length))) {
     throw new CaseSourceIdentityError();
   }
+  if (resultsSafety?.some(value => !hasBlockMediaIdentity(value))) throw new CaseSourceIdentityError();
   const seen = new Set<string>();
   for (const binding of bindings) {
     if (typeof binding !== "object" || binding === null || Object.keys(binding).some(key => !["source", "sha256"].includes(key))
@@ -104,7 +105,7 @@ export async function assertSourceBindings(config: WorkflowConfig, bindings: Cas
       identity = captured;
     } else {
       const safety = await inspectSourceSafety(binding.source, config.output);
-      if (!safety.safe) throw new CaseSourceIdentityError();
+      if (!safety.safe || !hasBlockMediaIdentity(safety)) throw new CaseSourceIdentityError();
       identity = workflowSourceIdentity(safety);
     }
     if (fingerprint(identity) !== binding.sha256) throw new CaseSourceIdentityError();

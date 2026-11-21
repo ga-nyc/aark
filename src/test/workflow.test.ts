@@ -280,7 +280,9 @@ test("clean native mining pauses resume through the workflow checkpoint", async 
 test("source guards tolerate destination writes while preserving source and container bindings", () => {
   const backing = {device: "synthetic-loop", backingFile: "/synthetic/container", fileDevice: "1", fileInode: "2",
     bytes: 1000, offset: 0, sizeLimit: 0, mount: "synthetic-mount", modifiedNs: "1", changedNs: "1"} as unknown as LoopBackingIdentity;
-  const base = {sourceLoopBackings: [backing], destinationLoopBackings: [backing]} as unknown as SourceSafety;
+  const base = {kind: "block-device", sourceLoopBackings: [backing], destinationLoopBackings: [backing],
+    blockDeviceIdentity: {device: 1, inode: 2, rawDevice: 2048, media: {version: 1, bootId: "11111111-1111-1111-1111-111111111111",
+      devices: [{device: "/dev/synthetic", majorMinor: "8:0", diskseq: "1", parent: null, slaves: []}]}}} as unknown as SourceSafety;
   const expected = workflowSourceIdentity(base);
   assert.equal(recoverySourceIdentity(base), recoverySourceIdentity(expected), "block-source fingerprints survive the native handoff");
   assert.equal(recoverySourceIdentity({...base, destinationDevice: "different-output", destinationLoopBackings: []}), recoverySourceIdentity(base));

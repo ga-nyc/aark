@@ -58,8 +58,8 @@ export interface CompletionProof {
 }
 export interface EngineHost {
   preflight(): Promise<void>;
-  /** token is a persisted idempotency key; repeat launch must attach, not duplicate. */
-  launch(attempt: PreparedAttempt, token: string, mode: "run" | "resume"): Promise<EngineIdentity>;
+  /** token is a persisted idempotency key; repeat launch attaches, never duplicates. Cancellation only prevents new submission. */
+  launch(attempt: PreparedAttempt, token: string, mode: "run" | "resume", signal?: AbortSignal): Promise<EngineIdentity>;
   /** Reconcile an uncertain launch without starting an absent engine. */
   reattach?(attempt: PreparedAttempt, token: string, mode: "run" | "resume"): Promise<EngineIdentity | undefined>;
   /** Fresh capacity check for an unchanged, clean free-space pause. */

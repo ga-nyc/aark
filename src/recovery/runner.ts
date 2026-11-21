@@ -392,7 +392,15 @@ async function validateMountedReadOnlyInput(root: string, input: string): Promis
   return resolvedInput;
 }
 
-async function validateCaseDestination(destination: string, plan: RecoveryPlan, lockHeld = false): Promise<void> {
+/** A quota retry keeps its original media authorization, including legacy raw refusal. */
+export function assertRecoveryQuotaSourceCurrent(stored: unknown, current: SourceSafety): void {
+  try {
+    if (typeof stored !== "object" || stored === null || Array.isArray(stored)
+      || recoverySourceIdentity(stored as SourceSafety) !== recoverySourceIdentity(current)) throw new Error();
+  } catch { throw new Error("recovery quota source identity differs from its original checkpoint"); }
+}
+
+async function validateCaseDestination(destination: string, plan: RecoveryPlan, safety: SourceSafety, lockHeld = false): Promise<void> {
   let metadata: Awaited<ReturnType<typeof lstat>>;
   try {
     metadata = await lstat(destination);
@@ -425,7 +433,7 @@ async function validateCaseDestination(destination: string, plan: RecoveryPlan, 
       const marker = await lstat(safeJoin(destination, filename));
       if (marker.isSymbolicLink() || !marker.isFile() || marker.nlink !== 1) throw new Error("existing recovery case markers must be single-link regular, non-symbolic-link files");
     }
-    const state = await readJson<{ status?: unknown; plan?: unknown; results?: unknown }>(safeJoin(destination, "case-sensitive.json"));
+    const state = await readJson<{ status?: unknown; plan?: unknown; results?: unknown; sourceSafety?: unknown }>(safeJoin(destination, "case-sensitive.json"));
     if (state.status === "running") throw new Error("existing recovery state is still marked running; inspect the case before attempting another run");
     if (!["paused", "complete", "complete-with-warnings", "failed", "interrupted"].includes(String(state.status))) {
       throw new Error("existing recovery state does not contain a recognized terminal status");
@@ -448,6 +456,7 @@ async function validateCaseDestination(destination: string, plan: RecoveryPlan, 
     if (!quotaResume) {
       throw new Error("an existing recovery case can only be reused for its explicitly resumable ddrescue quota pause; choose a new destination for another run");
     }
+    assertRecoveryQuotaSourceCurrent(state.sourceSafety, safety);
   }
 }
 
@@ -554,7 +563,7 @@ async function runRecoveryPlanWithSource(
   const mountedReadOnlyRoot = config.mountedReadOnlyRoot === undefined
     ? undefined
     : await validateMountedReadOnlyRoot(config.mountedReadOnlyRoot);
-  await validateCaseDestination(plan.destination, plan);
+  await validateCaseDestination(plan.destination, plan, safety);
   await ensurePrivateDirectory(plan.destination);
   for (const controlPath of [
     plan.destination,
@@ -575,7 +584,7 @@ async function runRecoveryPlanWithSource(
   const locks = await acquireRecoveryLocks(plan.destination);
   let runFailure: unknown;
   try {
-  await validateCaseDestination(plan.destination, plan, true);
+  await validateCaseDestination(plan.destination, plan, safety, true);
   const targetMount = await mountForPath(plan.destination);
   if (targetMount === undefined || await mountIsNetworkBacked(targetMount)) {
     throw new Error("recovery destination no longer has a verifiable local mount");

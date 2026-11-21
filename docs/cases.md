@@ -68,8 +68,12 @@ frozen configurations are detected rather than silently adopted.
 
 Initialization pins the original recovery media and external analysis views.
 Fresh jobs and retries compare those identities at the native engine's source
-baseline, so reusing a device name for different media cannot expand the case
-authorization. Inputs that will be produced by an approved dependency remain
+baseline. Raw sources bind the kernel boot identity and disk sequence of the
+source and its underlying devices, so kernel-observed media replacement fails
+closed even if the device name and capacity are unchanged. Missing generations,
+a reboot, and legacy raw checkpoints without this binding require local review
+and new authorization. This cannot attest a physical change the driver has not
+reported. Inputs that will be produced by an approved dependency remain
 subject to that producer's exact verified attempt and native launch checks.
 
 ## Process host and restricted agent
@@ -92,7 +96,11 @@ may share a healthy destination filesystem outside the protected source trees.
 `case run` checks the configured user's desktop notification channel before
 starting services. The worker restarts after a process failure; a separate
 30-second systemd timer detects worker death, stale heartbeats, degraded work,
-and required permission. Desktop acceptance and human acknowledgement are
+and required permission. Recoverable job failures remain visible in case status
+while the bounded agent decision is pending; they do not produce a desktop
+failure notice solely because a retry decision is outstanding. Agent timeout,
+unavailable transport, exhausted requests, or a permission hold trigger that
+notice. Desktop acceptance and human acknowledgement are
 distinct. Failed deliveries retry the same durable event token. An observed
 healthy interval closes a failure incident so a later failure alerts again;
 continuous worker restart loops remain deduplicated. The notifier has a

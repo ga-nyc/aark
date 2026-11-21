@@ -116,3 +116,22 @@ test("invalid source pins fail fixed while unknown filesystem errors remain dist
   await unlink(f.source);
   await assert.rejects(assertSourceBindings(f.workflow, pins), {code: "ENOENT"});
 });
+
+test("supervised captured raw identities reject legacy snapshots and a media generation change", linuxOnly, async context => {
+  const f = await fixture(context);
+  const captured = await Promise.all(workflowExternalSources(f.workflow).map(async source =>
+    workflowSourceIdentity(await inspectSourceSafety(source, f.workflow.output))));
+  const raw = {...JSON.parse(captured[0]!), kind: "block-device", regularFileIdentity: null,
+    blockDeviceIdentity: {device: 1, inode: 2, rawDevice: 2048, media: {version: 1,
+      bootId: "11111111-1111-1111-1111-111111111111", devices: [{device: "/dev/synthetic", majorMinor: "8:0",
+        diskseq: "11", parent: null, slaves: []}]}}};
+  captured[0] = JSON.stringify(raw);
+  const pin = {source: f.source, sha256: createHash("sha256").update(captured[0]).digest("hex")};
+  await assertSourceBindings(f.workflow, [pin], captured);
+  raw.blockDeviceIdentity.media.devices[0]!.diskseq = "12";
+  await assert.rejects(assertSourceBindings(f.workflow, [pin], [JSON.stringify(raw), captured[1]!]), CaseSourceIdentityError);
+  const legacy = {...raw, blockDeviceIdentity: {device: 1, inode: 2, rawDevice: 2048}};
+  const legacyText = JSON.stringify(legacy);
+  const legacyPin = {source: f.source, sha256: createHash("sha256").update(legacyText).digest("hex")};
+  await assert.rejects(assertSourceBindings(f.workflow, [legacyPin], [legacyText, captured[1]!]), CaseSourceIdentityError);
+});

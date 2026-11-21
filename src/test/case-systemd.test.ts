@@ -67,6 +67,73 @@ function manager() {
 }
 const linux = {skip: process.platform !== "linux"};
 
+function barrier() {
+  let resolve = () => {};
+  const promise = new Promise<void>(done => { resolve = done; });
+  return {promise, resolve};
+}
+
+for (const stage of ["probe", "logs"] as const) {
+  test(`aborting ${stage} preflight prevents systemd submission without classifying engine failure`, linux, async context => {
+    const f = await fixture(), host = manager();
+    context.after(() => rm(f.root, {recursive: true, force: true}));
+    const entered = barrier(), release = barrier(), controller = new AbortController();
+    context.after(() => { controller.abort(); release.resolve(); });
+    const controlRoot = path.join(f.root, "host");
+    const engine = new SystemdEngineHost({cliPath: path.resolve("dist/cli.js"), controlRoot,
+      command: async (executable, args, options) => {
+        if (stage === "probe" && args[1] === "binding") { entered.resolve(); await release.promise; }
+        return await host.command(executable, args, options);
+      }});
+    const originalOpen = fs.promises.open;
+    fs.promises.open = async (filename, flags, mode) => {
+      if (stage === "logs" && typeof filename === "string" && filename.endsWith(".stderr.log")) {
+        entered.resolve(); await release.promise;
+      }
+      return await originalOpen(filename, flags, mode);
+    };
+    syncBuiltinESMExports();
+    try {
+      const launching = engine.launch(f.attempt, "cancelled-token", "run", controller.signal);
+      const cancelled = assert.rejects(launching, error => error instanceof Error
+        && error.name === "AbortError" && !(error instanceof EngineLaunchRefusedError));
+      await entered.promise;
+      controller.abort(); release.resolve();
+      await cancelled;
+    } finally { fs.promises.open = originalOpen; syncBuiltinESMExports(); }
+    assert.equal(host.calls.some(call => call.executable.endsWith("systemd-run")), false);
+    const receiptPath = path.join(controlRoot, "engines", `${engineUnitName("cancelled-token")}.json`);
+    if (stage === "probe") await assert.rejects(access(receiptPath));
+    else assert.equal(JSON.parse(await readFile(receiptPath, "utf8")).invocationId, undefined);
+    const identity = await engine.launch(f.attempt, "cancelled-token", "run");
+    assert.equal(identity.unit, engineUnitName("cancelled-token"));
+    assert.equal(host.calls.filter(call => call.executable.endsWith("systemd-run")).length, 1);
+    assert.ok(host.calls.every(call => call.options.signal === undefined));
+    assert.equal(host.calls.some(call => call.args.some(arg => ["kill", "stop", "restart"].includes(arg))), false);
+  });
+}
+
+test("cancellation after systemd submission leaves the independent engine and client intact", linux, async context => {
+  const f = await fixture(), host = manager();
+  context.after(() => rm(f.root, {recursive: true, force: true}));
+  const entered = barrier(), release = barrier(), controller = new AbortController();
+  context.after(() => { controller.abort(); release.resolve(); });
+  const engine = new SystemdEngineHost({cliPath: path.resolve("dist/cli.js"), controlRoot: path.join(f.root, "host"),
+    command: async (executable, args, options) => {
+      const completed = await host.command(executable, args, options);
+      if (executable.endsWith("systemd-run")) { entered.resolve(); await release.promise; }
+      return completed;
+    }});
+  const launching = engine.launch(f.attempt, "already-submitted-token", "run", controller.signal);
+  await entered.promise;
+  controller.abort(); release.resolve();
+  const identity = await launching;
+  assert.equal(identity.invocationId, "a".repeat(32));
+  assert.equal(host.calls.filter(call => call.executable.endsWith("systemd-run")).length, 1);
+  assert.ok(host.calls.every(call => call.options.signal === undefined));
+  assert.equal(host.calls.some(call => call.args.some(arg => ["kill", "stop", "restart"].includes(arg))), false);
+});
+
 test("immutable local launch refusals are explicit and cannot create an engine or receipt", linux, async context => {
   const f = await fixture();
   context.after(() => rm(f.root, {recursive: true, force: true}));

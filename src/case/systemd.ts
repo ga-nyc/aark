@@ -58,11 +58,14 @@ export class SystemdEngineHost implements EngineHost {
     this.directory = path.join(options.controlRoot, "engines");
   }
 
-  private async capture(executable: string, args: string[], timeoutMs = this.timeout): Promise<CommandResult> {
+  private async capture(executable: string, args: string[], timeoutMs = this.timeout, beforeStart?: () => void): Promise<CommandResult> {
     const key = JSON.stringify([executable, args]);
     let helper = this.helpers.get(key);
     if (helper === undefined) {
-      helper = Promise.resolve().then(() => this.command(executable, args, {timeoutMs, killGraceMs: 250, maxCaptureBytes: 64 * 1024}))
+      helper = Promise.resolve().then(() => {
+        beforeStart?.();
+        return this.command(executable, args, {timeoutMs, killGraceMs: 250, maxCaptureBytes: 64 * 1024});
+      })
         .finally(() => this.helpers.delete(key));
       this.helpers.set(key, helper);
     }
@@ -170,7 +173,8 @@ export class SystemdEngineHost implements EngineHost {
     return {unit, invocationId};
   }
 
-  public async launch(attempt: PreparedAttempt, token: string, mode: "run" | "resume"): Promise<EngineIdentity> {
+  public async launch(attempt: PreparedAttempt, token: string, mode: "run" | "resume", signal?: AbortSignal): Promise<EngineIdentity> {
+    signal?.throwIfAborted();
     const unit = engineUnitName(token);
     const receiptPath = path.join(this.directory, `${unit}.json`);
     const receipt = await this.receipt(unit);
@@ -179,12 +183,14 @@ export class SystemdEngineHost implements EngineHost {
       || (receipt.invocationId !== undefined && !/^[a-f0-9]{32}$/u.test(receipt.invocationId)))) throw new Error("case engine identity changed");
     let values = await this.show(unit);
     if (values === undefined) {
+      signal?.throwIfAborted();
       // A previously observed invocation must never be replaced under its old token.
       if (receipt?.invocationId !== undefined) throw new Error("case engine invocation disappeared");
       let submitted = false;
       try {
       await ensurePrivateDirectory(this.directory);
       const config = await this.capture(process.execPath, [PROBE, "binding", attempt.configFile, attempt.configHash, JSON.stringify(this.sourcePolicy(attempt))]);
+      signal?.throwIfAborted();
       if (config.exitCode === 2 && config.terminationReason === null && !config.stdoutTruncated && !config.stderrTruncated
         && config.stdout.toString().trim() === '{"valid":false,"reason":"source-identity-changed"}') throw new CaseSourceIdentityError();
       if (!successful(config) || config.stdout.toString().trim() !== '{"valid":true}') throw new Error("case engine configuration binding changed");
@@ -204,11 +210,23 @@ export class SystemdEngineHost implements EngineHost {
         ...(mode === "run" ? ["--config", attempt.configFile] : ["--output", attempt.workflow.output]), "--expected-config-hash", attempt.configHash,
         ...(attempt.workflow.recovery === undefined ? [] : ["--expected-source-bindings", JSON.stringify(this.sourcePolicy(attempt))]), "--execute"];
       // A client timeout can leave a successfully started service. Always reconcile it.
+      // A reused helper may already be submitting this same stable token.
       submitted = true;
-      try { await this.capture(SYSTEMD_RUN, args); } catch { /* Only the launch client may have failed. */ }
+      let cancelledBeforeStart = false;
+      try {
+        await this.capture(SYSTEMD_RUN, args, this.timeout, () => {
+          // Do not pass this signal to the client: once submitted, its engine
+          // is independent and still needs the normal identity reconciliation.
+          if (signal?.aborted) { cancelledBeforeStart = true; signal.throwIfAborted(); }
+        });
+      } catch (error) {
+        if (cancelledBeforeStart) throw error;
+        // Only the launch client may have failed.
+      }
       values = await this.show(unit);
       if (values === undefined) throw new Error("case engine launch was not observed");
       } catch (error) {
+        if (!submitted && signal?.aborted) throw error;
         if (error instanceof CaseSourceIdentityError) throw error;
         // An absent unit and no prior receipt prove this is a pre-submit
         // refusal. Once submission starts, even a timeout remains unknown.

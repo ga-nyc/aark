@@ -1,6 +1,8 @@
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
+import fs from "node:fs";
 import { access, mkdir, readFile, rename, symlink, writeFile } from "node:fs/promises";
+import { syncBuiltinESMExports } from "node:module";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -98,6 +100,12 @@ class FakeAgent implements AgentBridge {
 
 async function settle(): Promise<void> {
   await new Promise<void>(resolve => setImmediate(resolve));
+}
+
+function barrier() {
+  let resolve = () => {};
+  const promise = new Promise<void>(done => { resolve = done; });
+  return {promise, resolve};
 }
 
 async function fixture(options: {jobs?: number; attempts?: number; maxConcurrent?: number; maxRequests?: number} = {}) {
@@ -463,6 +471,99 @@ test("user pause blocks new launches and never stops existing engines", linuxOnl
   assert.ok(observation && !(observation instanceof Error));
   assert.equal(observation.status, "running");
 });
+
+test("run cancellation during observation prevents an independent launch and preserves existing engines", linuxOnly, async t => {
+  const f = await fixture({jobs: 3, maxConcurrent: 2});
+  await initializeCase(f.filename, {execute: true});
+  const supervisor = await CaseSupervisor.open(f.control, {host: f.host, agent: f.agent});
+  const controller = new AbortController(), entered = barrier(), release = barrier();
+  t.after(async () => { controller.abort(); release.resolve(); await supervisor.close(); });
+  await tick(supervisor);
+  f.host.observations.set(f.host.launches[0]!.identity.unit, {status: "failed"});
+  const observe = f.host.observe.bind(f.host);
+  f.host.observe = async identity => {
+    if (identity.unit === f.host.launches[1]!.identity.unit) { entered.resolve(); await release.promise; }
+    return await observe(identity);
+  };
+  const running = supervisor.run(controller.signal);
+  await entered.promise;
+  controller.abort(); release.resolve();
+  await running;
+  const {state} = await loadCaseState(f.control);
+  assert.equal(state.jobs[0]!.attempts[0]!.status, "failed");
+  assert.equal(state.jobs[1]!.attempts[0]!.status, "running");
+  assert.equal(state.jobs[2]!.attempts.length, 0);
+  assert.equal(f.host.launches.length, 2);
+  assert.equal(f.agent.requests.length, 0, "shutdown does not dispatch a fresh agent decision");
+  await tick(supervisor);
+  assert.equal(f.host.launches.length, 3, "an explicit manual tick remains usable after run stops");
+});
+
+test("run cancellation during quota readiness settles the observation without launching new work", linuxOnly, async t => {
+  const f = await fixture({jobs: 2, maxConcurrent: 1});
+  f.config.jobs[0]!.resumeAfterQuota = true;
+  await writeFile(f.filename, JSON.stringify(f.config));
+  await initializeCase(f.filename, {execute: true});
+  const supervisor = await CaseSupervisor.open(f.control, {host: f.host, agent: f.agent});
+  const controller = new AbortController(), entered = barrier(), release = barrier();
+  t.after(async () => { controller.abort(); release.resolve(); await supervisor.close(); });
+  await tick(supervisor);
+  f.host.observations.set(f.host.launches[0]!.identity.unit, {status: "paused", pauseReason: "free-space-reserve"});
+  f.host.resumeReady = async () => { entered.resolve(); await release.promise; return true; };
+  const running = supervisor.run(controller.signal);
+  await entered.promise;
+  controller.abort(); release.resolve();
+  await running;
+  const {state} = await loadCaseState(f.control);
+  assert.equal(state.jobs[0]!.attempts[0]!.resumeReady, true);
+  assert.equal(state.jobs[1]!.attempts.length, 0);
+  assert.equal(f.host.launches.length, 1);
+});
+
+for (const stage of ["configuration", "new-intent", "uncertain-intent"] as const) {
+  test(`run cancellation during ${stage} prelaunch work does not submit an engine`, linuxOnly, async t => {
+    const f = await fixture();
+    await initializeCase(f.filename, {execute: true});
+    if (stage === "uncertain-intent") {
+      const saved = await loadCaseState(f.control);
+      saved.state.jobs[0]!.attempts.push({index: 0, token: randomUUID(), mode: "run", status: "launching", dispatched: true});
+      await saveCaseState(f.control, saved.config, saved.state);
+    }
+    const supervisor = await CaseSupervisor.open(f.control, {host: f.host, agent: f.agent});
+    const controller = new AbortController(), entered = barrier(), release = barrier();
+    t.after(async () => { controller.abort(); release.resolve(); await supervisor.close(); });
+    const originalOpen = fs.promises.open, originalRename = fs.promises.rename;
+    let blocked = false;
+    fs.promises.open = async (filename, flags, mode) => {
+      if (stage === "configuration" && filename === f.workflowFiles[0]![0] && !blocked) {
+        blocked = true; entered.resolve(); await release.promise;
+      }
+      return await originalOpen(filename, flags, mode);
+    };
+    fs.promises.rename = async (source, destination) => {
+      if (stage !== "configuration" && destination === path.join(f.control, "case-state-sensitive.json") && !blocked) {
+        blocked = true; entered.resolve(); await release.promise;
+      }
+      await originalRename(source, destination);
+    };
+    syncBuiltinESMExports();
+    try {
+      const running = supervisor.run(controller.signal);
+      await entered.promise;
+      controller.abort(); release.resolve();
+      await running;
+    } finally {
+      fs.promises.open = originalOpen; fs.promises.rename = originalRename; syncBuiltinESMExports();
+    }
+    const {state} = await loadCaseState(f.control);
+    const attempt = state.jobs[0]!.attempts[0]!;
+    assert.equal(attempt.status, "launching");
+    assert.equal(attempt.dispatched, stage === "uncertain-intent" ? true : undefined);
+    assert.equal(attempt.launchRefused, undefined);
+    assert.equal(f.host.launches.length, 0);
+    assert.equal(state.desired, "running", "worker shutdown does not turn into a user pause");
+  });
+}
 
 test("agent retry selects only the next approved fresh output and cannot resume failure", linuxOnly, async t => {
   const f = await fixture({attempts: 2});

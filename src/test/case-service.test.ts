@@ -241,7 +241,7 @@ test("case watchdog does not treat a pending agent decision as failed supervisio
   const f = await fixture(context);
   f.state.health = "awaiting-agent";
   f.state.jobs[0]!.attempts[0]!.status = "failed";
-  f.state.jobs[0]!.attempts[0]!.observation = { status: "failed", failureCode: "unclassified-failure" };
+  f.state.jobs[0]!.attempts[0]!.observation = { status: "failed", failureCode: "scan-completed-with-errors", scanErrors: 1 };
   f.state.agentRequests = 1;
   f.state.outbox = [{ event: { version: 1, caseId: f.state.caseId, eventId: randomUUID(), revision: f.state.revision,
     reason: "job-failed", jobs: [{ id: "job-000001", status: "failed", attemptsUsed: 1, attemptsAllowed: 1, resumeAfterQuota: false }] },
@@ -251,6 +251,13 @@ test("case watchdog does not treat a pending agent decision as failed supervisio
   assert.equal(status.workerObservedActive, true);
   assert.equal(status.notificationRequired, false);
   assert.equal(f.commands.notifications().length, 0);
+  // The production bridge bounds each decision. Failure of that decision
+  // escalates the still-visible native failure to the independent watchdog.
+  f.state.health = "agent-unavailable";
+  f.state.outbox[0]!.status = "pending";
+  await f.save();
+  assert.equal((await watchCaseService(f.control, f.commands.command, NOW)).notificationRequired, true);
+  assert.equal(f.commands.event(), "failed");
 });
 
 test("case watchdog notifies unhealthy state with a stable redacted event token", linuxOnly, async (context) => {

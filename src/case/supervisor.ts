@@ -72,7 +72,7 @@ export class CaseSupervisor {
     }
   }
 
-  public tick(): Promise<void> { return this.serialized(() => this.reconcile()); }
+  public tick(signal?: AbortSignal): Promise<void> { return this.serialized(() => this.reconcile(signal)); }
   public snapshot(): Promise<Record<string, unknown>> { return this.serialized(async () => redactedCaseStatus(this.config, this.state)); }
   public pause(): Promise<void> { return this.serialized(async () => { this.setDesired("user-paused"); await this.persist(); }); }
   public resume(): Promise<void> { return this.serialized(async () => { this.setDesired("running"); await this.persist(); }); }
@@ -144,18 +144,31 @@ export class CaseSupervisor {
     }
   }
 
-  private async launch(index: number, attempt: CaseAttempt): Promise<void> {
+  private async launch(index: number, attempt: CaseAttempt, signal?: AbortSignal): Promise<void> {
+    if (signal?.aborted) return;
     const approved = this.config.jobs[index]!.attempts[attempt.index]!;
     if (attempt.mode === "resume" && attempt.dispatched !== true
       && this.state.jobs[index]!.attempts.at(-2)?.resumeReady !== true) return;
     try {
       if (digest(await loadWorkflowConfig(approved.configFile)) !== approved.configHash) throw new Error();
     } catch { this.state.permissionReason = "new-plan-required"; this.configChanged = true; return; }
+    if (signal?.aborted) return;
     // The intent is committed BEFORE making the idempotent external launch call.
+    const previousDispatch = attempt.dispatched;
     attempt.dispatched = true;
     await this.persist();
+    if (signal?.aborted) {
+      // This call never reached the host. Preserve uncertain earlier dispatches,
+      // but keep a newly prepared intent truthful and pending for a later run.
+      if (previousDispatch !== true) {
+        if (previousDispatch === undefined) delete attempt.dispatched;
+        else attempt.dispatched = previousDispatch;
+        await this.persist();
+      }
+      return;
+    }
     try {
-      attempt.identity = await this.options.host.launch(approved, attempt.token, attempt.mode);
+      attempt.identity = await this.options.host.launch(approved, attempt.token, attempt.mode, signal);
       attempt.status = "running";
       this.changed();
       await this.persist();
@@ -369,7 +382,7 @@ export class CaseSupervisor {
       .finally(() => { this.agentInFlight = false; });
   }
 
-  private async reconcile(): Promise<void> {
+  private async reconcile(signal?: AbortSignal): Promise<void> {
     await this.lease.assertHeld();
     this.locations.clear();
     await this.readCommand();
@@ -382,21 +395,25 @@ export class CaseSupervisor {
     // Listed independent jobs already have durable execution authorization.
     // Agent transport readiness gates decisions, not that approved native work;
     // explicit approval stops still gate both launch loops below.
-    if (this.state.desired === "running") {
+    if (this.state.desired === "running" && !signal?.aborted) {
       for (let i = 0; i < this.state.jobs.length; i++) {
+        if (signal?.aborted) break;
         const job = this.state.jobs[i]!;
         const attempt = job.attempts.at(-1);
         const occupied = this.state.jobs.filter(other => { const last = other.attempts.at(-1); return last?.status === "running" || (last?.status === "launching" && last.dispatched === true); }).length;
         if (attempt?.status === "launching" && this.state.permissionReason === undefined && !this.configChanged
           && !unavailableReattachments.has(attempt.token)
-          && (attempt.dispatched === true || (occupied < this.config.maxConcurrent && await this.dependenciesReady(i, attempt.index)))) await this.launch(i, attempt);
+          && (attempt.dispatched === true || (occupied < this.config.maxConcurrent && await this.dependenciesReady(i, attempt.index)))
+          && !signal?.aborted) await this.launch(i, attempt, signal);
       }
       for (let i = 0; i < this.state.jobs.length; i++) {
+        if (signal?.aborted) break;
         if (this.state.jobs.filter(job => { const latest = job.attempts.at(-1); return latest?.status === "running"
           || (latest?.status === "launching" && latest.dispatched === true); }).length >= this.config.maxConcurrent) break;
         const job = this.state.jobs[i]!;
-        if (this.state.permissionReason === undefined && !this.configChanged && job.attempts.length === 0 && await this.dependenciesReady(i, 0)) {
-          this.newAttempt(i, "run"); await this.launch(i, job.attempts.at(-1)!);
+        if (this.state.permissionReason === undefined && !this.configChanged && job.attempts.length === 0 && await this.dependenciesReady(i, 0)
+          && !signal?.aborted) {
+          this.newAttempt(i, "run"); await this.launch(i, job.attempts.at(-1)!, signal);
         }
       }
     }
@@ -424,12 +441,12 @@ export class CaseSupervisor {
       : this.state.outbox.some(row => row.status !== "processed") ? "awaiting-agent"
       : this.capacityWaiting || statuses.some(status => status === "failed" || status === "paused") ? "degraded" : "healthy";
     await this.persist();
-    await this.dispatch();
+    if (!signal?.aborted) await this.dispatch();
   }
 
   public async run(signal: AbortSignal): Promise<void> {
     while (!signal.aborted && !this.closed) {
-      await this.tick();
+      await this.tick(signal);
       if (signal.aborted) break;
       await new Promise<void>(resolve => {
         const done = () => { clearTimeout(timer); signal.removeEventListener("abort", done); resolve(); };
