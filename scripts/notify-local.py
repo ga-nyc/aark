@@ -28,6 +28,7 @@ EVENTS = {'failed', 'paused', 'complete', 'notification-test'}
 NOTIFICATION_TIMEOUT_MS = 15000
 DEFAULT_STATE_DIRECTORY = Path('/var/lib/aark-alerts')
 UNIT_STEM_PATTERN = r'(?:[A-Za-z0-9_@.:-]|\\x[0-9a-fA-F]{2})+'
+COMMAND_ENV = {'PATH': '/usr/sbin:/usr/bin:/sbin:/bin', 'LANG': 'C.UTF-8', 'LC_ALL': 'C.UTF-8'}
 
 
 def _now():
@@ -291,10 +292,10 @@ class LocalNotifier:
 
     def _unit_status(self, unit):
         result = subprocess.run(
-            ['systemctl', 'show', unit + '.service', '--no-pager',
+            ['/usr/bin/systemctl', 'show', unit + '.service', '--no-pager',
              '-p', 'ActiveState', '-p', 'InvocationID',
              '-p', 'ExecMainStartTimestampMonotonic', '-p', 'ExecMainExitTimestampMonotonic'],
-            capture_output=True, text=True, timeout=10)
+            capture_output=True, text=True, timeout=10, env=COMMAND_ENV)
         if result.returncode:
             raise RuntimeError('systemctl status query failed')
         fields = dict(line.split('=', 1) for line in result.stdout.splitlines() if '=' in line)
@@ -329,7 +330,7 @@ class LocalNotifier:
             '-t', str(NOTIFICATION_TIMEOUT_MS), '-a', 'AARK']
         command += ['AARK: ' + event, unit + ': inspect the local redacted status.']
         try:
-            result = subprocess.run(command, capture_output=True, text=True, errors='replace', timeout=15)
+            result = subprocess.run(command, capture_output=True, text=True, errors='replace', timeout=15, env=COMMAND_ENV)
             record['desktopDeliveryAccepted'] = result.returncode == 0
             if result.returncode:
                 record['deliveryError'] = 'notify-send returned ' + str(result.returncode)

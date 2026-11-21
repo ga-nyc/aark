@@ -51,7 +51,10 @@ class LocalNotifierTests(unittest.TestCase):
         self.all_commands.append(command)
         self.assertNotIn('shell', kwargs)
         self.assertGreater(kwargs['timeout'], 0)
-        if command[0] == 'systemctl':
+        self.assertEqual(kwargs['env'], {'PATH': '/usr/sbin:/usr/bin:/sbin:/bin',
+                                        'LANG': 'C.UTF-8', 'LC_ALL': 'C.UTF-8'})
+        self.assertTrue(command[0].startswith('/'))
+        if command[0] == '/usr/bin/systemctl':
             self.assertEqual(command[1], 'show')
             active, invocation = self.status[notify_local._unit_stem(command[2])]
             if isinstance(active, Exception):
@@ -159,6 +162,30 @@ class LocalNotifierTests(unittest.TestCase):
         self.assertEqual(record['notificationId'], 17)
         self.assertNotIn('fixture-private-error', json.dumps(record))
 
+    def test_child_commands_exclude_parent_credentials_path_and_bus_overrides(self):
+        observed = []
+
+        def inspect(command, **kwargs):
+            observed.append((command, kwargs.get('env')))
+            return self.run_command(command, **kwargs)
+
+        inherited = {'PATH': '/synthetic/untrusted-bin', 'AARK_SYNTHETIC_SECRET': 'private-value',
+                     'LD_PRELOAD': '/synthetic/untrusted.so', 'PYTHONPATH': '/synthetic/private-modules',
+                     'DBUS_SESSION_BUS_ADDRESS': 'tcp:host=192.0.2.1,port=12345'}
+        with mock.patch.dict(os.environ, inherited), \
+                mock.patch.object(notify_local.subprocess, 'run', side_effect=inspect):
+            self.assertTrue(self.notifier.alert(self.unit)['desktopDeliveryAccepted'])
+        self.assertEqual([command[0] for command, _ in observed], ['/usr/bin/systemctl', '/usr/sbin/runuser'])
+        for _, environment in observed:
+            self.assertEqual(set(environment), {'PATH', 'LANG', 'LC_ALL'})
+            self.assertNotEqual(environment['PATH'], inherited['PATH'])
+            self.assertNotIn('private-value', json.dumps(environment))
+        delivery = observed[-1][0]
+        self.assertIn('/usr/bin/env', delivery)
+        self.assertIn('/usr/bin/notify-send', delivery)
+        self.assertIn('DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/4242/bus', delivery)
+        self.assertNotIn('DBUS_SESSION_BUS_ADDRESS=' + inherited['DBUS_SESSION_BUS_ADDRESS'], delivery)
+
     def test_malformed_optional_notification_ids_never_erase_accepted_delivery(self):
         invalid = ['²\n', '１２\n', '\ufffd\n', '9' * 5000, '4294967296\n',
                    '0\n', 'synthetic-private-metadata\n']
@@ -196,7 +223,7 @@ class LocalNotifierTests(unittest.TestCase):
         self.assertEqual(failed['deliveryError'], 'TimeoutExpired')
         self.assertTrue(self.notifier.alert(self.unit)['desktopDeliveryAccepted'])
         self.assertTrue(all(command[1] == 'show' for command in self.all_commands
-                            if command[0] == 'systemctl'))
+                            if command[0] == '/usr/bin/systemctl'))
 
     def check_restart_does_not_replace_a_reused_notification_id(self, successor):
         legacy = self.notifier.alert(self.unit)
@@ -265,7 +292,7 @@ class LocalNotifierTests(unittest.TestCase):
             self.assertEqual(notify_local.main(options), 0)
             self.assertEqual(notify_local.main(options), 0)
         self.assertEqual(self.journal()[0]['invocationId'], old_invocation)
-        self.assertFalse(any(command[0] == 'systemctl' for command in self.all_commands))
+        self.assertFalse(any(command[0] == '/usr/bin/systemctl' for command in self.all_commands))
         self.assertIsNone(self.notifier.alert(self.unit))
         self.status[self.unit] = ('failed', next_invocation)
         with contextlib.redirect_stdout(io.StringIO()):
@@ -314,7 +341,7 @@ class LocalNotifierTests(unittest.TestCase):
         (self.root / 'delivery-state.json').unlink()
         with contextlib.redirect_stdout(io.StringIO()):
             self.assertEqual(self.notifier.watch(), [])
-        queried = [command[2] for command in self.all_commands if command[0] == 'systemctl']
+        queried = [command[2] for command in self.all_commands if command[0] == '/usr/bin/systemctl']
         self.assertEqual(queried, ['worker.service', 'worker.service.service'])
         self.assertEqual(len(self.notification_commands), 2)
         self.assertIsNone(self.notifier.alert('worker.service.service'))
@@ -339,7 +366,7 @@ class LocalNotifierTests(unittest.TestCase):
         with contextlib.redirect_stdout(io.StringIO()):
             self.assertEqual(self.notifier.watch(), [])
         self.assertIsNone(self.notifier.on_failure(external, '1' * 32))
-        queried = [command[2] for command in self.all_commands if command[0] == 'systemctl']
+        queried = [command[2] for command in self.all_commands if command[0] == '/usr/bin/systemctl']
         self.assertEqual(queried, [external] * 3)
         self.assertEqual(len(self.notification_commands), 2)
         # Hex spelling remains an exact allowlist identity, with no decoding.
@@ -476,7 +503,7 @@ class LocalNotifierTests(unittest.TestCase):
         self.check_allowlist_change_preserves_cache_only_delivery(True)
 
     def test_status_error_is_recorded_and_later_poll_retries(self):
-        self.status[self.unit] = (subprocess.TimeoutExpired('systemctl', 10), '')
+        self.status[self.unit] = (subprocess.TimeoutExpired('/usr/bin/systemctl', 10), '')
         failed = self.notifier.alert(self.unit, only_if_failed=True)
         self.assertFalse(failed['desktopDeliveryAttempted'])
         self.assertEqual(failed['statusQueryError'], 'TimeoutExpired')
@@ -486,7 +513,7 @@ class LocalNotifierTests(unittest.TestCase):
         self.assertTrue(self.notifier.alert(self.unit)['desktopDeliveryAccepted'])
 
     def test_healthy_status_recovery_clears_error_without_notification(self):
-        self.status[self.unit] = (subprocess.TimeoutExpired('systemctl', 10), '')
+        self.status[self.unit] = (subprocess.TimeoutExpired('/usr/bin/systemctl', 10), '')
         self.notifier.alert(self.unit, only_if_failed=True)
         self.status[self.unit] = ('active', '')
         recovered = self.notifier.alert(self.unit, only_if_failed=True)
@@ -498,7 +525,7 @@ class LocalNotifierTests(unittest.TestCase):
 
     def test_status_recovery_persists_when_delivery_was_already_accepted(self):
         self.notifier.alert(self.unit)
-        self.status[self.unit] = (subprocess.TimeoutExpired('systemctl', 10), '')
+        self.status[self.unit] = (subprocess.TimeoutExpired('/usr/bin/systemctl', 10), '')
         self.notifier.alert(self.unit)
         self.status[self.unit] = ('failed', 'run-one')
         self.assertIsNone(self.notifier.alert(self.unit))
@@ -760,7 +787,7 @@ class LocalNotifierTests(unittest.TestCase):
         self.assertEqual(records[0]['deliveryKey'], rejected['deliveryKey'])
         self.assertEqual(records[0]['invocationId'], '1' * 32)
         self.assertTrue(records[0]['desktopDeliveryAccepted'])
-        self.assertFalse(any(command[0] == 'systemctl' for command in self.all_commands))
+        self.assertFalse(any(command[0] == '/usr/bin/systemctl' for command in self.all_commands))
         self.assertEqual(len(self.notification_commands), 2)
 
     def test_cli_pending_failure_retry_is_bounded_and_retains_delivery_failure_exit(self):
