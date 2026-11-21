@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawn, type ChildProcess } from "node:child_process";
-import { readFile, rename, writeFile } from "node:fs/promises";
+import { chmod, chown, mkdir, readFile, rename, stat, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -83,4 +83,53 @@ test("case lease detects lock pathname replacement and release preserves the rep
     await assert.rejects(lease.assertHeld(), /binding changed/);
   } finally { await lease.release(); }
   assert.equal(await readFile(filename, "utf8"), "synthetic replacement");
+});
+
+test("case lease rejects a replacement control directory even when the held lock is moved back", linux, async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "aark-case-directory-replace-test-"));
+  const control = path.join(root, "control");
+  const displaced = path.join(root, "displaced");
+  await mkdir(control, {mode: 0o700});
+  const lease = await acquireCaseLease(control);
+  try {
+    await rename(control, displaced);
+    await mkdir(control, {mode: 0o700});
+    await rename(path.join(displaced, ".case-service.lock"), path.join(control, ".case-service.lock"));
+    await assert.rejects(lease.assertHeld(), /control directory binding changed/);
+  } finally { await lease.release(); }
+});
+
+test("case lease rejects a newly introduced ancestor alias despite unchanged control and lock identities", linux, async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "aark-case-directory-alias-test-"));
+  const parent = path.join(root, "parent");
+  const displaced = path.join(root, "displaced");
+  const control = path.join(parent, "control");
+  await mkdir(control, {mode: 0o700, recursive: true});
+  const lease = await acquireCaseLease(control);
+  try {
+    await rename(parent, displaced);
+    await symlink(displaced, parent, "dir");
+    await assert.rejects(lease.assertHeld(), /symbolic-link/);
+  } finally { await lease.release(); }
+});
+
+test("case lease detects control directory permissions becoming public", linux, async () => {
+  const control = await mkdtemp(path.join(os.tmpdir(), "aark-case-directory-permissions-test-"));
+  const lease = await acquireCaseLease(control);
+  try {
+    await chmod(control, 0o755);
+    await assert.rejects(lease.assertHeld(), /control directory binding changed/);
+    await chmod(control, 0o700);
+    await lease.assertHeld();
+  } finally { await chmod(control, 0o700); await lease.release(); }
+});
+
+test("case lease detects control directory ownership changes", {skip: process.platform !== "linux" || process.getuid?.() !== 0}, async () => {
+  const control = await mkdtemp(path.join(os.tmpdir(), "aark-case-directory-owner-test-"));
+  const before = await stat(control);
+  const lease = await acquireCaseLease(control);
+  try {
+    await chown(control, before.uid + 1, before.gid);
+    await assert.rejects(lease.assertHeld(), /control directory binding changed/);
+  } finally { await chown(control, before.uid, before.gid); await lease.release(); }
 });

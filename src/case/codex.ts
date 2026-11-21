@@ -7,6 +7,7 @@ import type { Readable, Writable } from "node:stream";
 import type { AgentBridge, AgentConfig, AgentEvent, AgentReply, PermissionReason } from "./types.js";
 import { FAILURE_CODES } from "../workflow/failure.js";
 import { readJson } from "../core/fs-safe.js";
+import { CodexPipeTransport } from "./codex-transport.js";
 
 export type CodexAgentErrorCode = "agent-unavailable" | "agent-busy" | "agent-timeout" | "agent-invalid-response" | "agent-approval-required" | "agent-request-limit";
 export class CodexAgentError extends Error {
@@ -30,10 +31,12 @@ export function validateAgentEvent(value: unknown): AgentEvent {
   const seen = new Set<string>();
   for (const job of value.jobs) {
     if (!object(job) || !exact(job, ["id", "status", "attemptsUsed", "attemptsAllowed", "resumeAfterQuota",
-      ...(Object.hasOwn(job, "pauseReason") ? ["pauseReason"] : []), ...(Object.hasOwn(job, "failureCode") ? ["failureCode"] : [])])
+      ...(Object.hasOwn(job, "pauseReason") ? ["pauseReason"] : []), ...(Object.hasOwn(job, "failureCode") ? ["failureCode"] : []),
+      ...(Object.hasOwn(job, "resumeReady") ? ["resumeReady"] : [])])
         || typeof job.id !== "string" || !/^job-[0-9]{6}$/u.test(job.id) || seen.has(job.id) || typeof job.status !== "string" || !STATUSES.has(job.status)
         || !integer(job.attemptsUsed) || !integer(job.attemptsAllowed) || job.attemptsAllowed < 1 || job.attemptsAllowed > 4 || job.attemptsUsed > job.attemptsAllowed
         || typeof job.resumeAfterQuota !== "boolean"
+        || (job.resumeReady !== undefined && (job.status !== "paused" || typeof job.resumeReady !== "boolean"))
         || (job.pauseReason !== undefined && (job.status !== "paused" || !["signal", "free-space-reserve", "output-cap"].includes(String(job.pauseReason))))
         || (job.failureCode !== undefined && (typeof job.failureCode !== "string" || !FAILURE_CODES.has(job.failureCode)))) fail("agent-invalid-response");
     seen.add(job.id);
@@ -52,10 +55,15 @@ export function validateAgentReply(value: unknown, event: AgentEvent): AgentRepl
   return JSON.parse(JSON.stringify(value)) as AgentReply;
 }
 function outputSchema(event: AgentEvent): unknown {
+  const retry = event.jobs.filter(job => job.status === "failed" && job.attemptsUsed < job.attemptsAllowed).map(job => job.id);
+  const resume = event.jobs.filter(job => job.status === "paused" && job.resumeAfterQuota && job.resumeReady === true
+    && job.pauseReason === "free-space-reserve").map(job => job.id);
+  const selections = [{type: "retry", ids: retry}, {type: "resume", ids: resume}];
   return { type: "object", additionalProperties: false, required: ["eventId", "revision", "action"], properties: {
     eventId: { type: "string", enum: [event.eventId] }, revision: { type: "integer", enum: [event.revision] },
     action: { anyOf: [
-      ...(event.jobs.length === 0 ? [] : ["retry", "resume"].map((type) => ({ type: "object", additionalProperties: false, required: ["type", "jobId"], properties: { type: { type: "string", enum: [type] }, jobId: { type: "string", enum: event.jobs.map((job) => job.id) } } }))),
+      ...selections.filter(selection => selection.ids.length > 0).map(({type, ids}) => ({type: "object", additionalProperties: false,
+        required: ["type", "jobId"], properties: {type: {type: "string", enum: [type]}, jobId: {type: "string", enum: ids}}})),
       { type: "object", additionalProperties: false, required: ["type", "reason"], properties: { type: { type: "string", enum: ["needs-permission"] }, reason: { type: "string", enum: PERMISSIONS } } },
       { type: "object", additionalProperties: false, required: ["type"], properties: { type: { type: "string", enum: ["acknowledge"] } } },
     ] },
@@ -154,7 +162,7 @@ export class CodexAgentBridge implements AgentBridge {
   private working = false;
   private requests = 0;
   private nextId = 1;
-  private buffer = "";
+  private transport: CodexPipeTransport | undefined;
   private readonly pending = new Map<number, Pending>();
   private receipt: Receipt | undefined;
   private turn: TurnWaiter | undefined;
@@ -190,6 +198,12 @@ export class CodexAgentBridge implements AgentBridge {
         await this.setup(signal);
         const receipt = this.receipt!;
         this.checkThread(await this.rpc("thread/read", { threadId: receipt.threadId, includeTurns: false }), receipt.threadId, true);
+        // The transport can stay ready across many events. External/user goal
+        // changes must be checked again before each decision turn, without ever
+        // clearing a goal or taking over its automatic continuation lifecycle.
+        const goal = await this.rpc("thread/goal/get", { threadId: receipt.threadId });
+        if (!object(goal) || !Object.hasOwn(goal, "goal")) fail("agent-invalid-response");
+        if (goal.goal !== null) fail("agent-approval-required");
         signal.throwIfAborted();
         let resolve!: (reply: AgentReply) => void;
         let reject!: (error: Error) => void;
@@ -217,8 +231,9 @@ export class CodexAgentBridge implements AgentBridge {
       if (this.blockedReply) this.disconnect(new CodexAgentError("agent-approval-required"));
       return structuredClone(reply);
     } catch (error) {
-      if (this.blockedReply) {
-        const reply = this.blockedReply;
+      if (this.blockedReply || (error instanceof CodexAgentError && error.code === "agent-approval-required")) {
+        const reply: AgentReply = this.blockedReply ?? { eventId: event.eventId, revision: event.revision,
+          action: { type: "needs-permission", reason: "agent-approval-required" } };
         this.replies.set(key, reply);
         this.disconnect(new CodexAgentError("agent-approval-required"));
         return structuredClone(reply);
@@ -256,8 +271,8 @@ export class CodexAgentBridge implements AgentBridge {
     signal.throwIfAborted();
     await this.prepareState();
     signal.throwIfAborted();
-    this.startProxy(identity);
-    await this.rpc("initialize", { clientInfo: { name: "aark-case-supervisor", version: "1" }, capabilities: { experimentalApi: true, requiredHumanApproval: true } });
+    await this.startProxy(identity);
+    await this.rpc("initialize", { clientInfo: { name: "aark-case-supervisor", version: "1" }, capabilities: { experimentalApi: true } });
     this.send({ method: "initialized", params: {} });
     this.receipt = await this.readReceipt();
     signal.throwIfAborted();
@@ -288,7 +303,7 @@ export class CodexAgentBridge implements AgentBridge {
     signal.throwIfAborted();
     this.ready = true;
   }
-  private startProxy(identity: CodexValidatedBinding): void {
+  private async startProxy(identity: CodexValidatedBinding): Promise<void> {
     // This command is a stdio-to-Unix-socket proxy, not a new model session.
     const args = ["app-server", "proxy", "--sock", this.config.socketPath];
     const executable = identity.currentUid === 0 ? "/usr/sbin/runuser" : this.config.executable;
@@ -297,17 +312,20 @@ export class CodexAgentBridge implements AgentBridge {
       env: { PATH: "/usr/bin:/bin", HOME: identity.home, USER: this.config.user, LOGNAME: this.config.user, LANG: "C.UTF-8" } };
     const child: CodexProxyProcess = this.deps.spawn ? this.deps.spawn(executable, commandArgs, options) : spawn(executable, commandArgs, options);
     this.child = child;
-    this.buffer = "";
-    child.stdout.setEncoding("utf8");
-    child.stdout.on("data", (chunk: string) => { if (this.child === child) this.read(chunk); });
+    const transport = new CodexPipeTransport(bytes => child.stdin.write(bytes), text => this.message(JSON.parse(text)),
+      kind => { if (this.child === child) this.disconnect(new CodexAgentError(kind === "invalid" ? "agent-invalid-response" : "agent-unavailable")); });
+    this.transport = transport;
+    child.stdout.on("data", (chunk: Buffer) => { if (this.child === child) transport.receive(chunk); });
     child.stderr.resume(); // Never retain or forward subprocess diagnostics.
     child.stdin.on("error", () => { if (this.child === child) this.disconnect(new CodexAgentError("agent-unavailable")); });
     child.once("error", () => { if (this.child === child) this.disconnect(new CodexAgentError("agent-unavailable")); });
     child.once("exit", () => { if (this.child === child) this.disconnect(new CodexAgentError("agent-unavailable")); });
+    transport.start();
+    await transport.ready;
   }
   private send(value: unknown): void {
-    if (!this.child || this.closed) fail("agent-unavailable");
-    this.child.stdin.write(JSON.stringify(value) + "\n");
+    if (!this.child || this.closed || this.transport === undefined) fail("agent-unavailable");
+    this.transport.send(value);
   }
   private rpc(method: string, params: unknown): Promise<unknown> {
     const id = this.nextId++;
@@ -316,18 +334,6 @@ export class CodexAgentBridge implements AgentBridge {
       try { this.send({ id, method, params }); }
       catch { this.pending.delete(id); reject(new CodexAgentError("agent-unavailable")); }
     });
-  }
-  private read(chunk: string): void {
-    this.buffer += chunk;
-    if (Buffer.byteLength(this.buffer) > 1_048_576) { this.disconnect(new CodexAgentError("agent-invalid-response")); return; }
-    let newline: number;
-    while ((newline = this.buffer.indexOf("\n")) !== -1) {
-      const line = this.buffer.slice(0, newline);
-      this.buffer = this.buffer.slice(newline + 1);
-      if (!line.trim()) continue;
-      try { this.message(JSON.parse(line)); }
-      catch { this.disconnect(new CodexAgentError("agent-invalid-response")); return; }
-    }
   }
   private message(value: unknown): void {
     if (!object(value)) fail("agent-invalid-response");
@@ -344,6 +350,14 @@ export class CodexAgentBridge implements AgentBridge {
     else pending.resolve(value.result);
   }
   private refuse(request: Record<string, unknown>): void {
+    const params = request.params;
+    const ownedThread = this.receipt?.threadId;
+    if (ownedThread === undefined || !object(params)) return;
+    const scopes = ["threadId", "conversationId"].filter((key) => Object.hasOwn(params, key));
+    // Managed-server connections can replay requests belonging to other clients.
+    // Never decline, answer, or error a human/unscoped request. If both modern
+    // and legacy scopes are present, both must identify this owned thread.
+    if (scopes.length === 0 || scopes.some((key) => params[key] !== ownedThread)) return;
     let result: unknown;
     switch (request.method) {
       case "item/commandExecution/requestApproval": case "item/fileChange/requestApproval": result = { decision: "decline" }; break;
@@ -425,7 +439,7 @@ export class CodexAgentBridge implements AgentBridge {
     const filesystem = Object.fromEntries([[":root", "deny"], [":minimal", "read"], ...this.config.readableRoots.map((root) => [root, "read"])]);
     return { permissions: profile, approvalPolicy: "on-request", approvalsReviewer: "user", cwd: this.config.readableRoots[0],
       baseInstructions: "You are the AARK case decision worker. Return only the JSON decision required by the output schema. Use only the redacted event supplied in the current request. Do not inspect files, call tools, contact services, or request secrets.",
-      developerInstructions: "The native supervisor owns all execution authorization. Choose retry only for a failed job with an unused reviewed attempt; otherwise request new-plan-required. Choose resume only when a clean quota pause and resumeAfterQuota are explicitly established; never override a signal or user pause. Acknowledge completion after all jobs are complete. Unknown observations do not prove failure. No decision authorizes cleanup, source writes, new scope, or arbitrary commands.",
+      developerInstructions: "The native supervisor owns all execution authorization. Choose retry only for a failed job with an unused reviewed attempt; otherwise request new-plan-required. Choose resume only for a clean free-space-reserve pause with resumeAfterQuota and resumeReady both true; never override a signal or user pause. An output-cap pause requires a new plan. Acknowledge completion after all jobs are complete. Unknown observations do not prove failure. No decision authorizes cleanup, source writes, new scope, or arbitrary commands.",
       runtimeWorkspaceRoots: this.config.readableRoots, config: {
         default_permissions: profile, permissions: { [profile]: { filesystem, network: { enabled: false } } },
         web_search: "disabled", features: { apps: false, plugins: false, remote_plugin: false,
@@ -484,7 +498,7 @@ export class CodexAgentBridge implements AgentBridge {
     const child = this.child;
     this.child = undefined;
     this.ready = false;
-    this.buffer = "";
+    this.transport?.close(); this.transport = undefined;
     for (const pending of this.pending.values()) pending.reject(error);
     this.pending.clear();
     this.turn?.reject(error);

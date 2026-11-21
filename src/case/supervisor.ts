@@ -7,6 +7,7 @@ import { digest } from "./config.js";
 import { CodexAgentError, validateAgentReply } from "./codex.js";
 import { FAILURE_CODES } from "../workflow/failure.js";
 import { acquireCaseLease, type CaseLease } from "./lease.js";
+import { CaseSourceIdentityError } from "./sources.js";
 import { loadCaseState, redactedCaseStatus, saveCaseState, writeCaseCompletion } from "./store.js";
 import type { AgentBridge, AgentEvent, AgentReply, CaseAttempt, CaseConfig, CaseState, CompletionProof, EngineHost, EngineObservation, OutboxEntry, ReasonCode } from "./types.js";
 
@@ -27,6 +28,7 @@ export class CaseSupervisor {
   private readonly nextVerification = new Map<string, number>();
   private readonly locations = new Map<string, Promise<string>>();
   private observationUnavailable = false;
+  private capacityWaiting = false;
   private configChanged = false;
 
   private constructor(private readonly config: CaseConfig, private readonly state: CaseState,
@@ -143,6 +145,8 @@ export class CaseSupervisor {
 
   private async launch(index: number, attempt: CaseAttempt): Promise<void> {
     const approved = this.config.jobs[index]!.attempts[attempt.index]!;
+    if (attempt.mode === "resume" && attempt.dispatched !== true
+      && this.state.jobs[index]!.attempts.at(-2)?.resumeReady !== true) return;
     try {
       if (digest(await loadWorkflowConfig(approved.configFile)) !== approved.configHash) throw new Error();
     } catch { this.state.permissionReason = "new-plan-required"; this.configChanged = true; return; }
@@ -154,9 +158,12 @@ export class CaseSupervisor {
       attempt.status = "running";
       this.changed();
       await this.persist();
-    } catch {
+    } catch (error) {
       // A missing launch reply cannot establish whether an engine started.
       this.observationUnavailable = true;
+      if (error instanceof CaseSourceIdentityError) {
+        this.state.permissionReason = "new-media-required"; this.configChanged = true; this.changed();
+      }
     }
   }
 
@@ -166,6 +173,34 @@ export class CaseSupervisor {
     const attemptIndex = mode === "resume" ? previous!.index : (previous?.index ?? -1) + 1;
     job.attempts.push({index: attemptIndex, token: randomUUID(), mode, status: "launching"});
     this.changed();
+  }
+
+  private async pollResumeReadiness(): Promise<void> {
+    this.capacityWaiting = false;
+    for (let index = 0; index < this.state.jobs.length; index++) {
+      const saved = this.state.jobs[index]!;
+      const latest = saved.attempts.at(-1);
+      const paused = latest?.status === "paused" ? latest
+        : latest?.status === "launching" && latest.mode === "resume" && latest.dispatched !== true ? saved.attempts.at(-2) : undefined;
+      if (paused?.status !== "paused") continue;
+      if (paused.observation?.pauseReason === "output-cap") {
+        if (this.state.permissionReason === undefined) { this.state.permissionReason = "new-plan-required"; this.changed(); }
+        continue;
+      }
+      if (!this.config.jobs[index]!.resumeAfterQuota || paused.observation?.pauseReason !== "free-space-reserve") continue;
+      let ready: boolean | undefined;
+      try {
+        const observed = await this.options.host.resumeReady?.(this.config.jobs[index]!.attempts[paused.index]!);
+        if (typeof observed === "boolean") ready = observed;
+      } catch { /* Unavailable capacity observations do not authorize a resume. */ }
+      if (paused.resumeReady !== ready) {
+        if (ready === undefined) delete paused.resumeReady;
+        else paused.resumeReady = ready;
+        this.changed();
+      }
+      if (ready !== true) this.capacityWaiting = true;
+      if (ready === undefined) this.observationUnavailable = true;
+    }
   }
 
   private resolvedLocation(value: string): Promise<string> {
@@ -256,6 +291,7 @@ export class CaseSupervisor {
     if (reply.eventId !== entry.event.eventId || reply.revision !== entry.event.revision || reply.revision !== this.state.revision) return;
     entry.reply = reply;
     const action = reply.action;
+    if (this.state.permissionReason !== undefined) return;
     if (action.type === "acknowledge") {
       if (entry.event.reason === "case-completed") this.state.completionDeliveredToAgent = true;
       else if (["job-failed", "job-paused", "configuration-changed"].includes(entry.event.reason)) this.state.permissionReason = "new-plan-required";
@@ -269,7 +305,11 @@ export class CaseSupervisor {
     if (index < 0 || previous === undefined || job === undefined) { this.state.permissionReason = "new-plan-required"; return; }
     if (action.type === "retry" && previous.status === "failed" && previous.index + 1 < job.attempts.length) this.newAttempt(index, "run");
     else if (action.type === "resume" && previous.status === "paused" && job.resumeAfterQuota
-      && ["free-space-reserve", "output-cap"].includes(previous.observation?.pauseReason ?? "")) this.newAttempt(index, "resume");
+      && previous.observation?.pauseReason === "free-space-reserve") {
+      if (previous.resumeReady === true) this.newAttempt(index, "resume");
+      // Capacity may change after a decision was prepared. Wait for a fresh
+      // readiness edge instead of requiring a new authorization plan.
+    }
     else this.state.permissionReason = "new-plan-required";
   }
 
@@ -278,7 +318,8 @@ export class CaseSupervisor {
       attemptsUsed: job.attempts.filter(attempt => attempt.mode === "run").length,
       attemptsAllowed: this.config.jobs[index]!.attempts.length, resumeAfterQuota: this.config.jobs[index]!.resumeAfterQuota,
       ...(job.attempts.at(-1)?.observation?.pauseReason === undefined ? {} : {pauseReason: job.attempts.at(-1)!.observation!.pauseReason!}),
-      ...(job.attempts.at(-1)?.observation?.failureCode === undefined ? {} : {failureCode: job.attempts.at(-1)!.observation!.failureCode!})}));
+      ...(job.attempts.at(-1)?.observation?.failureCode === undefined ? {} : {failureCode: job.attempts.at(-1)!.observation!.failureCode!}),
+      ...(job.attempts.at(-1)?.resumeReady === undefined ? {} : {resumeReady: job.attempts.at(-1)!.resumeReady!})}));
   }
   private queueDecision(reason: ReasonCode): void {
     const jobs = this.eventJobs();
@@ -317,6 +358,8 @@ export class CaseSupervisor {
     await this.preflightAgent();
     await this.observe();
     const unavailableReattachments = await this.reattach();
+    const unavailableBeforeCapacity = this.observationUnavailable;
+    await this.pollResumeReadiness();
     this.processReply();
     if (this.state.desired === "running" && this.agentReady) {
       for (let i = 0; i < this.state.jobs.length; i++) {
@@ -328,7 +371,8 @@ export class CaseSupervisor {
           && (attempt.dispatched === true || (occupied < this.config.maxConcurrent && await this.dependenciesReady(i, attempt.index)))) await this.launch(i, attempt);
       }
       for (let i = 0; i < this.state.jobs.length; i++) {
-        if (this.state.jobs.filter(job => ["running", "launching"].includes(job.attempts.at(-1)?.status ?? "")).length >= this.config.maxConcurrent) break;
+        if (this.state.jobs.filter(job => { const latest = job.attempts.at(-1); return latest?.status === "running"
+          || (latest?.status === "launching" && latest.dispatched === true); }).length >= this.config.maxConcurrent) break;
         const job = this.state.jobs[i]!;
         if (this.state.permissionReason === undefined && !this.configChanged && job.attempts.length === 0 && await this.dependenciesReady(i, 0)) {
           this.newAttempt(i, "run"); await this.launch(i, job.attempts.at(-1)!);
@@ -336,6 +380,7 @@ export class CaseSupervisor {
       }
     }
     if (!this.state.complete && this.state.jobs.every(job => job.attempts.at(-1)?.status === "complete")) {
+      await this.lease.assertHeld();
       await writeCaseCompletion(this.config, this.state);
       this.state.complete = true; this.changed();
     }
@@ -346,13 +391,13 @@ export class CaseSupervisor {
     if (this.state.complete && !this.state.completionDeliveredToAgent) this.queueDecision("case-completed");
     else if (this.configChanged) this.queueDecision("configuration-changed");
     else if (statuses.includes("failed")) this.queueDecision("job-failed");
-    else if (statuses.includes("paused")) this.queueDecision("job-paused");
-    else if (this.observationUnavailable) this.queueDecision("observation-unavailable");
+    else if (this.state.jobs.some(job => { const latest = job.attempts.at(-1); return latest?.status === "paused" && latest.resumeReady === true; })) this.queueDecision("job-paused");
+    else if (unavailableBeforeCapacity) this.queueDecision("observation-unavailable");
     this.state.health = this.state.permissionReason !== undefined ? "awaiting-permission"
       : !this.agentReady || this.transportBackoffUntil() > 0 || (this.state.agentRequests >= this.config.agent.maxRequests && this.state.outbox.some(row => row.status === "pending")) ? "agent-unavailable"
       : this.observationUnavailable ? "observation-unavailable"
       : this.state.outbox.some(row => row.status !== "processed") ? "awaiting-agent"
-      : statuses.some(status => status === "failed" || status === "paused") ? "degraded" : "healthy";
+      : this.capacityWaiting || statuses.some(status => status === "failed" || status === "paused") ? "degraded" : "healthy";
     await this.persist();
     await this.dispatch();
   }

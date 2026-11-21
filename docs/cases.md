@@ -54,6 +54,10 @@ sudo aark case init --config case.json --execute
 sudo aark case run --control /var/lib/aark/case-001 --autonomous --execute
 ```
 
+Create the control directory's protected parent first if it is absent, for
+example `sudo install -d -m 0700 /var/lib/aark`. Initialization requires a fresh
+case directory and will not adopt an existing one.
+
 Initialization requires both `execute: true` in the case and the CLI `--execute`
 confirmation. Every listed workflow must also authorize execution; recovery
 configurations additionally require their own execution flag and
@@ -61,6 +65,12 @@ configurations additionally require their own execution flag and
 invalid configuration creates no control directory and starts no engine. Case
 execution additionally requires the explicit `--autonomous` option. Changes to
 frozen configurations are detected rather than silently adopted.
+
+Initialization pins the original recovery media and external analysis views.
+Fresh jobs and retries compare those identities at the native engine's source
+baseline, so reusing a device name for different media cannot expand the case
+authorization. Inputs that will be produced by an approved dependency remain
+subject to that producer's exact verified attempt and native launch checks.
 
 ## Process host and restricted agent
 
@@ -107,6 +117,12 @@ server. Unsupported permissions or protocol responses fail visibly; they do
 not fall back to broader access. See the upstream
 [permission profile documentation](https://learn.chatgpt.com/docs/permissions).
 
+The managed control socket uses WebSocket messages over the local Unix proxy;
+no TCP listener is required. Configure the canonical physical socket path,
+resolving the daemon's advertised symlink with `realpath` when necessary.
+The bridge answers approval requests only for its own decision thread and
+checks for an externally added or paused goal before every decision turn.
+
 Only one agent request is pending at a time. Events carry stable IDs and state
 revisions; stale replies cannot change a newer case state. Delivery retries and
 the total number of agent requests are bounded. An unavailable agent or an
@@ -133,12 +149,14 @@ case permits reconciliation and eligible launches again; it does not relabel a
 failed native run as a clean pause. Supervisor shutdown closes the agent bridge
 without killing engine units.
 
-Set the required `resumeAfterQuota` flag to false unless quota resume is explicitly
-authorized. When enabled for a job, the
-agent may request resume only after the native workflow has published a clean
-resumable quota pause. Storage reserves and native checkpoint validation still
-apply. Signal pauses and failed or interrupted outputs do not become automatic
-quota retries. Corrected failed work requires the next listed fresh attempt.
+Set `resumeAfterQuota` to false unless automatic free-space resume is authorized.
+When enabled, the supervisor waits for fresh destination and loop-host capacity
+checks before requesting a resume decision. Waiting for space does not consume
+model requests or launch attempts. Native checkpoint validation and storage
+reserves still apply. An output-cap pause needs a new reviewed plan, since an
+unchanged logical cap cannot be repaired by restarting the engine. Signal
+pauses and failed or interrupted outputs do not become automatic quota retries.
+Corrected failed work requires the next listed fresh attempt.
 
 Unknown or timed-out observations remain observation failures. They do not
 establish that an engine failed, authorize a duplicate launch, or prove that its

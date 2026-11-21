@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
+import { createHash } from "node:crypto";
 import { chmod, mkdtemp, readFile, realpath, rm, stat, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -19,23 +20,47 @@ class FakeProxy extends EventEmitter implements CodexProxyProcess {
   readonly stdout = new PassThrough();
   readonly stderr = new PassThrough();
   readonly killed: NodeJS.Signals[] = [];
-  private buffer = "";
+  private buffer: Buffer = Buffer.alloc(0);
+  private upgraded = false;
   constructor(readonly server: FakeServer) {
     super();
-    this.stdin.setEncoding("utf8");
-    this.stdin.on("data", (chunk: string) => {
-      this.buffer += chunk;
-      let newline: number;
-      while ((newline = this.buffer.indexOf("\n")) !== -1) {
-        const line = this.buffer.slice(0, newline); this.buffer = this.buffer.slice(newline + 1);
-        const request = JSON.parse(line) as Wire;
+    this.stdin.on("data", (chunk: Buffer) => {
+      this.buffer = Buffer.concat([this.buffer, chunk]);
+      if (!this.upgraded) {
+        const end = this.buffer.indexOf("\r\n\r\n");
+        if (end < 0) return;
+        const key = /Sec-WebSocket-Key: ([^\r\n]+)/u.exec(this.buffer.subarray(0, end).toString())?.[1];
+        assert.ok(key, "real managed IPC requires an HTTP WebSocket upgrade");
+        this.buffer = this.buffer.subarray(end + 4); this.upgraded = true;
+        const accept = createHash("sha1").update(key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").digest("base64");
+        this.stdout.write("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: " + accept + "\r\n\r\n");
+      }
+      while (this.buffer.length >= 2) {
+        const opcode = this.buffer[0]! & 15;
+        assert.ok((this.buffer[1]! & 128) !== 0, "client WebSocket frames must be masked");
+        let size = this.buffer[1]! & 127, offset = 2;
+        if (size === 126) { if (this.buffer.length < 4) return; size = this.buffer.readUInt16BE(2); offset = 4; }
+        else if (size === 127) { if (this.buffer.length < 10) return; size = Number(this.buffer.readBigUInt64BE(2)); offset = 10; }
+        if (this.buffer.length < offset + 4 + size) return;
+        const mask = this.buffer.subarray(offset, offset + 4);
+        const payload = Buffer.from(this.buffer.subarray(offset + 4, offset + 4 + size));
+        this.buffer = this.buffer.subarray(offset + 4 + size);
+        for (let index = 0; index < payload.length; index++) payload[index] = payload[index]! ^ mask[index % 4]!;
+        if (opcode !== 1) continue;
+        const request = JSON.parse(payload.toString()) as Wire;
         server.wire.push(request);
         queueMicrotask(() => server.receive(request, this));
       }
     });
   }
   kill(signal: NodeJS.Signals = "SIGTERM"): boolean { this.killed.push(signal); return true; }
-  send(value: unknown): void { this.stdout.write(JSON.stringify(value) + "\n"); }
+  send(value: unknown): void {
+    const payload = Buffer.from(JSON.stringify(value));
+    const header = Buffer.alloc(payload.length < 126 ? 2 : 4);
+    header[0] = 0x81; header[1] = payload.length < 126 ? payload.length : 126;
+    if (payload.length >= 126) header.writeUInt16BE(payload.length, 2);
+    this.stdout.write(Buffer.concat([header, payload]));
+  }
   result(request: Wire, value: unknown): void { this.send({ id: request.id, result: value }); }
 }
 class FakeServer {
@@ -99,6 +124,8 @@ const code = (message: string): { message: string } => ({ message });
 linuxTest("Codex preflight creates a protected fresh decision thread without starting a model turn", async (context) => {
   const { config, server, bridge } = await fixture(context);
   await bridge.preflight();
+  const initialized = server.calls("initialize")[0]!.params as Wire;
+  assert.equal(Object.hasOwn(initialized.capabilities as Wire, "requiredHumanApproval"), false);
   assert.equal(server.calls("thread/start").length, 1);
   assert.equal(server.calls("turn/start").length, 0);
   assert.equal(server.calls("thread/goal/clear").length, 0);
@@ -194,6 +221,21 @@ for (const method of ["thread/start", "thread/resume"]) {
     assert.equal(server.calls("turn/start").length, 0);
   });
 }
+linuxTest("Codex decision schema includes only approved retries and currently ready quota resumes", async context => {
+  const {bridge, server} = await fixture(context);
+  const event: AgentEvent = {...EVENT, jobs: [EVENT.jobs[0]!,
+    {id: "job-000002", status: "failed", attemptsUsed: 1, attemptsAllowed: 1, resumeAfterQuota: false},
+    {id: "job-000003", status: "paused", attemptsUsed: 1, attemptsAllowed: 1, resumeAfterQuota: true, pauseReason: "free-space-reserve", resumeReady: false},
+    {id: "job-000004", status: "paused", attemptsUsed: 1, attemptsAllowed: 1, resumeAfterQuota: true, pauseReason: "free-space-reserve", resumeReady: true},
+    {id: "job-000005", status: "paused", attemptsUsed: 1, attemptsAllowed: 1, resumeAfterQuota: true, pauseReason: "signal"}]};
+  await bridge.request(event);
+  const params = server.calls("turn/start")[0]!.params as Wire;
+  const schema = params.outputSchema as {properties: {action: {anyOf: Array<{properties: {type: {enum: string[]}; jobId?: {enum: string[]}}}>}}};
+  const actions = schema.properties.action.anyOf;
+  assert.deepEqual(actions.find(action => action.properties.type.enum[0] === "retry")!.properties.jobId!.enum, ["job-000001"]);
+  assert.deepEqual(actions.find(action => action.properties.type.enum[0] === "resume")!.properties.jobId!.enum, ["job-000004"]);
+});
+
 linuxTest("Codex root supervisor invokes only the proxy as the configured desktop account", async (context) => {
   const { bridge, server, config } = await fixture(context);
   await bridge.close();
@@ -229,6 +271,92 @@ linuxTest("Codex preserves an unexpected user goal on reuse and requires permiss
   assert.equal(server.calls("thread/goal/clear").length, 0);
   assert.equal(server.calls("turn/start").length, 0);
   assert.equal(server.calls("thread/start").length, 1);
+});
+linuxTest("Codex rechecks a new user goal after preflight even while the connection is ready", async (context) => {
+  const { bridge, server } = await fixture(context);
+  await bridge.preflight();
+  const checksBefore = server.calls("thread/goal/get").length;
+  const goal = { objective: "synthetic external goal after preflight", status: "paused", tokenBudget: 100 };
+  server.goal = structuredClone(goal);
+  assert.deepEqual(await bridge.request(EVENT), { eventId: EVENT.eventId, revision: EVENT.revision,
+    action: { type: "needs-permission", reason: "agent-approval-required" } });
+  assert.equal(server.calls("thread/goal/get").length, checksBefore + 1);
+  assert.deepEqual(server.goal, goal);
+  assert.equal(server.calls("thread/goal/clear").length, 0);
+  assert.equal(server.calls("turn/start").length, 0);
+});
+linuxTest("Codex rechecks user goals between successful decisions on the same ready connection", async (context) => {
+  const { bridge, server } = await fixture(context);
+  assert.deepEqual(await bridge.request(EVENT), REPLY);
+  const next: AgentEvent = { ...EVENT, eventId: "33333333-3333-4333-8333-333333333333", revision: EVENT.revision + 1 };
+  server.reply = { ...REPLY, eventId: next.eventId, revision: next.revision };
+  const goal = { objective: "synthetic external goal after one decision", status: "paused" };
+  server.goal = structuredClone(goal);
+  assert.deepEqual(await bridge.request(next), { eventId: next.eventId, revision: next.revision,
+    action: { type: "needs-permission", reason: "agent-approval-required" } });
+  assert.deepEqual(server.goal, goal);
+  assert.equal(server.calls("thread/goal/clear").length, 0);
+  assert.equal(server.calls("turn/start").length, 1);
+});
+linuxTest("Codex checks an empty goal immediately before every new decision turn", async (context) => {
+  const { bridge, server } = await fixture(context);
+  await bridge.request(EVENT);
+  const firstTurn = server.wire.findLastIndex((request) => request.method === "turn/start");
+  const next: AgentEvent = { ...EVENT, eventId: "33333333-3333-4333-8333-333333333333", revision: EVENT.revision + 1 };
+  const expected = { ...REPLY, eventId: next.eventId, revision: next.revision };
+  server.reply = expected;
+  assert.deepEqual(await bridge.request(next), expected);
+  const goalCheck = server.wire.findLastIndex((request) => request.method === "thread/goal/get");
+  const secondTurn = server.wire.findLastIndex((request) => request.method === "turn/start");
+  assert.ok(firstTurn < goalCheck && goalCheck < secondTurn);
+  assert.equal((server.wire[goalCheck]!.params as Wire).threadId, "case-agent-thread");
+  assert.equal(server.calls("thread/start").length, 1);
+});
+linuxTest("Codex ignores unowned and unscoped managed-server request replays without answering or blocking its own decision", async (context) => {
+  const { bridge, config, server } = await fixture(context);
+  const ignored = new Set<string>();
+  const replay = (proxy: FakeProxy, method: string, params: unknown): void => {
+    const id = "unowned-replay-" + ignored.size;
+    ignored.add(id);
+    proxy.send({ id, method, params });
+  };
+  server.custom = (request, proxy) => {
+    if (request.method === "initialize") {
+      replay(proxy, "item/commandExecution/requestApproval", { threadId: config.threadId });
+      replay(proxy, "execCommandApproval", { conversationId: "case-agent-thread" }); // No owned receipt exists yet.
+      replay(proxy, "account/chatgptAuthTokens/refresh", {});
+      proxy.result(request, { userAgent: "synthetic" });
+      return true;
+    }
+    if (request.method !== "turn/start") return false;
+    for (const method of ["item/commandExecution/requestApproval", "item/fileChange/requestApproval", "execCommandApproval", "applyPatchApproval",
+      "item/permissions/requestApproval", "mcpServer/elicitation/request", "item/tool/requestUserInput", "item/tool/call",
+      "account/chatgptAuthTokens/refresh", "attestation/generate", "fixture/unknownInheritedTool"]) {
+      for (const params of [{ threadId: config.threadId }, { conversationId: config.threadId }, {}, null,
+        { threadId: "case-agent-thread", conversationId: config.threadId }, { threadId: config.threadId, conversationId: "case-agent-thread" }]) {
+        replay(proxy, method, params);
+      }
+    }
+    proxy.result(request, { turn: { id: "turn-fixture", status: "inProgress", items: [] } });
+    queueMicrotask(() => server.complete(proxy));
+    return true;
+  };
+  assert.deepEqual(await bridge.request(EVENT), REPLY);
+  assert.equal(server.wire.some((packet) => typeof packet.id === "string" && ignored.has(packet.id)), false);
+  assert.equal(server.calls("turn/start").length, 1);
+  assert.equal(server.calls("thread/goal/clear").length, 0);
+});
+for (const method of ["execCommandApproval", "applyPatchApproval"]) linuxTest(`Codex declines owned legacy ${method} scoped by conversationId`, async (context) => {
+  const { bridge, server } = await fixture(context);
+  server.custom = (request, proxy) => {
+    if (request.method !== "turn/start") return false;
+    proxy.send({ id: "owned-legacy-approval", method, params: { conversationId: "case-agent-thread", command: "synthetic private command" } });
+    return true;
+  };
+  assert.deepEqual(await bridge.request(EVENT), { eventId: EVENT.eventId, revision: EVENT.revision,
+    action: { type: "needs-permission", reason: "agent-approval-required" } });
+  const response = server.wire.find((packet) => packet.id === "owned-legacy-approval");
+  assert.deepEqual(response?.result, { decision: { denied: { rejection: "agent-approval-required" } } });
 });
 linuxTest("Codex ambiguous thread creation failure leaves an intent and refuses a duplicate thread creation", async (context) => {
   const { bridge, config, server } = await fixture(context);

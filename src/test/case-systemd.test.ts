@@ -1,6 +1,8 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { access, mkdir, readFile, unlink, writeFile } from "node:fs/promises";
+import fs from "node:fs";
+import { access, mkdir, readFile, rm, unlink, writeFile } from "node:fs/promises";
+import { syncBuiltinESMExports } from "node:module";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -13,6 +15,7 @@ import type { CommandOptions, CommandResult } from "../core/command.js";
 import { loadWorkflowConfig } from "../workflow/config.js";
 import { runWorkflow } from "../workflow/runner.js";
 import { mkdtemp } from "./helpers.js";
+import { CaseSourceIdentityError } from "../case/sources.js";
 
 const hash = (value: string) => createHash("sha256").update(value).digest("hex");
 async function fixture(): Promise<{root: string; attempt: PreparedAttempt}> {
@@ -62,6 +65,54 @@ function manager() {
     forget() { properties = undefined; }};
 }
 const linux = {skip: process.platform !== "linux"};
+
+test("changed case source authorization stops before any engine is started", linux, async () => {
+  const f = await fixture();
+  const recoveryConfig = path.join(f.root, "recovery.json");
+  const source = path.join(f.root, "source.img");
+  await writeFile(source, "ordinary synthetic source");
+  await writeFile(recoveryConfig, JSON.stringify({version: 1, caseId: "synthetic-source-pin", execute: true, requireReadOnlySource: true,
+    source, destination: path.join(f.root, "recovery"), image: {enabled: false},
+    stages: {deletedMetadata: false, unallocatedStream: false, signatureCarving: false}}));
+  const document = JSON.parse(await readFile(f.attempt.configFile, "utf8"));
+  await writeFile(f.attempt.configFile, JSON.stringify({...document, recoveryConfig}));
+  const workflow = await loadWorkflowConfig(f.attempt.configFile);
+  const attempt = {...f.attempt, workflow, configHash: hash(JSON.stringify(workflow))};
+  const pins = [{source, sha256: "a".repeat(64)}];
+  const host = manager();
+  const engine = new SystemdEngineHost({cliPath: path.resolve("dist/cli.js"), controlRoot: path.join(f.root, "host"),
+    sourceBindings: {[attempt.configHash]: pins}, command: async (executable, args, options) => {
+      if (args[1] === "binding") {
+        assert.equal(args[4], JSON.stringify(pins));
+        return result(executable, args, '{"valid":false,"reason":"source-identity-changed"}', {exitCode: 2});
+      }
+      return await host.command(executable, args, options);
+    }});
+  await assert.rejects(engine.launch(attempt, "synthetic-source-token", "run"), CaseSourceIdentityError);
+  assert.equal(host.calls.some(call => call.executable.endsWith("systemd-run")), false);
+  await assert.rejects(access(workflow.output));
+});
+
+test("quota readiness uses an isolated bounded helper and rejects unavailable or malformed replies", linux, async () => {
+  const f = await fixture();
+  const replies: Array<Partial<CommandResult> & {text?: string}> = [{text: '{"ready":false}'}, {text: '{"ready":true}'},
+    {text: '{"ready":true}', terminationReason: "timeout"}, {text: '{"ready":false}', exitCode: 1}, {text: '{"ready":"true"}'}, {text: '{"ready":true,"error":"synthetic-private"}'}];
+  let calls = 0;
+  const engine = new SystemdEngineHost({cliPath: path.resolve("dist/cli.js"), controlRoot: path.join(f.root, "host"), probeTimeoutMs: 123,
+    command: async (executable, args, options) => {
+      assert.equal(executable, process.execPath);
+      assert.equal(path.basename(args[0]!), "capacity.js");
+      assert.deepEqual(args.slice(1), [f.attempt.configFile, f.attempt.configHash]);
+      assert.equal(options.timeoutMs, 123);
+      const {text, ...changes} = replies[calls++]!;
+      return result(executable, args, text ?? "", changes);
+    }});
+  assert.equal(await engine.resumeReady(f.attempt), false);
+  assert.equal(await engine.resumeReady(f.attempt), true);
+  for (let index = 0; index < 4; index++) await assert.rejects(engine.resumeReady(f.attempt), /readiness observation unavailable/);
+  assert.equal(calls, 6);
+  await assert.rejects(access(path.join(f.root, "host")));
+});
 
 test("host preflight checks privilege, binary versions, CLI availability, and manager connectivity without launching", linux, async t => {
   t.mock.method(process as NodeJS.Process & {getuid: () => number}, "getuid", () => 0);
@@ -170,6 +221,75 @@ test("observation distinguishes active engines, settled success, clean pauses, a
   assert.equal(host.calls.some(call => call.args.includes("kill") || call.args.includes("restart")), false);
 });
 
+test("settled systemd startup failure is observed without native progress or output", linux, async () => {
+  const f = await fixture();
+  const host = manager();
+  let nativeProbes = 0;
+  const engine = new SystemdEngineHost({cliPath: path.resolve("dist/cli.js"), controlRoot: path.join(f.root, "host"),
+    command: async (executable, args, options) => {
+      if (args[1] === "status") { nativeProbes++; throw new Error("synthetic unavailable native progress"); }
+      return await host.command(executable, args, options);
+    }});
+  const identity = await engine.launch(f.attempt, "startup-refusal-token", "run");
+  // The native expected-config-hash guard can refuse before creating output.
+  Object.assign(host.properties!, {ActiveState: "failed", SubState: "failed", Result: "exit-code",
+    MainPID: "0", TasksCurrent: "0", ExecMainCode: "1", ExecMainStatus: "1"});
+  assert.deepEqual(await engine.observe(identity, f.attempt), {status: "failed"});
+  assert.equal(nativeProbes, 0, "terminal failure must not depend on readable destination controls");
+  await assert.rejects(access(f.attempt.workflow.output));
+  assert.deepEqual(await engine.launch(f.attempt, "startup-refusal-token", "run"), identity);
+  assert.equal(host.calls.filter(call => call.executable.endsWith("systemd-run")).length, 1);
+});
+
+test("abruptly killed empty-cgroup invocation is failed even when native status looks paused", linux, async () => {
+  const f = await fixture();
+  const host = manager();
+  const engine = new SystemdEngineHost({cliPath: path.resolve("dist/cli.js"), controlRoot: path.join(f.root, "host"), command: host.command});
+  const identity = await engine.launch(f.attempt, "killed-token", "run");
+  host.native = {status: "paused", resumable: true, pauseReason: "free-space-reserve"};
+  Object.assign(host.properties!, {ActiveState: "failed", SubState: "failed", Result: "signal", MainPID: "0",
+    TasksCurrent: "[not set]", ControlGroup: "", ExecMainCode: "2", ExecMainStatus: "9"});
+  assert.deepEqual(await engine.observe(identity, f.attempt), {status: "failed"});
+  assert.equal(host.calls.some(call => call.args.some(arg => ["kill", "stop", "restart"].includes(arg))), false);
+});
+
+test("missing native progress cannot turn unproven cgroup death into failure or authorize replacement", linux, async () => {
+  const f = await fixture();
+  const host = manager();
+  const engine = new SystemdEngineHost({cliPath: path.resolve("dist/cli.js"), controlRoot: path.join(f.root, "host"),
+    command: async (executable, args, options) => args[1] === "status"
+      ? result(executable, args, '{"status":"unknown"}', {exitCode: 1}) : await host.command(executable, args, options)});
+  const identity = await engine.launch(f.attempt, "unsettled-token", "run");
+  Object.assign(host.properties!, {ActiveState: "failed", SubState: "failed", Result: "signal", MainPID: "0",
+    TasksCurrent: "1", ExecMainCode: "2", ExecMainStatus: "9"});
+  assert.deepEqual(await engine.observe(identity, f.attempt), {status: "unknown"});
+  host.properties!.TasksCurrent = "0";
+  host.properties!.MainPID = "100";
+  assert.deepEqual(await engine.observe(identity, f.attempt), {status: "unknown"});
+  host.properties!.MainPID = "0";
+  host.properties!.ControlGroup = "/system.slice/unrelated.service";
+  assert.deepEqual(await engine.observe(identity, f.attempt), {status: "unknown"});
+  Object.assign(host.properties!, {ActiveState: "active", SubState: "running", MainPID: "100", TasksCurrent: "1",
+    ControlGroup: `/system.slice/${identity.unit}`});
+  assert.deepEqual(await engine.observe(identity, f.attempt), {status: "unknown"});
+  assert.deepEqual(await engine.launch(f.attempt, "unsettled-token", "run"), identity);
+  assert.equal(host.calls.filter(call => call.executable.endsWith("systemd-run")).length, 1);
+});
+
+test("successful exits without native progress prove neither completion nor clean pause", linux, async () => {
+  const f = await fixture();
+  const host = manager();
+  const engine = new SystemdEngineHost({cliPath: path.resolve("dist/cli.js"), controlRoot: path.join(f.root, "host"),
+    command: async (executable, args, options) => args[1] === "status"
+      ? result(executable, args, '{"status":"unknown"}', {exitCode: 1}) : await host.command(executable, args, options)});
+  const identity = await engine.launch(f.attempt, "missing-status-token", "run");
+  Object.assign(host.properties!, {ActiveState: "active", SubState: "exited", Result: "success", MainPID: "0",
+    TasksCurrent: "0", ExecMainCode: "1", ExecMainStatus: "0"});
+  assert.deepEqual(await engine.observe(identity, f.attempt), {status: "unknown"});
+  host.properties!.ExecMainStatus = "75";
+  assert.deepEqual(await engine.observe(identity, f.attempt), {status: "unknown"});
+});
+
 test("finished RemainAfterExit services support systemd's released-cgroup success and pause properties", linux, async () => {
   const f = await fixture();
   const host = manager();
@@ -273,6 +393,64 @@ test("completion verification rejects a changed frozen input even when all resul
   await assert.rejects(verifyCompletedWorkflow(f.attempt), /input coverage changed/);
   await assert.rejects(access(path.join(f.attempt.workflow.output, ".aark-workflow.lock")));
   await assert.rejects(access(path.join(f.attempt.workflow.output, "mining", "scan-000001", ".aark-mining.lock")));
+});
+
+for (const mutation of ["file-content", "deep-file", "deep-empty-directory"] as const) {
+  test(`completion verification rejects ${mutation} changes after initial source coverage verification`, linux, async context => {
+    const f = await fixture();
+    context.after(() => rm(f.root, {recursive: true, force: true}));
+    const source = f.attempt.workflow.scans[0]!.inputs[0]!;
+    const deep = path.join(source, "existing", "nested");
+    await mkdir(deep, {recursive: true});
+    await runWorkflow(f.attempt.configFile, {execute: true});
+    const output = f.attempt.workflow.output;
+    const stateFile = path.join(output, "workflow-state-sensitive.json");
+    const before = await readFile(stateFile);
+    const indexFile = path.join(output, "finalization-000001", "index-sensitive.json");
+    const originalOpen = fs.promises.open;
+    let changed = false;
+    const injected: typeof fs.promises.open = async (filename, flags, mode) => {
+      // Package-index hashing happens after every scan's first coverage walk.
+      if (filename === indexFile && !changed) {
+        changed = true;
+        if (mutation === "file-content") await writeFile(path.join(source, "synthetic.txt"), "changed synthetic bytes");
+        else if (mutation === "deep-file") await writeFile(path.join(deep, "new.txt"), "new synthetic bytes");
+        else await mkdir(path.join(deep, "new-empty"));
+      }
+      return await originalOpen(filename, flags, mode);
+    };
+    fs.promises.open = injected;
+    syncBuiltinESMExports();
+    try {
+      await assert.rejects(verifyCompletedWorkflow(f.attempt), /input coverage changed|unscanned inputs|source snapshot changed/u);
+    } finally {
+      fs.promises.open = originalOpen;
+      syncBuiltinESMExports();
+    }
+    assert.equal(changed, true, "the synthetic mutation must occur inside verification");
+    assert.deepEqual(await readFile(stateFile), before);
+    for (const filename of [path.join(output, ".aark-workflow.lock"), path.join(output, "mining", "scan-000001", ".aark-mining.lock")]) {
+      await assert.rejects(access(filename));
+    }
+  });
+}
+
+test("completion source revalidation reads metadata without reopening original source bytes", linux, async context => {
+  const f = await fixture();
+  context.after(() => rm(f.root, {recursive: true, force: true}));
+  await runWorkflow(f.attempt.configFile, {execute: true});
+  const source = path.join(f.attempt.workflow.scans[0]!.inputs[0]!, "synthetic.txt");
+  const originalOpen = fs.promises.open;
+  let sourceReads = 0;
+  const guarded: typeof fs.promises.open = async (filename, flags, mode) => {
+    if (filename === source) { sourceReads++; throw new Error("original source contents must not be reopened"); }
+    return await originalOpen(filename, flags, mode);
+  };
+  fs.promises.open = guarded;
+  syncBuiltinESMExports();
+  try { assert.equal((await verifyCompletedWorkflow(f.attempt)).scansVerified, 1); }
+  finally { fs.promises.open = originalOpen; syncBuiltinESMExports(); }
+  assert.equal(sourceReads, 0);
 });
 
 test("completion verification ignores a forged progress snapshot and rejects changed sealed controls or configuration", async () => {

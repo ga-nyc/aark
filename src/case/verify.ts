@@ -12,6 +12,7 @@ import { loadWorkflowConfig, MAX_WORKFLOW_CONFIG_BYTES, type WorkflowConfig, typ
 import { workflowStatus } from "../workflow/runner.js";
 import { controlIdentity, fileDigest, miningDirectory, outputIdentity, samePath, workflowSourceIdentity } from "../workflow/verify.js";
 import type { CompletionProof, PreparedAttempt } from "./types.js";
+import { assertSourceBindings, CaseSourceIdentityError } from "./sources.js";
 
 const hash = (value: string) => createHash("sha256").update(value).digest("hex");
 interface Artifact {path: string; bytes: number; sha256: string}
@@ -28,6 +29,49 @@ async function assertAbsent(filename: string): Promise<void> {
   try { await stableLstat(filename); }
   catch (error) { if (error instanceof Error && "code" in error && error.code === "ENOENT") return; throw error; }
   throw new Error("workflow completion has an operation lock");
+}
+
+/** Bounded metadata-only snapshot, including empty/deep directory entry changes. */
+async function sourceSnapshot(scan: WorkflowScan, output: string, state: Awaited<ReturnType<typeof loadScanState>>): Promise<string> {
+  const snapshot = createHash("sha256");
+  const remember = (kind: string, value: unknown): void => { snapshot.update(JSON.stringify([kind, value]) + "\n"); };
+  const records = await mounts();
+  const backings = new Map<string, ReturnType<typeof protectedMountBacking>>();
+  const backing = async (filename: string) => {
+    const mounted = mountForPathFrom(records, filename);
+    if (mounted === undefined || await mountIsNetworkBacked(mounted)) throw new Error("workflow completion lost its local mount");
+    const key = JSON.stringify(mounted);
+    let pending = backings.get(key);
+    if (pending === undefined) { pending = protectedMountBacking(mounted); backings.set(key, pending); }
+    return await pending;
+  };
+  if (state.outputLoopBinding !== outputLoopBinding(await backing(output))) throw new Error("workflow scan output binding changed");
+  for (const root of state.inputRoots) {
+    const current = await stableLstat(root.path);
+    const mount = (await backing(root.path)).identity;
+    if (current.device !== root.device || current.inode !== root.inode || current.raw.isSymbolicLink()
+      || (root.kind === "file" ? !current.raw.isFile() : !current.raw.isDirectory()) || !samePath(await realpath(root.path), root.path)
+      || mount !== root.mount) throw new Error("workflow scan input root changed");
+    remember("root", [root.path, root.kind, current.device, current.inode, current.bytes,
+      current.raw.mtimeNs.toString(), current.raw.ctimeNs.toString(), mount]);
+  }
+  const currentFiles = walkRegularFiles(scan.inputs, {onError: () => { throw new Error("workflow completion coverage walk failed"); },
+    shouldEnterDirectory: async directory => {
+      const current = await stableLstat(directory);
+      if (!current.raw.isDirectory() || current.raw.isSymbolicLink() || !samePath(await realpath(directory), directory)) throw new Error("workflow scan input directory changed");
+      remember("directory", [directory, current.device, current.inode, current.bytes,
+        current.raw.mtimeNs.toString(), current.raw.ctimeNs.toString(), (await backing(directory)).identity]);
+      return true;
+    }})[Symbol.asyncIterator]();
+  try {
+    for await (const file of readScanManifest(output, state.manifest)) {
+      const current = await currentFiles.next();
+      if (current.done || !isDeepStrictEqual({...current.value, index: file.index}, file) || !samePath(await realpath(file.path), file.path)) throw new Error("workflow scan input coverage changed");
+      remember("file", current.value);
+    }
+    if (!(await currentFiles.next()).done) throw new Error("workflow scan has unscanned inputs");
+  } finally { await currentFiles.return?.(undefined); }
+  return snapshot.digest("hex");
 }
 
 /** Separate read-only proof: unlike native verifyScan, this never acquires operation locks. */
@@ -57,32 +101,13 @@ async function verifyReadOnlyScan(config: WorkflowConfig, scan: WorkflowScan, in
     if (occurrence.provenance !== scan.provenance || !state.inputRoots.some(root => root.kind === "file"
       ? samePath(root.path, occurrence.sourcePath) : occurrence.sourcePath.startsWith(root.path + path.sep))) throw new Error("workflow occurrence escaped its inputs");
   }
-  const records = await mounts();
-  const backing = async (filename: string) => {
-    const mounted = mountForPathFrom(records, filename);
-    if (mounted === undefined || await mountIsNetworkBacked(mounted)) throw new Error("workflow completion lost its local mount");
-    return await protectedMountBacking(mounted);
-  };
-  if (state.outputLoopBinding !== outputLoopBinding(await backing(output))) throw new Error("workflow scan output binding changed");
-  for (const root of state.inputRoots) {
-    const current = await stableLstat(root.path);
-    if (current.device !== root.device || current.inode !== root.inode || current.raw.isSymbolicLink()
-      || (root.kind === "file" ? !current.raw.isFile() : !current.raw.isDirectory()) || !samePath(await realpath(root.path), root.path)
-      || (await backing(root.path)).identity !== root.mount) throw new Error("workflow scan input root changed");
-  }
-  const currentFiles = walkRegularFiles(scan.inputs, {onError: () => { throw new Error("workflow completion coverage walk failed"); },
-    shouldEnterDirectory: async directory => { await backing(directory); return true; }})[Symbol.asyncIterator]();
-  try {
-    for await (const file of readScanManifest(output, state.manifest)) {
-      const current = await currentFiles.next();
-      if (current.done || !isDeepStrictEqual({...current.value, index: file.index}, file) || !samePath(await realpath(file.path), file.path)) throw new Error("workflow scan input coverage changed");
-    }
-    if (!(await currentFiles.next()).done) throw new Error("workflow scan has unscanned inputs");
-  } finally { await currentFiles.return?.(undefined); }
+  const snapshot = await sourceSnapshot(scan, output, state);
   await verifyResumeArtifacts(output, inventory);
   if (!isDeepStrictEqual(await fileDigest(path.join(output, "scan-state-sensitive.json"), 16 * 1024 ** 2), proof)) throw new Error("workflow scan proof changed");
   for (const seal of seals) if (await controlIdentity(seal.filename) !== seal.identity) throw new Error("workflow scan controls changed");
-  return {state, inventory, proof, seals};
+  return {state, inventory, proof, seals, verifySources: async () => {
+    if (await sourceSnapshot(scan, output, state) !== snapshot) throw new Error("workflow completion source snapshot changed");
+  }};
 }
 
 /** Strictly read-only case evidence, never cleanup authorization. Host must prove engine inactivity. */
@@ -140,12 +165,14 @@ export async function verifyCompletedWorkflow(attempt: PreparedAttempt): Promise
   const findings = new Map<string, Finding>();
   const artifacts = new Map<string, Artifact>();
   const scanProofs: Array<{bytes: number; sha256: string}> = [];
+  const verifySources: Array<() => Promise<void>> = [];
   let filesVerified = 0, bytesScanned = 0, findingsAcrossScans = 0, references = 0;
   for (let index = 0; index < config.scans.length; index++) {
     const scan = config.scans[index]!;
     const directory = miningDirectory(config, index);
     await outputIdentity(directory, config.mining.storage, false);
     const verified = await verifyReadOnlyScan(config, scan, index);
+    verifySources.push(verified.verifySources);
     if (!isDeepStrictEqual(verified.proof, state.completedScans[index])) throw new Error("workflow completed scan proof changed");
     for (const seal of verified.seals) seals.set(seal.filename, seal.identity);
     scanProofs.push(verified.proof);
@@ -210,6 +237,10 @@ export async function verifyCompletedWorkflow(attempt: PreparedAttempt): Promise
   }
   const expectedNames = [...artifacts.values()].map(artifact => artifact.path).concat("index-sensitive.json", "manifest-redacted.json").sort();
   if (!isDeepStrictEqual((await readDirectoryNamesBounded(packageRoot, expectedNames.length + 1)).sort(), expectedNames)) throw new Error("workflow package contains unexpected entries");
+  // Artifact hashing can be lengthy. Recheck the complete source/entry snapshot
+  // afterward, streaming the existing bounded manifest rather than retaining or
+  // hashing original source contents. Final control seals still cover this pass.
+  for (const verify of verifySources) await verify();
   for (const filename of lockPaths) await assertAbsent(filename);
   for (const [filename, expected] of seals) if (await controlIdentity(filename) !== expected) throw new Error("workflow completion inputs changed during verification");
   if (!isDeepStrictEqual(await fileDigest(statePath, 16 * MAX_WORKFLOW_CONFIG_BYTES), stateDigest)
@@ -223,14 +254,20 @@ export async function verifyCompletedWorkflow(attempt: PreparedAttempt): Promise
 // A separate disposable process isolates blocked destination reads from the case worker.
 if (process.argv[1] !== undefined && pathToFileURL(path.resolve(process.argv[1])).href === import.meta.url) {
   try {
-    const [operation, filename, configHash] = process.argv.slice(2);
+    const [operation, filename, configHash, bindings] = process.argv.slice(2);
     if (operation === "status" && filename !== undefined) process.stdout.write(JSON.stringify(await workflowStatus(filename)) + "\n");
     else if ((operation === "verify" || operation === "binding") && filename !== undefined && configHash !== undefined) {
       const attempt = await verifyPreparedAttempt(filename, configHash);
+      if (operation === "binding" && bindings !== undefined) await assertSourceBindings(attempt.workflow, JSON.parse(bindings));
       process.stdout.write(JSON.stringify(operation === "verify" ? await verifyCompletedWorkflow(attempt) : {valid: true}) + "\n");
     } else throw new Error();
-  } catch {
-    process.stdout.write(JSON.stringify({status: "unknown"}) + "\n");
-    process.exitCode = 1;
+  } catch (error) {
+    if (error instanceof CaseSourceIdentityError) {
+      process.stdout.write('{"valid":false,"reason":"source-identity-changed"}\n');
+      process.exitCode = 2;
+    } else {
+      process.stdout.write(JSON.stringify({status: "unknown"}) + "\n");
+      process.exitCode = 1;
+    }
   }
 }

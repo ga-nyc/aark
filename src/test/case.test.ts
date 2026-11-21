@@ -1,15 +1,16 @@
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
-import { access, mkdir, readFile, symlink, writeFile } from "node:fs/promises";
+import { access, mkdir, readFile, rename, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import type { AgentAction, AgentBridge, AgentEvent, AgentReply, CompletionProof, EngineHost, EngineIdentity,
   EngineObservation, PreparedAttempt, CaseConfig, CaseState } from "../case/types.js";
-import { initializeCase, loadCaseState, redactedCaseStatus, saveCaseState } from "../case/store.js";
+import { initializeCase, loadCaseState, redactedCaseStatus, saveCaseState, writeCaseCompletion } from "../case/store.js";
 import { CaseSupervisor } from "../case/supervisor.js";
 import { caseConfigHash, casePlan, digest, loadCaseConfig } from "../case/config.js";
 import { engineUnitName } from "../case/systemd.js";
+import { CaseSourceIdentityError } from "../case/sources.js";
 import { captureCommand } from "../core/command.js";
 import { mkdtemp } from "./helpers.js";
 
@@ -23,6 +24,7 @@ class FakeHost implements EngineHost {
   verified: string[] = [];
   identities = new Map<string, EngineIdentity>();
   loseNextLaunchReply = false;
+  resumeCapacity: boolean | Error = true;
 
   async preflight(): Promise<void> { this.preflights++; }
   async launch(attempt: PreparedAttempt, token: string, mode: "run" | "resume"): Promise<EngineIdentity> {
@@ -49,6 +51,10 @@ class FakeHost implements EngineHost {
     const proof = this.proofs.get(attempt.workflow.output);
     if (proof instanceof Error) throw proof;
     return proof ?? {sha256: "a".repeat(64), scansVerified: attempt.workflow.scans.length, filesVerified: 1};
+  }
+  async resumeReady(): Promise<boolean> {
+    if (this.resumeCapacity instanceof Error) throw this.resumeCapacity;
+    return this.resumeCapacity;
   }
 }
 
@@ -126,7 +132,42 @@ async function fixture(options: {jobs?: number; attempts?: number; maxConcurrent
   return {root, control, filename, config, workflowFiles, host: new FakeHost(), agent: new FakeAgent()};
 }
 
+async function recoverySourceFixture(missingSource = false) {
+  const f = await fixture({attempts: 2});
+  const source = path.join(f.root, "synthetic-original.img");
+  const analysis = path.join(f.root, "synthetic-analysis.img");
+  if (!missingSource) await writeFile(source, "ordinary synthetic source image\n");
+  await writeFile(analysis, "ordinary synthetic analysis image\n");
+  for (const [index, workflowFile] of f.workflowFiles[0]!.entries()) {
+    const destination = path.join(f.root, `recovery-${index}`);
+    const recoveryFile = path.join(f.root, `recovery-${index}.json`);
+    await writeFile(recoveryFile, JSON.stringify({version: 1, caseId: `synthetic-recovery-${index}`, source, analysisSource: analysis,
+      destination, execute: true, requireReadOnlySource: true, image: {enabled: false},
+      stages: {deletedMetadata: false, ntfsUndelete: false, unallocatedStream: true, signatureCarving: true}}));
+    const workflow = JSON.parse(await readFile(workflowFile, "utf8"));
+    await writeFile(workflowFile, JSON.stringify({...workflow, recoveryConfig: recoveryFile,
+      scans: [{inputs: [path.join(destination, "recovery", "carved")], provenance: "unallocated-carve"}]}));
+  }
+  return {...f, source, analysis};
+}
+
 const linuxOnly = {skip: process.platform !== "linux"};
+
+test("a changed source requires media approval and an agent acknowledgement cannot erase it", linuxOnly, async t => {
+  const f = await fixture();
+  f.host.launch = async () => { throw new CaseSourceIdentityError(); };
+  f.agent.automatic = () => ({type: "acknowledge"});
+  await initializeCase(f.filename, {execute: true});
+  const supervisor = await CaseSupervisor.open(f.control, {host: f.host, agent: f.agent});
+  t.after(() => supervisor.close());
+  await tick(supervisor, 3);
+  const {state} = await loadCaseState(f.control);
+  assert.equal(state.permissionReason, "new-media-required");
+  assert.equal(state.health, "awaiting-permission");
+  assert.equal(f.host.identities.size, 0);
+  assert.equal(state.jobs[0]!.attempts.length, 1);
+  assert.notEqual(state.jobs[0]!.attempts[0]!.status, "failed");
+});
 
 async function tick(supervisor: CaseSupervisor, count = 1): Promise<void> {
   for (let index = 0; index < count; index++) {
@@ -148,6 +189,58 @@ test("case initialization requires both confirmations and every workflow authori
   await writeFile(workflowFile, JSON.stringify({...workflow, execute: false}));
   await assert.rejects(initializeCase(f.filename, {execute: true}), /execut|confirmation/i);
   await assert.rejects(access(f.control));
+});
+
+test("case initialization pins every reviewed recovery source/view and keeps those bindings out of public status", linuxOnly, async () => {
+  const f = await recoverySourceFixture();
+  await initializeCase(f.filename, {execute: true});
+  const {config, state} = await loadCaseState(f.control);
+  assert.deepEqual(Object.keys(state.sourceBindings).sort(), config.jobs[0]!.attempts.map(attempt => attempt.configHash).sort());
+  const status = redactedCaseStatus(config, state);
+  assert.equal(Object.hasOwn(status, "sourceBindings"), false);
+  const serialized = JSON.stringify(status);
+  for (const bindings of Object.values(state.sourceBindings)) {
+    assert.deepEqual(bindings.map(binding => binding.source).sort(), [f.source, f.analysis].sort());
+    for (const binding of bindings) {
+      assert.match(binding.sha256, /^[a-f0-9]{64}$/u);
+      assert.equal(serialized.includes(binding.source), false);
+      assert.equal(serialized.includes(binding.sha256), false);
+    }
+  }
+});
+
+test("initial source identity failure occurs before the case control directory is created", linuxOnly, async () => {
+  const f = await recoverySourceFixture(true);
+  await assert.rejects(initializeCase(f.filename, {execute: true}));
+  await assert.rejects(access(f.control));
+});
+
+test("case storage rejects malformed source identity bindings even after their envelope is rehashed", linuxOnly, async () => {
+  const f = await recoverySourceFixture();
+  await initializeCase(f.filename, {execute: true});
+  const original = await loadCaseState(f.control);
+  const stateFile = path.join(f.control, "case-state-sensitive.json");
+  const bytes = await readFile(stateFile);
+  const key = original.config.jobs[0]!.attempts[0]!.configHash;
+  const changes: Array<(state: CaseState) => void> = [
+    state => { delete state.sourceBindings[key]; },
+    state => { state.sourceBindings["f".repeat(64)] = []; },
+    state => { state.sourceBindings[key]![0]!.source = "/unregistered/synthetic-source.img"; },
+    state => { state.sourceBindings[key]![0]!.sha256 = "invalid"; },
+    state => { state.sourceBindings[key]!.push({...state.sourceBindings[key]![0]!}); },
+    state => { state.sourceBindings[key] = [{...state.sourceBindings[key]![0]!}, {...state.sourceBindings[key]![0]!}]; },
+    state => { (state.sourceBindings[key]![0] as unknown as Record<string, unknown>).message = "synthetic private diagnostic"; },
+    state => { (state.sourceBindings as unknown as Record<string, unknown>)[key] = "synthetic private diagnostic"; },
+  ];
+  for (const change of changes) {
+    const saved = structuredClone(original);
+    change(saved.state);
+    await assert.rejects(saveCaseState(f.control, saved.config, saved.state), /integrity/);
+    assert.throws(() => redactedCaseStatus(saved.config, saved.state), /integrity/);
+    await writeFile(stateFile, JSON.stringify({version: 1, sha256: digest(saved), ...saved}));
+    await assert.rejects(loadCaseState(f.control), /integrity/);
+    await writeFile(stateFile, bytes);
+  }
 });
 
 test("case plans stay redacted and reject cycles, reused outputs, and evidence-readable agents", linuxOnly, async () => {
@@ -329,10 +422,8 @@ test("quota resume remains explicitly opt-in", linuxOnly, async t => {
   t.after(() => supervisor.close());
   await tick(supervisor);
   f.host.observations.set(f.host.launches[0]!.identity.unit, {status: "paused", pauseReason: "free-space-reserve"});
-  await tick(supervisor);
-  f.agent.reply(0, {type: "resume", jobId: "job-000001"});
-  await settle();
-  await tick(supervisor, 2);
+  await tick(supervisor, 3);
+  assert.equal(f.agent.requests.length, 0);
   assert.equal(f.host.launches.length, 1);
   assert.equal((await loadCaseState(f.control)).state.jobs[0]!.attempts.at(-1)!.status, "paused");
 });
@@ -366,17 +457,140 @@ test("an approved quota resume reuses the native output while a signal pause can
       const first = f.host.launches[0]!;
       f.host.observations.set(first.identity.unit, {status: "paused", pauseReason});
       await tick(supervisor);
-      f.agent.reply(0, {type: "resume", jobId: "job-000001"});
-      await settle();
-      await tick(supervisor, 2);
-      if (pauseReason === "signal") assert.equal(f.host.launches.length, 1);
+      if (pauseReason === "signal") {
+        assert.equal(f.host.launches.length, 1);
+        assert.equal(f.agent.requests.length, 0);
+      }
       else {
+        f.agent.reply(0, {type: "resume", jobId: "job-000001"});
+        await settle();
+        await tick(supervisor, 2);
         assert.equal(f.host.identities.size, 2);
         assert.equal(f.host.launches.at(-1)!.mode, "resume");
         assert.equal(f.host.launches.at(-1)!.attempt.workflow.output, first.attempt.workflow.output);
       }
     } finally { await supervisor.close(); }
   }
+});
+
+test("an output-cap pause requires a new plan without consuming repeated resume requests", linuxOnly, async t => {
+  const f = await fixture();
+  f.config.jobs[0]!.resumeAfterQuota = true;
+  await writeFile(f.filename, JSON.stringify(f.config));
+  await initializeCase(f.filename, {execute: true});
+  const supervisor = await CaseSupervisor.open(f.control, {host: f.host, agent: f.agent});
+  t.after(() => supervisor.close());
+  await tick(supervisor);
+  f.host.observations.set(f.host.launches[0]!.identity.unit, {status: "paused", pauseReason: "output-cap"});
+  await tick(supervisor, 10);
+  const {state} = await loadCaseState(f.control);
+  assert.equal(state.permissionReason, "new-plan-required");
+  assert.equal(state.health, "awaiting-permission");
+  assert.equal(state.jobs[0]!.attempts.length, 1);
+  assert.equal(state.agentRequests, 0);
+  assert.equal(f.agent.requests.length, 0);
+  assert.equal(f.host.launches.length, 1);
+});
+
+test("free-space pauses wait for capacity before spending an agent decision or allocating a resume", linuxOnly, async t => {
+  const f = await fixture();
+  f.config.jobs[0]!.resumeAfterQuota = true;
+  await writeFile(f.filename, JSON.stringify(f.config));
+  await initializeCase(f.filename, {execute: true});
+  const supervisor = await CaseSupervisor.open(f.control, {host: f.host, agent: f.agent});
+  t.after(() => supervisor.close());
+  await tick(supervisor);
+  const first = f.host.launches[0]!;
+  f.host.observations.set(first.identity.unit, {status: "paused", pauseReason: "free-space-reserve"});
+  f.host.resumeCapacity = false;
+  await tick(supervisor, 10);
+  const waiting = (await loadCaseState(f.control)).state;
+  assert.equal(waiting.health, "degraded");
+  assert.equal(waiting.jobs[0]!.attempts[0]!.resumeReady, false);
+  assert.equal(waiting.jobs[0]!.attempts.length, 1);
+  assert.equal(waiting.agentRequests, 0);
+  assert.equal(f.agent.requests.length, 0);
+  assert.equal(f.host.launches.length, 1);
+  f.host.resumeCapacity = true;
+  await tick(supervisor);
+  assert.equal(f.agent.requests.length, 1);
+  f.agent.reply(0, {type: "resume", jobId: "job-000001"});
+  await settle();
+  await tick(supervisor, 2);
+  assert.equal(f.host.launches.length, 2);
+  assert.equal(f.host.launches[1]!.mode, "resume");
+  assert.equal(f.host.launches[1]!.attempt.workflow.output, first.attempt.workflow.output);
+});
+
+test("unknown capacity stays observable without spending agent or engine retries", linuxOnly, async t => {
+  const f = await fixture();
+  f.config.jobs[0]!.resumeAfterQuota = true;
+  await writeFile(f.filename, JSON.stringify(f.config));
+  await initializeCase(f.filename, {execute: true});
+  const supervisor = await CaseSupervisor.open(f.control, {host: f.host, agent: f.agent});
+  t.after(() => supervisor.close());
+  await tick(supervisor);
+  f.host.observations.set(f.host.launches[0]!.identity.unit, {status: "paused", pauseReason: "free-space-reserve"});
+  f.host.resumeCapacity = new Error("synthetic capacity probe unavailable");
+  await tick(supervisor, 5);
+  const {state} = await loadCaseState(f.control);
+  assert.equal(state.health, "observation-unavailable");
+  assert.equal(state.jobs[0]!.attempts[0]!.resumeReady, undefined);
+  assert.equal(state.jobs[0]!.attempts.length, 1);
+  assert.equal(state.agentRequests, 0);
+  assert.equal(f.agent.requests.length, 0);
+  assert.equal(f.host.launches.length, 1);
+});
+
+test("capacity loss invalidates an outstanding resume approval before it can allocate an intent", linuxOnly, async t => {
+  const f = await fixture();
+  f.config.jobs[0]!.resumeAfterQuota = true;
+  await writeFile(f.filename, JSON.stringify(f.config));
+  await initializeCase(f.filename, {execute: true});
+  const supervisor = await CaseSupervisor.open(f.control, {host: f.host, agent: f.agent});
+  t.after(() => supervisor.close());
+  await tick(supervisor);
+  f.host.observations.set(f.host.launches[0]!.identity.unit, {status: "paused", pauseReason: "free-space-reserve"});
+  await tick(supervisor);
+  const revision = f.agent.requests[0]!.event.revision;
+  f.host.resumeCapacity = false;
+  f.agent.reply(0, {type: "resume", jobId: "job-000001"});
+  await settle();
+  await tick(supervisor, 3);
+  const {state} = await loadCaseState(f.control);
+  assert.ok(state.revision > revision);
+  assert.equal(state.jobs[0]!.attempts[0]!.resumeReady, false);
+  assert.equal(state.jobs[0]!.attempts.length, 1);
+  assert.equal(state.permissionReason, undefined);
+  assert.equal(f.agent.requests.length, 1);
+  assert.equal(f.host.launches.length, 1);
+});
+
+test("an unready resume from a mixed failure decision waits for capacity without demanding a new plan", linuxOnly, async t => {
+  const f = await fixture({jobs: 2});
+  f.config.jobs[0]!.resumeAfterQuota = true;
+  await writeFile(f.filename, JSON.stringify(f.config));
+  await initializeCase(f.filename, {execute: true});
+  const supervisor = await CaseSupervisor.open(f.control, {host: f.host, agent: f.agent});
+  t.after(() => supervisor.close());
+  await tick(supervisor);
+  f.host.resumeCapacity = false;
+  f.host.observations.set(f.host.launches[0]!.identity.unit, {status: "paused", pauseReason: "free-space-reserve"});
+  f.host.observations.set(f.host.launches[1]!.identity.unit, {status: "failed", failureCode: "unclassified-failure"});
+  await tick(supervisor);
+  assert.equal(f.agent.requests[0]!.event.reason, "job-failed");
+  f.agent.reply(0, {type: "resume", jobId: "job-000001"});
+  await settle();
+  await tick(supervisor, 3);
+  const {state} = await loadCaseState(f.control);
+  assert.equal(state.permissionReason, undefined);
+  assert.equal(state.jobs[0]!.attempts.length, 1);
+  assert.equal(state.jobs[0]!.attempts[0]!.status, "paused");
+  assert.equal(f.host.launches.length, 2);
+  assert.equal(f.agent.requests.length, 1);
+  f.host.resumeCapacity = true;
+  await tick(supervisor);
+  assert.equal(f.agent.requests.length, 2);
 });
 
 test("a lost launch reply reuses its persisted token after supervisor restart", linuxOnly, async () => {
@@ -531,6 +745,44 @@ test("all verified jobs produce a consolidated redacted report and tracked compl
   assert.equal(f.agent.requests.filter(request => request.event.reason === "case-completed").length, 1);
 });
 
+test("completion publication rejects control replacement during the last observation before writing reports", linuxOnly, async t => {
+  const f = await fixture();
+  await initializeCase(f.filename, {execute: true});
+  const supervisor = await CaseSupervisor.open(f.control, {host: f.host, agent: f.agent});
+  t.after(() => supervisor.close());
+  await tick(supervisor);
+  f.host.observations.set(f.host.launches[0]!.identity.unit, {status: "complete", scanErrors: 0});
+  await tick(supervisor); // Let the asynchronous proof finish before its commit.
+  const observe = f.host.observe.bind(f.host);
+  const displaced = path.join(f.root, "displaced-control");
+  f.host.observe = async identity => {
+    const result = await observe(identity);
+    await rename(f.control, displaced);
+    await mkdir(f.control, {mode: 0o700});
+    await rename(path.join(displaced, ".case-service.lock"), path.join(f.control, ".case-service.lock"));
+    return result;
+  };
+  await assert.rejects(supervisor.tick(), /control directory binding changed/);
+  await assert.rejects(access(path.join(f.control, "manifest-redacted.json")));
+  await assert.rejects(access(path.join(f.control, "final-report-redacted.md")));
+});
+
+test("completion publication never recreates a missing case control directory", linuxOnly, async () => {
+  const f = await fixture();
+  await initializeCase(f.filename, {execute: true});
+  const supervisor = await CaseSupervisor.open(f.control, {host: f.host, agent: f.agent});
+  let saved: Awaited<ReturnType<typeof loadCaseState>>;
+  try {
+    await tick(supervisor);
+    f.host.observations.set(f.host.launches[0]!.identity.unit, {status: "complete", scanErrors: 0});
+    await tick(supervisor, 2);
+    saved = await loadCaseState(f.control);
+  } finally { await supervisor.close(); }
+  await rename(f.control, path.join(f.root, "displaced-control"));
+  await assert.rejects(writeCaseCompletion(saved.config, saved.state));
+  await assert.rejects(access(f.control));
+});
+
 test("persisted delivering events are reconciled after a supervisor crash", linuxOnly, async () => {
   const f = await fixture();
   await initializeCase(f.filename, {execute: true});
@@ -583,6 +835,17 @@ test("case storage rejects rehashed malformed fields before persistence, reload,
     ["duplicate agent roots", ({config}) => { config.agent.readableRoots.push(config.agent.readableRoots[0]!); }],
     ["unit does not match launch token", ({state}) => { state.jobs[0]!.attempts[0]!.identity!.unit = engineUnitName(randomUUID()); }],
     ["arbitrary observation diagnostic", ({state}) => { state.jobs[0]!.attempts[0]!.observation = {status: "failed", failureCode: "private-synthetic-value"}; }],
+    ["readiness on a running attempt", ({state}) => { state.jobs[0]!.attempts[0]!.resumeReady = true; }],
+    ["readiness without quota permission", ({state}) => {
+      const attempt = state.jobs[0]!.attempts[0]!; attempt.status = "paused";
+      attempt.observation = {status: "paused", pauseReason: "free-space-reserve"}; attempt.resumeReady = true;
+    }],
+    ["nonboolean readiness", ({config, state}) => {
+      config.jobs[0]!.resumeAfterQuota = true;
+      for (const entry of state.outbox) entry.event.jobs[0]!.resumeAfterQuota = true;
+      const attempt = state.jobs[0]!.attempts[0]!; attempt.status = "paused";
+      attempt.observation = {status: "paused", pauseReason: "free-space-reserve"}; raw(attempt).resumeReady = "private-synthetic-value";
+    }],
     ["event extra fields", ({state}) => { raw(state.outbox[0]!.event).message = "private-synthetic-value"; }],
     ["arbitrary event reason", ({state}) => { raw(state.outbox[0]!.event).reason = "private-synthetic-value"; }],
     ["unregistered event job", ({state}) => { state.outbox[0]!.event.jobs[0]!.id = "private-synthetic-value"; }],

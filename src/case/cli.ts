@@ -50,11 +50,11 @@ export function registerCaseCommands(program: Command): void {
     .option("--autonomous", "confirm agent continuation", false).option("--execute", "confirm managed worker", false)
     .action(async (options: {control: string; autonomous: boolean; execute: boolean}) => {
       confirm(options.execute, options.autonomous);
-      const {config} = await loadCaseState(options.control);
+      const {config, state} = await loadCaseState(options.control);
       await assertProductionCaseStorage(config);
       const groups = (await readFile("/proc/self/cgroup", "utf8")).trim().split("\n");
       if (!groups.some(line => line.endsWith("/" + caseServiceUnit(config.control)))) throw new Error("case serve requires its registered systemd worker");
-      const host = new SystemdEngineHost({cliPath: CLI, controlRoot: config.control, probeTimeoutMs: config.probeTimeoutMs});
+      const host = new SystemdEngineHost({cliPath: CLI, controlRoot: config.control, probeTimeoutMs: config.probeTimeoutMs, sourceBindings: state.sourceBindings});
       const supervisor = await CaseSupervisor.open(config.control, {host, agent: new CodexAgentBridge(config.agent)});
       const controller = new AbortController();
       const stop = () => controller.abort();

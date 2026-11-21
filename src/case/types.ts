@@ -10,6 +10,8 @@ export interface PreparedAttempt {
   configHash: string;
   workflow: WorkflowConfig;
 }
+export interface CaseSourceBinding { source: string; sha256: string }
+export type CaseSourceBindings = Record<string, CaseSourceBinding[]>;
 export interface CaseJob {
   id: string;
   dependsOn: string[];
@@ -60,6 +62,8 @@ export interface EngineHost {
   launch(attempt: PreparedAttempt, token: string, mode: "run" | "resume"): Promise<EngineIdentity>;
   /** Reconcile an uncertain launch without starting an absent engine. */
   reattach?(attempt: PreparedAttempt, token: string, mode: "run" | "resume"): Promise<EngineIdentity | undefined>;
+  /** Fresh capacity check for an unchanged, clean free-space pause. */
+  resumeReady?(attempt: PreparedAttempt): Promise<boolean>;
   observe(identity: EngineIdentity, attempt: PreparedAttempt): Promise<EngineObservation>;
   verify(attempt: PreparedAttempt): Promise<CompletionProof>;
 }
@@ -70,7 +74,7 @@ export interface AgentEvent {
   revision: number;
   reason: ReasonCode;
   jobs: Array<{id: string; status: JobStatus; attemptsUsed: number; attemptsAllowed: number; resumeAfterQuota: boolean;
-    pauseReason?: "signal" | "free-space-reserve" | "output-cap"; failureCode?: string}>;
+    pauseReason?: "signal" | "free-space-reserve" | "output-cap"; failureCode?: string; resumeReady?: boolean}>;
 }
 export type AgentAction =
   | {type: "retry"; jobId: string}
@@ -93,6 +97,7 @@ export interface CaseAttempt {
   status: JobStatus;
   mode: "run" | "resume";
   dispatched?: boolean;
+  resumeReady?: boolean;
   identity?: EngineIdentity;
   observation?: EngineObservation;
   proof?: CompletionProof;
@@ -113,6 +118,7 @@ export interface CaseState {
   caseId: string;
   revision: number;
   configHash: string;
+  sourceBindings: CaseSourceBindings;
   desired: "running" | "user-paused" | "stopped";
   health: CaseHealth;
   jobs: JobState[];

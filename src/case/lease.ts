@@ -9,6 +9,12 @@ export interface CaseLease { assertHeld(): Promise<void>; release(): Promise<voi
 /** The worker retains the flocked open file description. Worker death releases it. */
 export async function acquireCaseLease(control: string): Promise<CaseLease> {
   if (process.platform !== "linux") throw new Error("case supervision requires Linux");
+  if (!path.isAbsolute(control) || path.resolve(control) !== control) throw new Error("invalid case control directory");
+  await assertNoSymlinkComponents(path.parse(control).root, control);
+  const directory = await stableLstat(control);
+  const workerUid = process.getuid?.();
+  if (!directory.raw.isDirectory() || directory.raw.isSymbolicLink() || workerUid === undefined
+    || directory.raw.uid !== BigInt(workerUid) || (directory.raw.mode & 0o077n) !== 0n) throw new Error("case control requires a private worker-owned directory");
   const filename = path.join(control, ".case-service.lock");
   await assertNoSymlinkComponents(control, filename);
   const handle = await open(filename, constants.O_CREAT | constants.O_RDWR | constants.O_NOFOLLOW, 0o600);
@@ -27,7 +33,12 @@ export async function acquireCaseLease(control: string): Promise<CaseLease> {
     const lease: CaseLease = {
       assertHeld: async () => {
         if (released) throw new Error("case lease released");
+        await assertNoSymlinkComponents(path.parse(control).root, control);
         await assertNoSymlinkComponents(control, filename);
+        const currentDirectory = await stableLstat(control);
+        if (!currentDirectory.raw.isDirectory() || currentDirectory.raw.isSymbolicLink()
+          || currentDirectory.device !== directory.device || currentDirectory.inode !== directory.inode
+          || currentDirectory.raw.uid !== directory.raw.uid || (currentDirectory.raw.mode & 0o077n) !== 0n) throw new Error("case control directory binding changed");
         const current = await stableLstat(filename);
         const opened = await stableHandleStat(handle);
         if (current.device !== original.device || current.inode !== original.inode || current.raw.nlink !== 1n

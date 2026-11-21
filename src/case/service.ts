@@ -8,6 +8,8 @@ import { inspectSourceSafety } from "../recovery/source-safety.js";
 import { digest } from "./config.js";
 import { assertCaseDirectory, loadCaseState, redactedCaseStatus } from "./store.js";
 import type { CaseConfig } from "./types.js";
+import { caseRecoverySourcesToInspect } from "./sources.js";
+export { caseRecoverySourcesToInspect } from "./sources.js";
 
 type Command = (executable: string, args: string[], options: CommandOptions) => Promise<CommandResult>;
 interface HostReceipt {version: 1; unit: string; watchUnit: string; user: string; bus: string; cli: string; node: string}
@@ -41,9 +43,8 @@ export async function assertProductionCaseStorage(config: CaseConfig): Promise<v
     || await mountIsNetworkBacked(mounted)) throw new Error("case control requires healthy persistent local storage with private Unix permissions");
   const backing = await resolveBlockBacking(mounted.source.replace(/\[[^\]]*\]$/u, ""));
   if (backing.devices.length === 0 || backing.networkBacked) throw new Error("case control storage backing is unverified");
-  for (const job of config.jobs) for (const attempt of job.attempts) {
-    if (attempt.workflow.recovery === undefined) continue;
-    const safety = await inspectSourceSafety(attempt.workflow.recovery.source, config.control);
+  for (const source of await caseRecoverySourcesToInspect(config)) {
+    const safety = await inspectSourceSafety(source, config.control);
     if (!safety.safe) throw new Error("case control is not independent of its protected recovery source");
   }
 }
@@ -116,12 +117,31 @@ export async function watchCaseService(control: string, command: Command = captu
     || !/^[A-Za-z_][A-Za-z0-9_.-]*[$]?$/u.test(receipt.user) || !/^unix:path=\/run\/user\/[1-9][0-9]*\/bus$/u.test(receipt.bus)) throw new Error("invalid case host registration");
   let active = false;
   try {
-    const result = await command(CTL, ["--system", "--no-ask-password", "show", receipt.unit, "--property=ActiveState,InvocationID", "--no-pager"], options);
-    active = /^ActiveState=(active|activating|reloading)$/mu.test(result.stdout.toString()) && ok(result);
+    const result = await command(CTL, ["--system", "--no-ask-password", "show", receipt.unit,
+      "--property=ActiveState,SubState,MainPID,Result,ExecMainStatus,InvocationID", "--no-pager"], options);
+    const fields = new Map<string, string>();
+    let duplicate = false;
+    for (const line of result.stdout.toString().split("\n")) {
+      const separator = line.indexOf("=");
+      if (separator < 1) continue;
+      const key = line.slice(0, separator);
+      if (fields.has(key)) duplicate = true;
+      fields.set(key, line.slice(separator + 1));
+    }
+    const pid = fields.get("MainPID") ?? "";
+    active = ok(result) && !duplicate && fields.get("ActiveState") === "active" && fields.get("SubState") === "running"
+      && /^[1-9][0-9]*$/u.test(pid) && Number.isSafeInteger(Number(pid)) && fields.get("Result") === "success"
+      && fields.get("ExecMainStatus") === "0" && /^[a-f0-9]{32}$/u.test(fields.get("InvocationID") ?? "");
   } catch { /* Observation unavailable still requires notification. */ }
   let status: Record<string, unknown> | undefined;
-  try { const loaded = await loadCaseState(control); status = redactedCaseStatus(loaded.config, loaded.state); } catch { /* Fixed failure alert below. */ }
-  const stale = status === undefined || now - Date.parse(String(status.updatedAt)) > 180_000;
+  let staleAfter = 180_000;
+  try {
+    const loaded = await loadCaseState(control);
+    status = redactedCaseStatus(loaded.config, loaded.state);
+    // Respect supported polling intervals and a bounded first agent handshake.
+    staleAfter = Math.max(staleAfter, loaded.config.pollMs * 3, loaded.config.agent.timeoutMs + loaded.config.pollMs + 60_000);
+  } catch { /* Fixed failure alert below. */ }
+  const stale = status === undefined || now - Date.parse(String(status.updatedAt)) > staleAfter;
   const unhealthy = !active || stale || ["degraded", "awaiting-permission", "agent-unavailable", "observation-unavailable"].includes(String(status?.health));
   const complete = status?.complete === true;
   const event = complete ? "complete" : unhealthy ? "failed" : status?.desired === "user-paused" ? "paused" : undefined;

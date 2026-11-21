@@ -9,6 +9,7 @@ import { storagePolicyFromGiB } from "../core/storage.js";
 import { FAILURE_CODES } from "../workflow/failure.js";
 import { overlaps } from "../workflow/config.js";
 import { workflowPlan } from "../workflow/runner.js";
+import { captureCaseSourceBindings, workflowExternalSources } from "./sources.js";
 import type { CaseConfig, CaseState } from "./types.js";
 
 const STATE = "case-state-sensitive.json";
@@ -86,7 +87,7 @@ function validate(config: CaseConfig, state: CaseState, control: string): void {
 
 function validateControls(config: CaseConfig, state: CaseState, control: string): void {
   requireValid(fields(config, ["version", "execute", "control", "jobs", "pollMs", "probeTimeoutMs", "maxConcurrent", "agent"])
-    && fields(state, ["version", "caseId", "revision", "configHash", "desired", "health", "jobs", "outbox", "agentRequests", "startedAt", "updatedAt", "complete", "completionDeliveredToAgent"], ["permissionReason", "commandId"]));
+    && fields(state, ["version", "caseId", "revision", "configHash", "sourceBindings", "desired", "health", "jobs", "outbox", "agentRequests", "startedAt", "updatedAt", "complete", "completionDeliveredToAgent"], ["permissionReason", "commandId"]));
   if (config.version !== 1 || config.execute !== true || config.control !== control || !location(control) || state.version !== 1
     || !validId(state.caseId) || state.configHash !== caseConfigHash(config) || !integer(state.revision)
     || !["running", "user-paused", "stopped"].includes(state.desired)
@@ -133,7 +134,7 @@ function validateControls(config: CaseConfig, state: CaseState, control: string)
     }
     let lastIndex = -1;
     for (const attempt of saved.attempts) {
-      if (!fields(attempt, ["index", "token", "status", "mode"], ["dispatched", "identity", "observation", "proof"])
+      if (!fields(attempt, ["index", "token", "status", "mode"], ["dispatched", "identity", "observation", "proof", "resumeReady"])
         || !integer(attempt.index, job.attempts.length - 1) || !validId(attempt.token) || tokens.has(attempt.token)
         || !["launching", "running", "paused", "failed", "complete"].includes(attempt.status)
         || !["run", "resume"].includes(attempt.mode)
@@ -152,10 +153,25 @@ function validateControls(config: CaseConfig, state: CaseState, control: string)
           && (observation.pauseReason === undefined || (observation.status === "paused" && ["signal", "free-space-reserve", "output-cap"].includes(observation.pauseReason))));
         for (const key of ["bytesScanned", "filesScanned", "scanErrors"] as const) requireValid(observation[key] === undefined || integer(observation[key]));
       }
+      if (attempt.resumeReady !== undefined) requireValid(typeof attempt.resumeReady === "boolean" && attempt.status === "paused"
+        && attempt.observation?.pauseReason === "free-space-reserve" && job.resumeAfterQuota);
       if (attempt.proof !== undefined) requireValid(attempt.status === "complete" && fields(attempt.proof, ["sha256", "scansVerified", "filesVerified"])
         && hash(attempt.proof.sha256) && attempt.proof.scansVerified === job.attempts[attempt.index]!.workflow.scans.length
         && integer(attempt.proof.filesVerified));
       if (attempt.status === "complete") requireValid(attempt.proof !== undefined);
+    }
+  }
+  const prepared = new Map(config.jobs.flatMap(job => job.attempts.map(attempt => [attempt.configHash, attempt] as const)));
+  requireValid(fields(state.sourceBindings, [...prepared.keys()]));
+  for (const [configHash, attempt] of prepared) {
+    const bindings = state.sourceBindings[configHash];
+    const allowed = new Set(workflowExternalSources(attempt.workflow));
+    requireValid(Array.isArray(bindings) && bindings.length <= 2);
+    const sources = new Set<string>();
+    for (const binding of bindings) {
+      requireValid(fields(binding, ["source", "sha256"]) && location(binding.source) && allowed.has(binding.source)
+        && !sources.has(binding.source) && hash(binding.sha256));
+      sources.add(binding.source);
     }
   }
   requireValid(!config.agent.readableRoots.some(root => protectedPaths.some(protectedPath => overlaps(root, protectedPath) || overlaps(protectedPath, root))));
@@ -197,11 +213,12 @@ export async function initializeCase(configFile: string, options: {execute: bool
   if (options.execute !== true) throw new Error("case initialization requires --execute confirmation");
   const config = await loadCaseConfig(configFile);
   if (!config.execute) throw new Error("case configuration requires execute confirmation");
+  const sourceBindings = await captureCaseSourceBindings(config);
   await assertNoSymlinkComponents(path.parse(config.control).root, config.control);
   await mkdir(config.control, {mode: 0o700}); // Never adopt or overwrite an existing control directory.
   await assertCaseDirectory(config.control);
   const now = new Date().toISOString();
-  const state: CaseState = {version: 1, caseId: randomUUID(), revision: 0, configHash: caseConfigHash(config), desired: "running",
+  const state: CaseState = {version: 1, caseId: randomUUID(), revision: 0, configHash: caseConfigHash(config), sourceBindings, desired: "running",
     health: "healthy", jobs: config.jobs.map(job => ({id: job.id, attempts: []})), outbox: [], agentRequests: 0,
     startedAt: now, updatedAt: now, complete: false, completionDeliveredToAgent: false};
   await saveCaseState(config.control, config, state);
@@ -244,6 +261,7 @@ export async function saveCaseState(control: string, config: CaseConfig, state: 
 }
 
 export async function writeCaseCompletion(config: CaseConfig, state: CaseState): Promise<void> {
+  await assertCaseDirectory(config.control);
   validate(config, state, config?.control ?? "");
   if (state.jobs.some(job => job.attempts.at(-1)?.status !== "complete")) throw new Error("case has unverified jobs");
   const aggregate = {...redactedCaseStatus(config, state), complete: true, layer: "case-completion", completionScope: "registered-jobs-only",

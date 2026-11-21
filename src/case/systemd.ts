@@ -6,7 +6,8 @@ import { fileURLToPath } from "node:url";
 import { captureCommand, type CommandOptions, type CommandResult } from "../core/command.js";
 import { atomicWriteJson, ensurePrivateDirectory, readJson, stableHandleStat } from "../core/fs-safe.js";
 import { FAILURE_CODES } from "../workflow/failure.js";
-import type { CompletionProof, EngineHost, EngineIdentity, EngineObservation, PreparedAttempt } from "./types.js";
+import { CaseSourceIdentityError } from "./sources.js";
+import type { CaseSourceBinding, CaseSourceBindings, CompletionProof, EngineHost, EngineIdentity, EngineObservation, PreparedAttempt } from "./types.js";
 
 type Command = (executable: string, args: string[], options: CommandOptions) => Promise<CommandResult>;
 export interface SystemdEngineHostOptions {
@@ -14,6 +15,7 @@ export interface SystemdEngineHostOptions {
   controlRoot: string;
   probeTimeoutMs?: number;
   verificationTimeoutMs?: number;
+  sourceBindings?: CaseSourceBindings;
   /** Test seam; production always uses captureCommand. */
   command?: Command;
 }
@@ -22,6 +24,7 @@ type Properties = Record<string, string>;
 const SYSTEMCTL = "/usr/bin/systemctl";
 const SYSTEMD_RUN = "/usr/bin/systemd-run";
 const PROBE = fileURLToPath(new URL("./verify.js", import.meta.url));
+const CAPACITY = fileURLToPath(new URL("./capacity.js", import.meta.url));
 const hash = (value: string) => createHash("sha256").update(value).digest("hex");
 const successful = (result: CommandResult) => result.exitCode === 0 && result.terminationReason === null && !result.stdoutTruncated && !result.stderrTruncated;
 
@@ -105,7 +108,14 @@ export class SystemdEngineHost implements EngineHost {
   private binding(attempt: PreparedAttempt, mode: "run" | "resume"): string {
     if (!/^[a-f0-9]{64}$/u.test(attempt.configHash) || hash(JSON.stringify(attempt.workflow)) !== attempt.configHash || !path.isAbsolute(attempt.configFile)
       || /[\u0000-\u001f\u007f%]/u.test(attempt.configFile + attempt.workflow.output)) throw new Error("invalid case engine binding");
-    return hash(JSON.stringify([attempt.configFile, attempt.configHash, attempt.workflow.output, mode, process.execPath, this.options.cliPath]));
+    return hash(JSON.stringify([attempt.configFile, attempt.configHash, attempt.workflow.output, mode, process.execPath, this.options.cliPath, this.sourcePolicy(attempt)]));
+  }
+
+  private sourcePolicy(attempt: PreparedAttempt): CaseSourceBinding[] {
+    if (attempt.workflow.recovery === undefined) return [];
+    const bindings = this.options.sourceBindings?.[attempt.configHash];
+    if (bindings === undefined) throw new Error("case source authorization is missing");
+    return bindings;
   }
 
   private assertUnit(values: Properties, binding: string): string {
@@ -148,7 +158,9 @@ export class SystemdEngineHost implements EngineHost {
     if (values === undefined) {
       // A previously observed invocation must never be replaced under its old token.
       if (receipt?.invocationId !== undefined) throw new Error("case engine invocation disappeared");
-      const config = await this.capture(process.execPath, [PROBE, "binding", attempt.configFile, attempt.configHash]);
+      const config = await this.capture(process.execPath, [PROBE, "binding", attempt.configFile, attempt.configHash, JSON.stringify(this.sourcePolicy(attempt))]);
+      if (config.exitCode === 2 && config.terminationReason === null && !config.stdoutTruncated && !config.stderrTruncated
+        && config.stdout.toString().trim() === '{"valid":false,"reason":"source-identity-changed"}') throw new CaseSourceIdentityError();
       if (!successful(config) || config.stdout.toString().trim() !== '{"valid":true}') throw new Error("case engine configuration binding changed");
       await atomicWriteJson(receiptPath, {version: 1, binding});
       const logs = ["stdout", "stderr"].map(kind => path.join(this.directory, `${unit}.${kind}.log`));
@@ -163,7 +175,8 @@ export class SystemdEngineHost implements EngineHost {
         "--service-type=exec", "--remain-after-exit", "--expand-environment=no", "--property=Restart=no", "--property=UMask=0077",
         "--property=SuccessExitStatus=75", "--property=TasksAccounting=yes", `--property=StandardOutput=append:${logs[0]}`, `--property=StandardError=append:${logs[1]}`,
         "--", process.execPath, this.options.cliPath, "workflow", mode,
-        ...(mode === "run" ? ["--config", attempt.configFile] : ["--output", attempt.workflow.output]), "--expected-config-hash", attempt.configHash, "--execute"];
+        ...(mode === "run" ? ["--config", attempt.configFile] : ["--output", attempt.workflow.output]), "--expected-config-hash", attempt.configHash,
+        ...(attempt.workflow.recovery === undefined ? [] : ["--expected-source-bindings", JSON.stringify(this.sourcePolicy(attempt))]), "--execute"];
       // A client timeout can leave a successfully started service. Always reconcile it.
       try { await this.capture(SYSTEMD_RUN, args); } catch { /* Only the launch client may have failed. */ }
       values = await this.show(unit);
@@ -190,6 +203,20 @@ export class SystemdEngineHost implements EngineHost {
       if (![this.binding(attempt, "run"), this.binding(attempt, "resume")].includes(receipt.binding)) return {status: "unknown"};
       const values = await this.show(identity.unit);
       if (values === undefined || this.assertUnit(values, receipt.binding) !== identity.invocationId || receipt.invocationId !== identity.invocationId) return {status: "unknown"};
+      const running = ["activating", "reloading", "deactivating"].includes(values.ActiveState ?? "")
+        || (values.ActiveState === "active" && values.SubState !== "exited");
+      const assignedEmptyGroup = values.TasksCurrent === "0" && values.ControlGroup === `/system.slice/${identity.unit}`;
+      // systemd releases the empty cgroup of a RemainAfterExit service and then
+      // reports TasksCurrent=[not set]. Missing properties are not this proof.
+      const releasedEmptyGroup = values.TasksCurrent === "[not set]" && values.ControlGroup === "";
+      const settled = !running && values.MainPID === "0" && (assignedEmptyGroup || releasedEmptyGroup)
+        && ["exited", "dead", "failed"].includes(values.SubState ?? "");
+      const exitedWithError = values.ExecMainCode === "1" && /^[1-9][0-9]*$/u.test(values.ExecMainStatus ?? "") && values.ExecMainStatus !== "75";
+      const killed = ["2", "3"].includes(values.ExecMainCode ?? "") && /^[1-9][0-9]*$/u.test(values.ExecMainStatus ?? "");
+      // Startup refusals and crashes can precede the first progress checkpoint,
+      // or leave its disk unreadable. An owned, settled failed invocation proves
+      // failure independently; it never proves completion or a resumable pause.
+      if (settled && (values.ActiveState === "failed" || exitedWithError || killed)) return {status: "failed"};
       const result = await this.capture(process.execPath, [PROBE, "status", attempt.workflow.output]);
       if (!successful(result)) return {status: "unknown"};
       const native: unknown = JSON.parse(result.stdout.toString());
@@ -201,13 +228,7 @@ export class SystemdEngineHost implements EngineHost {
         if (typeof value === "number" && Number.isSafeInteger(value) && value >= 0) counters[target] = value;
       }
       if (typeof status.failureCode === "string" && FAILURE_CODES.has(status.failureCode)) counters.failureCode = status.failureCode;
-      if (["activating", "reloading", "deactivating"].includes(values.ActiveState ?? "") || (values.ActiveState === "active" && values.SubState !== "exited")) return {...counters, status: "running"};
-      const assignedEmptyGroup = values.TasksCurrent === "0" && values.ControlGroup === `/system.slice/${identity.unit}`;
-      // systemd releases the empty cgroup of a RemainAfterExit service and then
-      // reports TasksCurrent=[not set]. Missing properties are not this proof.
-      const releasedEmptyGroup = values.TasksCurrent === "[not set]" && values.ControlGroup === "";
-      const settled = values.MainPID === "0" && (assignedEmptyGroup || releasedEmptyGroup)
-        && (values.SubState === "exited" || values.SubState === "dead" || values.SubState === "failed");
+      if (running) return {...counters, status: "running"};
       if (!settled) return counters;
       if (status.status === "paused" && status.resumable === true && values.Result === "success" && values.ExecMainCode === "1" && values.ExecMainStatus === "75"
         && ["signal", "free-space-reserve", "output-cap"].includes(String(status.pauseReason))) {
@@ -218,7 +239,7 @@ export class SystemdEngineHost implements EngineHost {
         this.completed.set(attempt.configFile + ":" + attempt.configHash, identity);
         return {...counters, status: "complete"};
       }
-      if (status.status === "failed" || values.ActiveState === "failed" || (values.ExecMainCode !== "0" && values.ExecMainStatus !== "0" && values.ExecMainStatus !== "75")) return {...counters, status: "failed"};
+      if (status.status === "failed") return {...counters, status: "failed"};
       return counters;
     } catch { return {status: "unknown"}; }
   }
@@ -235,5 +256,15 @@ export class SystemdEngineHost implements EngineHost {
       if ((await this.observe(identity, attempt)).status !== "complete") throw new Error();
       return proof as CompletionProof;
     } catch { throw new Error("case workflow completion verification failed"); }
+  }
+
+  public async resumeReady(attempt: PreparedAttempt): Promise<boolean> {
+    const result = await this.capture(process.execPath, [CAPACITY, attempt.configFile, attempt.configHash]);
+    if (!successful(result)) throw new Error("case quota readiness observation unavailable");
+    let response: unknown;
+    try { response = JSON.parse(result.stdout.toString()); } catch { throw new Error("case quota readiness observation unavailable"); }
+    if (typeof response !== "object" || response === null || Array.isArray(response)
+      || Object.keys(response).length !== 1 || !("ready" in response) || typeof response.ready !== "boolean") throw new Error("case quota readiness observation unavailable");
+    return response.ready;
   }
 }

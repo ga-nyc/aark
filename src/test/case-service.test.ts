@@ -1,11 +1,11 @@
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
-import { chmod, mkdir, readFile, rm, unlink } from "node:fs/promises";
+import { chmod, mkdir, readFile, rm, symlink, unlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test, { type TestContext } from "node:test";
 import { caseConfigHash, digest } from "../case/config.js";
-import { caseNotificationStatus, caseServiceUnit, watchCaseService } from "../case/service.js";
+import { caseNotificationStatus, caseRecoverySourcesToInspect, caseServiceUnit, watchCaseService } from "../case/service.js";
 import { saveCaseState } from "../case/store.js";
 import { engineUnitName } from "../case/systemd.js";
 import type { CaseConfig, CaseState } from "../case/types.js";
@@ -13,9 +13,11 @@ import type { CommandOptions, CommandResult } from "../core/command.js";
 import { atomicWriteJson } from "../core/fs-safe.js";
 import type { WorkflowConfig } from "../workflow/config.js";
 import { mkdtemp } from "./helpers.js";
+import { inspectSourceSafety } from "../recovery/source-safety.js";
 
 const linuxOnly = { skip: process.platform !== "linux" };
 const NOW = Date.parse("2030-01-02T03:04:05.000Z");
+const ACTIVE = "ActiveState=active\nSubState=running\nMainPID=4242\nResult=success\nExecMainStatus=0\nInvocationID=" + "1".repeat(32) + "\n";
 interface Call { executable: string; args: string[]; options: CommandOptions }
 function result(stdout = "", changes: Partial<CommandResult> = {}): CommandResult {
   return { executable: "synthetic", args: [], exitCode: 0, signal: null, stdout: Buffer.from(stdout), stderr: Buffer.alloc(0),
@@ -23,7 +25,7 @@ function result(stdout = "", changes: Partial<CommandResult> = {}): CommandResul
 }
 class FakeCommands {
   readonly calls: Call[] = [];
-  observation: CommandResult | Error = result("ActiveState=active\nInvocationID=" + "1".repeat(32) + "\n");
+  observation: CommandResult | Error = result(ACTIVE);
   delivery: CommandResult | Error = result();
   command = async (executable: string, args: string[], options: CommandOptions): Promise<CommandResult> => {
     this.calls.push({ executable, args, options });
@@ -65,7 +67,8 @@ async function fixture(context: TestContext): Promise<{ control: string; config:
     pollMs: 1000, probeTimeoutMs: 1000, maxConcurrent: 1,
     agent: { ownership: "dedicated-thread", stateDirectory: path.join(control, "agent-private"), executable: "/approved/bin/codex",
       socketPath: "/approved/runtime/app.sock", threadId: "synthetic-parent", user: "fixtureuser", readableRoots: [path.join(root, "synthetic-code")], timeoutMs: 1000, maxRequests: 4 } };
-  const state: CaseState = { version: 1, caseId: randomUUID(), revision: 0, configHash: caseConfigHash(config), desired: "running", health: "healthy",
+  const state: CaseState = { version: 1, caseId: randomUUID(), revision: 0, configHash: caseConfigHash(config),
+    sourceBindings: Object.fromEntries(config.jobs.flatMap(job => job.attempts.map(attempt => [attempt.configHash, []]))), desired: "running", health: "healthy",
     jobs: [{ id: "job-000001", attempts: [{ index: 0, token: randomUUID(), status: "running", mode: "run", observation: { status: "running" } }] }],
     outbox: [], agentRequests: 0, startedAt: new Date(NOW - 10_000).toISOString(), updatedAt: new Date(NOW).toISOString(), complete: false, completionDeliveredToAgent: false };
   const attempt = state.jobs[0]!.attempts[0]!;
@@ -107,6 +110,87 @@ test("case watchdog leaves a healthy worker and fresh heartbeat quiet", linuxOnl
   assert.equal(status.userAcknowledged, false);
   assert.equal(f.commands.notifications().length, 0);
   assert.equal(await readFile(path.join(f.control, "case-state-sensitive.json"), "utf8"), before);
+  assert.ok(f.commands.calls[0]!.args.includes("--property=ActiveState,SubState,MainPID,Result,ExecMainStatus,InvocationID"));
+});
+
+test("case watchdog detects auto-restart crash loops despite fresh healthy heartbeats", linuxOnly, async context => {
+  const f = await fixture(context);
+  f.commands.observation = result("ActiveState=activating\nSubState=auto-restart\nMainPID=0\nResult=exit-code\nExecMainStatus=1\nInvocationID=" + "2".repeat(32) + "\n");
+  for (const offset of [0, 30_000, 60_000]) {
+    f.state.updatedAt = new Date(NOW + offset).toISOString();
+    await f.save();
+    const status = await watchCaseService(f.control, f.commands.command, NOW + offset);
+    assert.equal(status.heartbeatStale, false);
+    assert.equal(status.workerObservedActive, false);
+    assert.equal(status.notificationRequired, true);
+    assert.equal(f.commands.event(), "failed");
+  }
+  assert.equal(new Set(f.commands.notifications().map((_, index) => f.commands.token(index))).size, 1);
+});
+
+test("case watchdog requires a complete successful running identity before remaining quiet", linuxOnly, async context => {
+  const f = await fixture(context);
+  const valid = Object.fromEntries(ACTIVE.trim().split("\n").map(line => line.split("=")));
+  for (const key of Object.keys(valid)) {
+    const incomplete = {...valid}; delete incomplete[key];
+    f.commands.observation = result(Object.entries(incomplete).map(([name, value]) => `${name}=${value}`).join("\n"));
+    assert.equal((await watchCaseService(f.control, f.commands.command, NOW)).notificationRequired, true, key);
+  }
+  for (const mutation of [{SubState: "auto-restart"}, {MainPID: "0"}, {MainPID: "not-a-pid"},
+    {Result: "exit-code"}, {ExecMainStatus: "1"}, {InvocationID: "unverified"}, {ActiveState: "reloading"}]) {
+    f.commands.observation = result(Object.entries({...valid, ...mutation}).map(([name, value]) => `${name}=${value}`).join("\n"));
+    assert.equal((await watchCaseService(f.control, f.commands.command, NOW)).notificationRequired, true);
+  }
+  f.commands.observation = result(ACTIVE + "MainPID=0\n");
+  assert.equal((await watchCaseService(f.control, f.commands.command, NOW)).notificationRequired, true);
+  f.commands.observation = result(ACTIVE);
+  assert.equal((await watchCaseService(f.control, f.commands.command, NOW)).notificationRequired, false);
+});
+
+test("production source planning defers only missing inputs produced by approved dependencies", linuxOnly, async context => {
+  const f = await fixture(context);
+  const config = structuredClone(f.config);
+  const producer = config.jobs[0]!;
+  const source = path.join(producer.attempts[0]!.workflow.output, "evidence", "produced.img");
+  const root = path.dirname(f.control);
+  const destination = path.join(root, "dependent-recovery");
+  const workflow: WorkflowConfig = {...structuredClone(producer.attempts[0]!.workflow), output: path.join(root, "dependent-output"),
+    scans: [{inputs: [path.join(destination, "recovery", "carved")], provenance: "unallocated-carve"}],
+    recovery: {version: 1, caseId: "synthetic-dependent", source, destination, requireReadOnlySource: true, execute: true,
+      sectorOffset: 0, photoRecCommand: "partition_none,fileopt,everything,enable,search",
+      image: {enabled: false, path: path.join(destination, "evidence", "source.img"), mapfile: path.join(destination, "evidence", "source.map"), retryPasses: 0},
+      stages: {deletedMetadata: false, ntfsUndelete: false, unallocatedStream: true, signatureCarving: true,
+        volumeShadows: false, residualMemory: false, deletedRegistryCells: false}}};
+  const consumer = {id: "job-000002", dependsOn: [producer.id], resumeAfterQuota: false,
+    attempts: [{configFile: path.join(root, "dependent-workflow.json"), configHash: digest(workflow), workflow}]};
+  config.jobs.push(consumer);
+  assert.deepEqual(await caseRecoverySourcesToInspect(config), []);
+  const analysis = path.join(root, "external-analysis.img");
+  workflow.recovery!.analysisSource = analysis;
+  assert.deepEqual(await caseRecoverySourcesToInspect(config), [analysis], "external analysis sources receive the same protection as the original source");
+  workflow.recovery!.analysisSource = path.join(producer.attempts[0]!.workflow.output, "future-analysis.img");
+  assert.deepEqual(await caseRecoverySourcesToInspect(config), [], "approved missing producer analysis inputs may wait for their dependency");
+  workflow.recovery!.analysisSource = workflow.recovery!.image.path;
+  workflow.recovery!.image.enabled = true;
+  assert.deepEqual(await caseRecoverySourcesToInspect(config), [], "the image created by this recovery is checked by native recovery execution");
+  workflow.recovery!.image.enabled = false;
+  delete workflow.recovery!.analysisSource;
+  // Deferring the host's early storage check does not weaken native preflight.
+  await assert.rejects(inspectSourceSafety(source, f.control), {code: "ENOENT"});
+  const alias = path.join(root, "metadata-alias");
+  await symlink(root, alias, "dir");
+  workflow.recovery!.source = path.join(alias, path.relative(root, source));
+  assert.deepEqual(await caseRecoverySourcesToInspect(config), []);
+  workflow.recovery!.source = source;
+  consumer.dependsOn = [];
+  assert.deepEqual(await caseRecoverySourcesToInspect(config), [source]);
+  consumer.dependsOn = [producer.id];
+  workflow.recovery!.source = path.join(root, "unproduced.img");
+  assert.deepEqual(await caseRecoverySourcesToInspect(config), [workflow.recovery!.source]);
+  workflow.recovery!.source = source;
+  await mkdir(path.dirname(source), {recursive: true});
+  await writeFile(source, "ordinary synthetic fixture bytes\n");
+  assert.deepEqual(await caseRecoverySourcesToInspect(config), [source], "existing sources still require full source safety checks");
 });
 
 test("case watchdog does not treat a pending agent decision as failed supervision", linuxOnly, async (context) => {
@@ -168,6 +252,26 @@ test("case watchdog detects stale heartbeat even while worker appears active", l
   assert.equal(second.deliveryAccepted, true);
   assert.equal(f.commands.event(), "failed");
   assert.equal(f.commands.token(0), f.commands.token(1));
+});
+
+test("case watchdog respects a supported long poll or first agent handshake instead of raising a false failure", linuxOnly, async context => {
+  const f = await fixture(context);
+  f.config.pollMs = 300_000;
+  f.state.configHash = caseConfigHash(f.config);
+  await f.save();
+  const polling = await watchCaseService(f.control, f.commands.command, NOW + 300_001);
+  assert.equal(polling.heartbeatStale, false);
+  assert.equal(polling.notificationRequired, false);
+  f.config.pollMs = 1000;
+  f.config.agent.timeoutMs = 900_000;
+  f.state.configHash = caseConfigHash(f.config);
+  await f.save();
+  const handshake = await watchCaseService(f.control, f.commands.command, NOW + 800_000);
+  assert.equal(handshake.heartbeatStale, false);
+  assert.equal(handshake.notificationRequired, false);
+  const expired = await watchCaseService(f.control, f.commands.command, NOW + 961_001);
+  assert.equal(expired.heartbeatStale, true);
+  assert.equal(expired.notificationRequired, true);
 });
 
 test("case watchdog notices a dead worker without signaling any engine", linuxOnly, async (context) => {

@@ -18,6 +18,8 @@ import type { WorkflowConfig } from "./config.js";
 import { finalizeWorkflow } from "./finalize.js";
 import { FAILURE_CODES, workflowFailureCode } from "./failure.js";
 import { controlIdentity, fileDigest, interrupted, miningDirectory, outputIdentity, samePath, verifyScan, workflowSourceIdentity } from "./verify.js";
+import { assertSourceBindings } from "../case/sources.js";
+import type { CaseSourceBinding } from "../case/types.js";
 
 type Phase = "recovery" | "mining" | "verification" | "packaging" | "complete";
 type Status = "running" | "paused" | "complete" | "failed";
@@ -53,6 +55,8 @@ export interface WorkflowOptions {
   execute: boolean;
   /** Bind an external supervisor's authorization to the config actually loaded. */
   expectedConfigHash?: string;
+  /** Bind supervised execution to its original source identities, not paths alone. */
+  expectedSourceBindings?: CaseSourceBinding[];
   signal?: AbortSignal;
   progress?: (value: Record<string, unknown>) => void;
 }
@@ -364,6 +368,7 @@ export async function runWorkflow(filename: string, options: WorkflowOptions): P
   await assertLoopBackingsOutside(backing.loopBackings, [...config.scans.flatMap(scan => scan.inputs),
     ...(config.recovery === undefined ? [] : [config.recovery.destination])], "workflow input or recovery case");
   const expectedResultsSafety = await resultsSafety(config);
+  if (options.expectedSourceBindings !== undefined) await assertSourceBindings(config, options.expectedSourceBindings, expectedResultsSafety);
   await assertStorageCapacity(parent, storagePolicy(config));
   await assertNoSymlinkComponents(path.parse(config.output).root, config.output);
   await mkdir(config.output, {mode: 0o700});
@@ -388,6 +393,7 @@ export async function resumeWorkflow(directory: string, options: WorkflowOptions
     || hash(JSON.stringify(state.config)) !== options.expectedConfigHash)) throw new Error("workflow configuration differs from the supervisor authorization");
   if (state.status !== "paused") throw new Error("only an explicitly paused workflow may resume; abrupt stops require local review");
   if (await outputIdentity(output, state.config.finalizationStorage) !== state.outputIdentity) throw new Error("workflow output identity changed since its pause");
+  if (options.expectedSourceBindings !== undefined) await assertSourceBindings(state.config, options.expectedSourceBindings, state.resultsSafety);
   const lock = await acquireExclusiveLock(output, ".aark-workflow.lock");
   return await execute(state, options, lock);
 }
