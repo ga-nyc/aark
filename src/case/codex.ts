@@ -333,6 +333,14 @@ export class CodexAgentBridge implements AgentBridge {
         this.assertActive(signal);
         this.checkThread(response, this.receipt.threadId, true);
         this.checkSettings(response, profile);
+        // Codex defers a fresh persistent thread's rollout until its first
+        // turn. Naming the owned thread materializes it without a model turn,
+        // so the strict resume below and a later worker restart can find it.
+        // Keep the receipt durable first: a lost naming reply must never lead
+        // to creating another decision thread.
+        const named = await this.rpc("thread/name/set", { threadId: this.receipt.threadId, name: "AARK case supervisor" });
+        this.assertActive(signal);
+        if (!object(named) || !exact(named, [])) fail("agent-invalid-response");
       } catch (error) {
         if (!intent.submitted) await this.releaseUnsubmittedIntent(intent);
         throw error;
