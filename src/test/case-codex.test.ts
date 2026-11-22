@@ -75,6 +75,7 @@ class FakeServer {
   reply: unknown = REPLY;
   terminal = "completed";
   autoComplete = true;
+  materialized = false;
   settings: Wire = {};
   custom: ((request: Wire, proxy: FakeProxy) => boolean) | undefined;
   spawn = (executable: string, args: string[], options: CodexSpawnOptions): FakeProxy => {
@@ -85,7 +86,9 @@ class FakeServer {
     status: { type: id === "registered-parent" ? this.parentStatus : this.childStatus }, canAcceptDirectInput: true }; }
   resumeResult(): Wire { return { thread: this.thread("case-agent-thread"), approvalPolicy: "on-request", approvalsReviewer: "user",
     activePermissionProfile: { id: this.settings.permissions }, sandbox: { type: "readOnly", networkAccess: false },
-    runtimeWorkspaceRoots: this.settings.runtimeWorkspaceRoots }; }
+    // Codex reports the primary selected environment's roots. An empty
+    // environment selection therefore reports no runtime workspace roots.
+    runtimeWorkspaceRoots: [] }; }
   complete(proxy: FakeProxy, status = this.terminal, reply: unknown = this.reply): void {
     proxy.send({ method: "turn/completed", params: { threadId: "case-agent-thread", turn: { id: "turn-fixture", status, error: null,
       items: [{ type: "agentMessage", id: "message-fixture", phase: "final_answer", text: typeof reply === "string" ? reply : JSON.stringify(reply) }] } } });
@@ -99,7 +102,18 @@ class FakeServer {
       case "initialized": break;
       case "config/read": proxy.result(request, { config: { mcp_servers: { fixture_remote: { enabled: true } }, plugins: { "fixture-plugin": { enabled: true } } } }); break;
       case "thread/read": proxy.result(request, { thread: this.thread(params.threadId as string) }); break;
-      case "thread/start": case "thread/resume": this.settings = params; proxy.result(request, this.resumeResult()); break;
+      case "thread/start":
+        this.materialized = false; this.settings = params; proxy.result(request, this.resumeResult()); break;
+      case "thread/name/set":
+        assert.equal(params.threadId, "case-agent-thread");
+        assert.equal(params.name, "AARK case supervisor");
+        this.materialized = true; proxy.result(request, {}); break;
+      case "thread/resume":
+        if (!this.materialized) {
+          proxy.send({ id: request.id, error: { code: -32600, message: "no rollout found for thread id case-agent-thread" } });
+          break;
+        }
+        this.settings = params; proxy.result(request, this.resumeResult()); break;
       case "thread/goal/get": proxy.result(request, { goal: this.goal }); break;
       case "thread/goal/clear": this.goal = null; proxy.result(request, {}); break;
       case "turn/start":
@@ -181,7 +195,7 @@ linuxTest("closing a bridge during unresolved validation prevents late proxy set
   assert.equal(server.wire.length, 0);
 });
 
-for (const phase of ["initialize", "config/read", "thread/read", "thread/resume", "thread/goal/get"]) linuxTest(`external cancellation during setup ${phase} prevents later setup or model work`, async context => {
+for (const phase of ["initialize", "config/read", "thread/read", "thread/name/set", "thread/resume", "thread/goal/get"]) linuxTest(`external cancellation during setup ${phase} prevents later setup or model work`, async context => {
   const {bridge, server} = await fixture(context);
   const entered = barrier(), controller = new AbortController();
   let held: {request: Wire; proxy: FakeProxy} | undefined;
@@ -262,6 +276,7 @@ linuxTest("Codex preflight creates a protected fresh decision thread without sta
   const created = server.calls("thread/start")[0]!.params as Wire;
   assert.deepEqual(created.dynamicTools, []);
   assert.deepEqual(created.environments, []);
+  assert.deepEqual(created.runtimeWorkspaceRoots, []);
   assert.equal(created.ephemeral, false);
   assert.equal(Object.hasOwn(created, "threadId"), false);
   assert.equal(server.calls("thread/fork").length, 0);
@@ -283,6 +298,7 @@ linuxTest("Codex request sends only the fixed redacted event and binds the reply
   assert.equal(turn.approvalPolicy, "on-request");
   assert.equal(turn.approvalsReviewer, "user");
   assert.deepEqual(turn.environments, []);
+  assert.deepEqual(turn.runtimeWorkspaceRoots, []);
   assert.equal(Object.hasOwn(turn, "sandboxPolicy"), false); // named profile carries restrictive roots
   assert.equal(typeof turn.permissions, "string");
   assert.deepEqual(await bridge.request(EVENT), REPLY);
@@ -290,14 +306,17 @@ linuxTest("Codex request sends only the fixed redacted event and binds the reply
   assert.equal(server.wire.some((item) => item.method === "turn/steer" || item.method === "turn/interrupt"), false);
 });
 linuxTest("Codex fresh-thread config disables network, web, apps, plugins, MCP, and execution tools", async (context) => {
-  const { bridge, server, config } = await fixture(context);
+  const { bridge, server, config } = await fixture(context, {readableRoots: ["/approved/code/one", "/approved/code/two"]});
   await bridge.preflight();
   const params = server.calls("thread/start")[0]!.params as Wire;
   const settings = params.config as Wire;
   const profiles = settings.permissions as Record<string, Wire>;
   const profile = profiles[params.permissions as string]!;
   assert.deepEqual(profile.network, { enabled: false });
-  assert.deepEqual(profile.filesystem, Object.fromEntries([[":root", "deny"], [":minimal", "read"], [config.readableRoots[0], "read"]]));
+  assert.deepEqual(profile.filesystem, Object.fromEntries([[":root", "deny"], [":minimal", "read"], ...config.readableRoots.map(root => [root, "read"])]));
+  assert.equal(Object.hasOwn(profile.filesystem as Wire, ":workspace_roots"), false);
+  assert.deepEqual(params.runtimeWorkspaceRoots, []);
+  assert.equal(params.cwd, config.readableRoots[0]);
   assert.equal(settings.default_permissions, params.permissions);
   assert.equal(settings.web_search, "disabled");
   assert.equal((settings.features as Wire).apps, false);
@@ -319,11 +338,28 @@ linuxTest("Codex start and resume use fixed decision instructions with the fixed
   assert.match(created.developerInstructions as string, /never override a signal or user pause/);
   for (const call of server.calls("thread/resume")) {
     const resumed = call.params as Wire;
+    assert.deepEqual(resumed.runtimeWorkspaceRoots, []);
     assert.equal(resumed.baseInstructions, created.baseInstructions);
     assert.equal(resumed.developerInstructions, created.developerInstructions);
   }
 });
 for (const method of ["thread/start", "thread/resume"]) {
+  for (const roots of [undefined, null, {}, ["/unexpected/workspace"]]) {
+    linuxTest(`Codex rejects ${roots === undefined ? "missing" : JSON.stringify(roots)} runtime workspace roots on ${method}`, async context => {
+      const {bridge, server} = await fixture(context);
+      server.custom = (request, proxy) => {
+        if (request.method !== method) return false;
+        server.settings = request.params as Wire;
+        const response = server.resumeResult();
+        if (roots === undefined) delete response.runtimeWorkspaceRoots;
+        else response.runtimeWorkspaceRoots = roots;
+        proxy.result(request, response);
+        return true;
+      };
+      await assert.rejects(bridge.preflight(), code("agent-unavailable"));
+      assert.equal(server.calls("turn/start").length, 0);
+    });
+  }
   for (const networkAccess of [undefined, null, true, "false", 0]) {
     linuxTest(`Codex rejects ${networkAccess === undefined ? "missing" : JSON.stringify(networkAccess)} network assurance on ${method}`, async (context) => {
       const { bridge, server } = await fixture(context);
@@ -387,6 +423,72 @@ linuxTest("Codex reuses the persisted decision thread across bridge lifetimes", 
   context.after(() => next.close());
   await next.preflight();
   assert.equal(server.calls("thread/start").length, 1);
+  assert.equal(server.calls("thread/name/set").length, 1);
+});
+linuxTest("Codex materializes its unturned decision thread after committing its receipt and can cold resume it", async context => {
+  const {bridge, config, server} = await fixture(context);
+  let receiptChecked: Promise<void> | undefined;
+  server.custom = (request, proxy) => {
+    if (request.method !== "thread/name/set") return false;
+    receiptChecked = (async () => {
+      const receipt = JSON.parse(await readFile(path.join(config.stateDirectory, "codex-thread.json"), "utf8")) as Wire;
+      assert.equal(receipt.threadId, (request.params as Wire).threadId);
+      assert.equal(receipt.parentThreadId, "registered-parent");
+      assert.notEqual(receipt.threadId, receipt.parentThreadId);
+      assert.equal(server.calls("thread/resume").length, 0);
+      assert.equal(server.calls("turn/start").length, 0);
+      server.custom = undefined;
+      server.receive(request, proxy);
+    })();
+    return true;
+  };
+  await bridge.preflight();
+  await receiptChecked;
+  assert.equal(server.materialized, true);
+  assert.deepEqual(server.calls("thread/name/set").map(call => call.params), [
+    {threadId: "case-agent-thread", name: "AARK case supervisor"},
+  ]);
+  assert.equal(server.calls("turn/start").length, 0);
+  await bridge.close();
+
+  // A new backend has only the committed thread, with no loaded session or
+  // creating connection. An unmaterialized thread would reject this resume.
+  const cold = new FakeServer();
+  cold.materialized = server.materialized;
+  const next = new CodexAgentBridge(config, {spawn: cold.spawn,
+    validate: async () => ({uid: 4242, currentUid: 4242, home: "/home/fixtureuser"})});
+  context.after(() => next.close());
+  await next.preflight();
+  assert.equal(cold.calls("thread/start").length, 0);
+  assert.equal(cold.calls("thread/name/set").length, 0);
+  assert.equal(cold.calls("thread/resume").length, 1);
+  assert.equal((cold.calls("thread/resume")[0]!.params as Wire).threadId, "case-agent-thread");
+  assert.equal(cold.calls("turn/start").length, 0);
+});
+for (const response of ["rpc-rejection", null, [], {unexpected: true}] as const) linuxTest(`Codex preserves its receipt and fails closed when new-thread naming returns ${JSON.stringify(response)}`, async context => {
+  const {bridge, config, server} = await fixture(context);
+  server.custom = (request, proxy) => {
+    if (request.method !== "thread/name/set") return false;
+    if (response === "rpc-rejection") proxy.send({id: request.id, error: {code: -32600, message: "synthetic private failure"}});
+    else proxy.result(request, response);
+    return true;
+  };
+  await assert.rejects(bridge.preflight(), code(response === "rpc-rejection" ? "agent-unavailable" : "agent-invalid-response"));
+  const receipt = JSON.parse(await readFile(path.join(config.stateDirectory, "codex-thread.json"), "utf8")) as Wire;
+  assert.equal(receipt.threadId, "case-agent-thread");
+  await assert.rejects(access(path.join(config.stateDirectory, "codex-thread-intent.json")), {code: "ENOENT"});
+  assert.equal(server.calls("thread/resume").length, 0);
+  assert.equal(server.calls("turn/start").length, 0);
+  await bridge.close();
+
+  server.custom = undefined;
+  const next = new CodexAgentBridge(config, {spawn: server.spawn,
+    validate: async () => ({uid: 4242, currentUid: 4242, home: "/home/fixtureuser"})});
+  context.after(() => next.close());
+  await assert.rejects(next.preflight(), code("agent-unavailable"));
+  assert.equal(server.calls("thread/start").length, 1);
+  assert.equal(server.calls("thread/name/set").length, 1);
+  assert.equal(server.calls("turn/start").length, 0);
 });
 linuxTest("Codex preserves an unexpected user goal on reuse and requires permission without starting a turn", async (context) => {
   const { bridge, config, server } = await fixture(context);

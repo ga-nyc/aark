@@ -224,7 +224,7 @@ export class CodexAgentBridge implements AgentBridge {
           threadId: receipt.threadId,
           input: [{ type: "text", text: JSON.stringify(event), text_elements: [] }],
           outputSchema: outputSchema(event), approvalPolicy: "on-request", approvalsReviewer: "user",
-          permissions: receipt.profile, runtimeWorkspaceRoots: this.config.readableRoots,
+          permissions: receipt.profile, runtimeWorkspaceRoots: [],
           cwd: this.config.readableRoots[0], environments: [],
           clientUserMessageId: event.eventId,
         });
@@ -333,6 +333,14 @@ export class CodexAgentBridge implements AgentBridge {
         this.assertActive(signal);
         this.checkThread(response, this.receipt.threadId, true);
         this.checkSettings(response, profile);
+        // Codex defers a fresh persistent thread's rollout until its first
+        // turn. Naming the owned thread materializes it without a model turn,
+        // so the strict resume below and a later worker restart can find it.
+        // Keep the receipt durable first: a lost naming reply must never lead
+        // to creating another decision thread.
+        const named = await this.rpc("thread/name/set", { threadId: this.receipt.threadId, name: "AARK case supervisor" });
+        this.assertActive(signal);
+        if (!object(named) || !exact(named, [])) fail("agent-invalid-response");
       } catch (error) {
         if (!intent.submitted) await this.releaseUnsubmittedIntent(intent);
         throw error;
@@ -482,7 +490,7 @@ export class CodexAgentBridge implements AgentBridge {
         || !object(response.activePermissionProfile) || response.activePermissionProfile.id !== profile
         || response.activePermissionProfile.extends != null
         || !object(response.sandbox) || response.sandbox.type !== "readOnly" || response.sandbox.networkAccess !== false
-        || JSON.stringify(response.runtimeWorkspaceRoots) !== JSON.stringify(this.config.readableRoots)) fail("agent-unavailable");
+        || !Array.isArray(response.runtimeWorkspaceRoots) || response.runtimeWorkspaceRoots.length !== 0) fail("agent-unavailable");
   }
   private async restrictedSettings(profile: string): Promise<Record<string, unknown>> {
     const read = await this.rpc("config/read", { cwd: this.config.readableRoots[0], includeLayers: false });
@@ -495,7 +503,9 @@ export class CodexAgentBridge implements AgentBridge {
     return { permissions: profile, approvalPolicy: "on-request", approvalsReviewer: "user", cwd: this.config.readableRoots[0],
       baseInstructions: "You are the AARK case decision worker. Return only the JSON decision required by the output schema. Use only the redacted event supplied in the current request. Do not inspect files, call tools, contact services, or request secrets.",
       developerInstructions: "The native supervisor owns all execution authorization. Choose retry only for a failed job with an unused reviewed attempt; otherwise request new-plan-required. Choose resume only for a clean free-space-reserve pause with resumeAfterQuota and resumeReady both true; never override a signal or user pause. An output-cap pause requires a new plan. Acknowledge completion after all jobs are complete. Unknown observations do not prove failure. No decision authorizes cleanup, source writes, new scope, or arbitrary commands.",
-      runtimeWorkspaceRoots: this.config.readableRoots, config: {
+      // There are no selected execution environments. Code access is granted
+      // only by the absolute filesystem entries below, never workspace roots.
+      runtimeWorkspaceRoots: [], config: {
         default_permissions: profile, permissions: { [profile]: { filesystem, network: { enabled: false } } },
         web_search: "disabled", features: { apps: false, plugins: false, remote_plugin: false,
           shell_tool: false, unified_exec: false, browser_use: false, browser_use_external: false,
