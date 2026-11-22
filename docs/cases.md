@@ -134,6 +134,8 @@ and cannot approve cleanup or expand the authorized media or scope.
 The bridge requests a unique named permission profile with a denied filesystem
 root, minimal runtime reads, explicit code roots, and network access disabled;
 it disables external tool integrations and declines approval requests. This
+uses no execution environments or runtime workspace roots; the profile grants
+code reads through its explicit absolute filesystem entries. The bridge
 uses the experimental Codex app-server protocol and requires a compatible
 server. Unsupported permissions or protocol responses fail visibly; they do
 not fall back to broader access. See the upstream

@@ -86,7 +86,9 @@ class FakeServer {
     status: { type: id === "registered-parent" ? this.parentStatus : this.childStatus }, canAcceptDirectInput: true }; }
   resumeResult(): Wire { return { thread: this.thread("case-agent-thread"), approvalPolicy: "on-request", approvalsReviewer: "user",
     activePermissionProfile: { id: this.settings.permissions }, sandbox: { type: "readOnly", networkAccess: false },
-    runtimeWorkspaceRoots: this.settings.runtimeWorkspaceRoots }; }
+    // Codex reports the primary selected environment's roots. An empty
+    // environment selection therefore reports no runtime workspace roots.
+    runtimeWorkspaceRoots: [] }; }
   complete(proxy: FakeProxy, status = this.terminal, reply: unknown = this.reply): void {
     proxy.send({ method: "turn/completed", params: { threadId: "case-agent-thread", turn: { id: "turn-fixture", status, error: null,
       items: [{ type: "agentMessage", id: "message-fixture", phase: "final_answer", text: typeof reply === "string" ? reply : JSON.stringify(reply) }] } } });
@@ -274,6 +276,7 @@ linuxTest("Codex preflight creates a protected fresh decision thread without sta
   const created = server.calls("thread/start")[0]!.params as Wire;
   assert.deepEqual(created.dynamicTools, []);
   assert.deepEqual(created.environments, []);
+  assert.deepEqual(created.runtimeWorkspaceRoots, []);
   assert.equal(created.ephemeral, false);
   assert.equal(Object.hasOwn(created, "threadId"), false);
   assert.equal(server.calls("thread/fork").length, 0);
@@ -295,6 +298,7 @@ linuxTest("Codex request sends only the fixed redacted event and binds the reply
   assert.equal(turn.approvalPolicy, "on-request");
   assert.equal(turn.approvalsReviewer, "user");
   assert.deepEqual(turn.environments, []);
+  assert.deepEqual(turn.runtimeWorkspaceRoots, []);
   assert.equal(Object.hasOwn(turn, "sandboxPolicy"), false); // named profile carries restrictive roots
   assert.equal(typeof turn.permissions, "string");
   assert.deepEqual(await bridge.request(EVENT), REPLY);
@@ -302,14 +306,17 @@ linuxTest("Codex request sends only the fixed redacted event and binds the reply
   assert.equal(server.wire.some((item) => item.method === "turn/steer" || item.method === "turn/interrupt"), false);
 });
 linuxTest("Codex fresh-thread config disables network, web, apps, plugins, MCP, and execution tools", async (context) => {
-  const { bridge, server, config } = await fixture(context);
+  const { bridge, server, config } = await fixture(context, {readableRoots: ["/approved/code/one", "/approved/code/two"]});
   await bridge.preflight();
   const params = server.calls("thread/start")[0]!.params as Wire;
   const settings = params.config as Wire;
   const profiles = settings.permissions as Record<string, Wire>;
   const profile = profiles[params.permissions as string]!;
   assert.deepEqual(profile.network, { enabled: false });
-  assert.deepEqual(profile.filesystem, Object.fromEntries([[":root", "deny"], [":minimal", "read"], [config.readableRoots[0], "read"]]));
+  assert.deepEqual(profile.filesystem, Object.fromEntries([[":root", "deny"], [":minimal", "read"], ...config.readableRoots.map(root => [root, "read"])]));
+  assert.equal(Object.hasOwn(profile.filesystem as Wire, ":workspace_roots"), false);
+  assert.deepEqual(params.runtimeWorkspaceRoots, []);
+  assert.equal(params.cwd, config.readableRoots[0]);
   assert.equal(settings.default_permissions, params.permissions);
   assert.equal(settings.web_search, "disabled");
   assert.equal((settings.features as Wire).apps, false);
@@ -331,11 +338,28 @@ linuxTest("Codex start and resume use fixed decision instructions with the fixed
   assert.match(created.developerInstructions as string, /never override a signal or user pause/);
   for (const call of server.calls("thread/resume")) {
     const resumed = call.params as Wire;
+    assert.deepEqual(resumed.runtimeWorkspaceRoots, []);
     assert.equal(resumed.baseInstructions, created.baseInstructions);
     assert.equal(resumed.developerInstructions, created.developerInstructions);
   }
 });
 for (const method of ["thread/start", "thread/resume"]) {
+  for (const roots of [undefined, null, {}, ["/unexpected/workspace"]]) {
+    linuxTest(`Codex rejects ${roots === undefined ? "missing" : JSON.stringify(roots)} runtime workspace roots on ${method}`, async context => {
+      const {bridge, server} = await fixture(context);
+      server.custom = (request, proxy) => {
+        if (request.method !== method) return false;
+        server.settings = request.params as Wire;
+        const response = server.resumeResult();
+        if (roots === undefined) delete response.runtimeWorkspaceRoots;
+        else response.runtimeWorkspaceRoots = roots;
+        proxy.result(request, response);
+        return true;
+      };
+      await assert.rejects(bridge.preflight(), code("agent-unavailable"));
+      assert.equal(server.calls("turn/start").length, 0);
+    });
+  }
   for (const networkAccess of [undefined, null, true, "false", 0]) {
     linuxTest(`Codex rejects ${networkAccess === undefined ? "missing" : JSON.stringify(networkAccess)} network assurance on ${method}`, async (context) => {
       const { bridge, server } = await fixture(context);
