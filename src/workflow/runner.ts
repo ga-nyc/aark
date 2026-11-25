@@ -88,7 +88,8 @@ export function workflowPlan(config: WorkflowConfig): Record<string, unknown> {
     ...(config.recovery === undefined ? {} : {recoveryPlan: redactedPlan(buildRecoveryPlan(config.recovery))}),
     scans: config.scans.map((scan, index) => ({number: index + 1, provenance: scan.provenance, inputRoots: scan.inputs.length})),
     phases: [...(config.recovery === undefined ? [] : ["recovery"]), "mining", "verification", "packaging", "complete"],
-    automaticFinalization: true, originalSourcesAndMiningOutputsRetained: true, cleanupAuthorized: false,
+    automaticFinalization: true, originalSourcesAndMiningOutputsRetained: true,
+    wholeFindingSourcesCopiedByWorkflow: false, sourceErasureAuthorized: false, cleanupAuthorized: false,
     miningStoragePerScan: config.mining.storage, finalizationStorage: config.finalizationStorage};
 }
 
@@ -102,6 +103,7 @@ function redacted(state: WorkflowState): Record<string, unknown> {
     ...(state.currentScanErrors === undefined ? {} : {currentScanErrors: state.currentScanErrors}),
     ...(state.recoveryProgress === undefined ? {} : {recoveryProgress: state.recoveryProgress}),
     processId: state.status === "running" ? process.pid : null,
+    wholeFindingSourcesCopiedByWorkflow: false, sourceErasureAuthorized: false,
     cleanupAuthorized: false, ...(state.failureClass === undefined ? {} : {failureClass: state.failureClass}),
     ...(state.failureCode === undefined ? {} : {failureCode: state.failureCode}),
     ...(state.pauseReason === undefined ? {} : {pauseReason: state.pauseReason}),
@@ -416,6 +418,7 @@ export async function workflowStatus(directory: string): Promise<Record<string, 
   for (const key of ["scansPlanned", "scansCompleted", "scansVerified", "filesVerified", "currentScanFilesScanned", "currentScanBytesScanned", "currentScanErrors"] as const) if (Number.isSafeInteger(input[key]) && Number(input[key]) >= 0) result[key] = input[key];
   for (const key of ["startedAt", "updatedAt"] as const) if (typeof input[key] === "string" && /^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z$/.test(input[key])) result[key] = input[key];
   result.resumable = input.status === "paused"; result.cleanupAuthorized = false;
+  result.wholeFindingSourcesCopiedByWorkflow = false; result.sourceErasureAuthorized = false;
   if (typeof input.failureCode === "string" && FAILURE_CODES.has(input.failureCode)) result.failureCode = input.failureCode;
   if (["signal", "free-space-reserve", "output-cap"].includes(String(input.pauseReason))) result.pauseReason = input.pauseReason;
   if (input.recoveryProgress !== undefined) {
