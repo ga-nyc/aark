@@ -88,7 +88,8 @@ async function verifyExtJournalDevice(mounted: RetentionFilesystemRecord): Promi
 }
 /** Directory scans may cross local mounts; this first export contract deliberately refuses them. */
 export function assertRetentionInputMounts(root: string, kind: "file" | "directory", records: readonly MountRecord[]): void {
-  if (kind === "directory" && records.some(mounted => path.resolve(mounted.target) !== root && inside(root, path.resolve(mounted.target)))) throw new Error("retention selected directory input must not contain nested mounts");
+  const canonicalRoot = path.resolve(root);
+  if (kind === "directory" && records.some(mounted => path.resolve(mounted.target) !== canonicalRoot && inside(canonicalRoot, path.resolve(mounted.target)))) throw new Error("retention selected directory input must not contain nested mounts");
 }
 function loopHostRecords(backings: ReadonlyArray<{mount: string}>): RetentionFilesystemRecord[] {
   return backings.map(backing => { let value: unknown; try { value = JSON.parse(backing.mount) as unknown; } catch { throw new Error("retention loop host identity is invalid"); } const host = record(value); if (typeof host.filesystem !== "string" || typeof host.source !== "string" || !Array.isArray(host.options) || host.options.some(value => typeof value !== "string")) throw new Error("retention loop host filesystem is unknown"); return {filesystem: host.filesystem, source: host.source, options: host.options as string[]}; });
