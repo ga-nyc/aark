@@ -3,6 +3,7 @@ import { AsyncLocalStorage } from "node:async_hooks";
 import { constants } from "node:fs";
 import { access, open, readFile, readdir, stat, unlink } from "node:fs/promises";
 import { basename, delimiter, dirname, isAbsolute, join, resolve } from "node:path";
+import { OperationInterruptedError } from "./interruption.js";
 import { ensurePrivateDirectory, stableHandleStat, stableLstat, syncDirectory, type FilesystemIdentity } from "./fs-safe.js";
 
 export interface CommandResult {
@@ -285,7 +286,7 @@ export async function captureCommand(
   }
   if (options.signal?.aborted === true) {
     await cleanupUnstartedOutputs();
-    throw new Error("command aborted before execution");
+    throw new OperationInterruptedError("command aborted before execution");
   }
 
   return await new Promise<CommandResult>((resolve, reject) => {

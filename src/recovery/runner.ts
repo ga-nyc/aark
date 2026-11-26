@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { lstat, opendir, realpath, statfs } from "node:fs/promises";
 import path from "node:path";
+import { OperationInterruptedError } from "../core/interruption.js";
 import { captureCommand, commandExists } from "../core/command.js";
 import { acquireExclusiveLock, assertNoSymlinkComponents, atomicWriteFile, atomicWriteInformationalFile, atomicWriteJson, ensurePrivateDirectory, nearestExistingParent, readDirectoryNamesBounded, readJson, safeJoin } from "../core/fs-safe.js";
 import type { ExclusiveLock } from "../core/fs-safe.js";
@@ -249,7 +250,7 @@ async function containsRegularFile(
   ancestors = new Set<string>(),
   depth = 0,
 ): Promise<boolean> {
-  if (signal?.aborted === true) throw new Error("recovery output verification was interrupted");
+  if (signal?.aborted === true) throw new OperationInterruptedError("recovery output verification was interrupted");
   if (depth > MAX_RECOVERY_OUTPUT_TREE_DEPTH) throw new Error("recovery output exceeds the bounded directory-depth limit");
   const currentMetadata = await lstat(root);
   if (currentMetadata.isSymbolicLink()) return false;
@@ -261,7 +262,7 @@ async function containsRegularFile(
   try {
     const directory = await opendir(root);
     for await (const entry of directory) {
-      if (Boolean(signal?.aborted)) throw new Error("recovery output verification was interrupted");
+      if (Boolean(signal?.aborted)) throw new OperationInterruptedError("recovery output verification was interrupted");
       if (await containsRegularFile(path.join(root, entry.name), signal, ancestors, depth + 1)) return true;
     }
     return false;
@@ -767,7 +768,7 @@ async function runRecoveryPlanWithSource(
 
   try {
     for (const recoveryStep of plan.steps) {
-      if (signal?.aborted === true) throw new Error("recovery interrupted");
+      if (signal?.aborted === true) throw new OperationInterruptedError("recovery interrupted");
       await reused?.assertCurrent();
       await assertDestinationControlCurrent();
       await assertSourceSafetyCurrent(config.source, plan.destination, safety, config.requireReadOnlySource, "source");
@@ -940,7 +941,8 @@ async function runRecoveryPlanWithSource(
         sensitiveRun.currentStep = null;
         await persistState();
         if (effectiveTermination !== null) {
-          throw new Error(effectiveTermination === "abort" ? "recovery interrupted" : `recovery step terminated before completion: ${recoveryStep.id}`);
+          if (effectiveTermination === "abort") throw new OperationInterruptedError("recovery interrupted");
+          throw new Error(`recovery step terminated before completion: ${recoveryStep.id}`);
         }
         if (stepStatus === "failed" && !recoveryStep.optional) throw new Error(`recovery step failed: ${recoveryStep.id}`);
       } catch (error) {
@@ -979,7 +981,7 @@ async function runRecoveryPlanWithSource(
         throw error;
       }
     }
-    if (signal?.aborted === true) throw new Error("recovery interrupted");
+    if (signal?.aborted === true) throw new OperationInterruptedError("recovery interrupted");
     await reused?.assertCurrent();
     await assertSourceSafetyCurrent(config.source, plan.destination, safety, config.requireReadOnlySource, "source");
     if (analysisSafety !== undefined) {

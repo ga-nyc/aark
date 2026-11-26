@@ -3,6 +3,7 @@ import type { BigIntStats } from "node:fs";
 import { constants, open, opendir, rename, stat, lstat, chmod, mkdir, unlink } from "node:fs/promises";
 import type { FileHandle } from "node:fs/promises";
 import path from "node:path";
+import { OperationInterruptedError } from "./interruption.js";
 
 export type FilesystemIdentity = number | string;
 
@@ -540,7 +541,7 @@ export async function* walkRegularFiles(roots: string[], options: WalkOptions = 
   const pending = [...rootPaths].sort((left, right) => bytewiseLexical(right, left));
   const visitedDirectories = new Set<string>();
   while (pending.length > 0) {
-    if (aborted()) throw new Error("regular-file walk was paused");
+    if (aborted()) throw new OperationInterruptedError("regular-file walk was paused");
     const current = pending.pop();
     if (current === undefined) break;
     let stable: StableStat;
@@ -591,7 +592,7 @@ export async function* walkRegularFiles(roots: string[], options: WalkOptions = 
     try {
       const children: string[] = [];
       for await (const entry of directory) {
-        if (aborted()) throw new Error("regular-file walk was paused");
+        if (aborted()) throw new OperationInterruptedError("regular-file walk was paused");
         if (entry.isSymbolicLink()) continue;
         if (children.length >= maximumDirectoryEntries) {
           throw new Error(`directory exceeds the ${maximumDirectoryEntries}-entry deterministic-walk limit; scan smaller subdirectories separately`);

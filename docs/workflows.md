@@ -45,7 +45,9 @@ redacted status, never evidence, recovered values, or source paths.
 Workflow terminal snapshots and `workflow status` include a fixed `failureCode`
 for recognized failures. Storage quota errors use `free-space-reserve` or
 `output-cap`. A clean quota pause during verification or packaging also records
-the quota reason. A caller-requested pause in those phases records `signal`.
+the quota reason. A clean pause requested by the caller records `signal`,
+including when a quota is reached at the same time. An independent I/O or
+integrity error during verification or packaging still fails the workflow.
 Unknown exceptions use `unclassified-failure`. Redacted status omits exception
 messages. A reviewed correction to a failed workflow requires a fresh output.
 Preserve prior outputs and their seals.

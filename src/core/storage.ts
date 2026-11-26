@@ -1,6 +1,7 @@
 import type { BigIntStats } from "node:fs";
 import fs, { lstat, statfs } from "node:fs/promises";
 import path from "node:path";
+import { OperationInterruptedError } from "./interruption.js";
 
 const GIBIBYTE = 1024n ** 3n;
 const MAX_OUTPUT_TREE_DEPTH = 256;
@@ -139,7 +140,7 @@ export async function directoryLogicalBytes(root: string, signal?: AbortSignal):
   const ancestors = new Set<string>();
   let trackedEntries = 0;
   const assertNotAborted = (): void => {
-    if (signal?.aborted === true) throw new Error("output tree size walk was interrupted");
+    if (signal?.aborted === true) throw new OperationInterruptedError("output tree size walk was interrupted");
   };
   const visit = async (current: string, depth: number): Promise<bigint> => {
     assertNotAborted();

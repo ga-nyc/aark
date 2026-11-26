@@ -3,6 +3,7 @@ import { constants } from "node:fs";
 import { open, realpath } from "node:fs/promises";
 import path from "node:path";
 import { isDeepStrictEqual } from "node:util";
+import { OperationInterruptedError } from "../core/interruption.js";
 import { assertNoSymlinkComponents, stableHandleStat, stableLstat, walkRegularFiles } from "../core/fs-safe.js";
 import { assertLoopBackingCapacity, assertSupportedLoopOutputBackings, assertSupportedOutputMount, mountForPath, mountForPathFrom, mountIsNetworkBacked, mounts, outputLoopBinding, protectedMountBacking, stableLoopBackingIdentity } from "../core/mounts.js";
 import { assertStorageCapacity, storagePolicyFromGiB } from "../core/storage.js";
@@ -33,7 +34,7 @@ export async function controlIdentity(filename: string): Promise<string> {
 }
 
 export function interrupted(signal?: AbortSignal): void {
-  if (signal?.aborted === true) throw new Error("workflow interrupted");
+  if (signal?.aborted === true) throw new OperationInterruptedError("workflow interrupted");
 }
 
 export async function outputIdentity(directory: string, storage: RecoveryStorageConfig, checkCapacity = true): Promise<string> {

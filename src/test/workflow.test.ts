@@ -5,7 +5,7 @@ import { access, mkdir, readFile, readdir, writeFile } from "node:fs/promises";
 import { syncBuiltinESMExports } from "node:module";
 import os from "node:os";
 import path from "node:path";
-import test from "node:test";
+import test, { type TestContext } from "node:test";
 import { entropyToMnemonic } from "@scure/bip39";
 import { wordlist } from "@scure/bip39/wordlists/english.js";
 import { mkdtemp } from "./helpers.js";
@@ -133,61 +133,84 @@ async function pauseFinalization() {
   return f;
 }
 
+async function runWithVerificationQuota(context: TestContext, f: Awaited<ReturnType<typeof fixture>>,
+  options: {callerPause?: boolean; readError?: Error}) {
+  f.config.finalizationStorage.minFreePercent = 1;
+  await writeFile(f.filename, JSON.stringify(f.config));
+  const caller = new AbortController();
+  const scanState = path.join(f.output, "mining", "scan-000001", "scan-state-sensitive.json");
+  const originalOpen = fs.promises.open;
+  const originalStatfs = fs.promises.statfs;
+  let verifyStarted = false;
+  let capacityInjected = false;
+  let notifyCapacityCheck!: () => void;
+  const capacityChecked = new Promise<void>(resolve => { notifyCapacityCheck = resolve; });
+  context.mock.timers.enable({apis: ["setInterval", "Date"], now: Date.now()});
+  fs.promises.statfs = (async (...args: Parameters<typeof originalStatfs>) => {
+    const stat = await originalStatfs(...args);
+    if (!capacityInjected || args[0] !== f.output) return stat;
+    notifyCapacityCheck();
+    return {...stat, bavail: typeof stat.bavail === "bigint" ? 0n : 0};
+  }) as typeof originalStatfs;
+  fs.promises.open = async (...args) => {
+    if (verifyStarted && !capacityInjected && args[0] === scanState) {
+      capacityInjected = true;
+      if (options.callerPause) caller.abort();
+      context.mock.timers.tick(5_001);
+      await capacityChecked;
+      // Let the heartbeat abort before the pending control open finishes.
+      await new Promise<void>(resolve => { setImmediate(resolve); });
+      if (options.readError !== undefined) throw options.readError;
+    }
+    return originalOpen(...args);
+  };
+  syncBuiltinESMExports();
+  try {
+    const result = await runWorkflow(f.filename, {execute: true, signal: caller.signal, progress: snapshot => {
+      if (snapshot.phase === "verification" && snapshot.status === "running") verifyStarted = true;
+    }});
+    assert.equal(capacityInjected, true);
+    return result;
+  } finally {
+    fs.promises.open = originalOpen;
+    fs.promises.statfs = originalStatfs;
+    syncBuiltinESMExports();
+    context.mock.timers.reset();
+  }
+}
+
 for (const callerPause of [false, true]) {
   const name = callerPause ? "an explicit signal pause takes precedence over a concurrent quota stop"
     : "a background storage stop during verification reports a resumable quota pause";
   test(name, {timeout: 10_000}, async context => {
     const f = await fixture();
-    f.config.finalizationStorage.minFreePercent = 1;
-    await writeFile(f.filename, JSON.stringify(f.config));
-    const caller = new AbortController();
-    const scanState = path.join(f.output, "mining", "scan-000001", "scan-state-sensitive.json");
-    const originalOpen = fs.promises.open;
-    const originalStatfs = fs.promises.statfs;
-    let verifyStarted = false;
-    let capacityInjected = false;
-    let notifyCapacityCheck!: () => void;
-    const capacityChecked = new Promise<void>(resolve => { notifyCapacityCheck = resolve; });
-    context.mock.timers.enable({apis: ["setInterval", "Date"], now: Date.now()});
-    fs.promises.statfs = (async (...args: Parameters<typeof originalStatfs>) => {
-      const stat = await originalStatfs(...args);
-      if (!capacityInjected || args[0] !== f.output) return stat;
-      notifyCapacityCheck();
-      return {...stat, bavail: typeof stat.bavail === "bigint" ? 0n : 0};
-    }) as typeof originalStatfs;
-    fs.promises.open = async (...args) => {
-      if (verifyStarted && !capacityInjected && args[0] === scanState) {
-        capacityInjected = true;
-        if (callerPause) caller.abort();
-        context.mock.timers.tick(5_001);
-        await capacityChecked;
-        // The guard aborts before verification reads the opened control.
-        await new Promise<void>(resolve => { setImmediate(resolve); });
-      }
-      return originalOpen(...args);
-    };
-    syncBuiltinESMExports();
-    try {
-      const result = await runWorkflow(f.filename, {execute: true, signal: caller.signal, progress: snapshot => {
-        if (snapshot.phase === "verification" && snapshot.status === "running") verifyStarted = true;
-      }});
-      assert.equal(capacityInjected, true);
-      assert.equal(result.status, "paused");
-      assert.equal(result.failureCode, "free-space-reserve");
-      assert.equal(result.pauseReason, callerPause ? "signal" : "free-space-reserve");
-      const status = await workflowStatus(f.output);
-      assert.equal(status.resumable, true);
-      assert.equal(status.nextAction, callerPause ? "resume-when-ready" : "free-space-and-resume");
-      await assert.rejects(access(path.join(f.output, "manifest-redacted.json")));
-    } finally {
-      fs.promises.open = originalOpen;
-      fs.promises.statfs = originalStatfs;
-      syncBuiltinESMExports();
-      context.mock.timers.reset();
-    }
+    const result = await runWithVerificationQuota(context, f, {callerPause});
+    assert.equal(result.status, "paused");
+    assert.equal(result.failureCode, "free-space-reserve");
+    assert.equal(result.pauseReason, callerPause ? "signal" : "free-space-reserve");
+    const status = await workflowStatus(f.output);
+    assert.equal(status.resumable, true);
+    assert.equal(status.nextAction, callerPause ? "resume-when-ready" : "free-space-and-resume");
+    await assert.rejects(access(path.join(f.output, "manifest-redacted.json")));
     assert.equal((await resumeWorkflow(f.output, {execute: true})).status, "complete");
   });
 }
+
+test("a verification I/O failure during a quota stop remains terminal", {timeout: 10_000}, async context => {
+  const f = await fixture();
+  const readError = Object.assign(new Error("synthetic verification read failed"), {code: "EIO"});
+  await assert.rejects(runWithVerificationQuota(context, f, {readError}),
+    error => error instanceof Error && error.cause === readError);
+  const status = await workflowStatus(f.output);
+  assert.equal(status.phase, "verification");
+  assert.equal(status.status, "failed");
+  assert.equal(status.failureCode, "unclassified-failure");
+  assert.equal(status.pauseReason, undefined);
+  assert.equal(status.resumable, false);
+  assert.equal(status.nextAction, "review-local-controls");
+  await assert.rejects(resumeWorkflow(f.output, {execute: true}), /explicitly paused/);
+  await assert.rejects(access(path.join(f.output, "manifest-redacted.json")), {code: "ENOENT"});
+});
 
 test("a clean finalization pause resumes automatically without rerunning completed scans", async () => {
   const f = await pauseFinalization();
