@@ -155,6 +155,14 @@ and a detector match does not establish current account access or funds.
 Secure sensitive output physically or with encryption when the destination
 filesystem cannot enforce Unix file modes.
 
+`wholeFindingSourcesCopiedByWorkflow: false` and `sourceErasureAuthorized: false`
+make this boundary explicit in plans, status, and completion manifests. Before
+reinstalling or erasing an original source, use the separate
+[retention export and verification](retention.md) for every relevant native scan.
+In-place allocated-reference and memory scans can still depend on originals on
+the device being retired. Exporting selected findings does not back up other
+personal files or authorize erasure.
+
 ## Pauses, failures, and storage
 
 A native clean mining pause, recovery's supported ddrescue quota pause, or a

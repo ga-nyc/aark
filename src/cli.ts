@@ -13,6 +13,7 @@ import { resumeSensitiveMaterial, scanSensitiveMaterial } from "./mining/scanner
 import { readValidatedRevealArtifact } from "./mining/reveal.js";
 import { scanDiagnostics } from "./mining/diagnostics.js";
 import { planCleanup, runCleanup } from "./cleanup.js";
+import { planRetention, runRetention, verifyRetentionBundle } from "./retention.js";
 import type { Provenance } from "./core/types.js";
 import { loadWorkflowConfig } from "./workflow/config.js";
 import { resumeWorkflow, runWorkflow, workflowPlan, workflowStatus } from "./workflow/runner.js";
@@ -422,6 +423,41 @@ cleanup.command("run")
       process.removeListener("SIGINT", interrupt);
       process.removeListener("SIGTERM", interrupt);
     }
+  });
+
+const retain = program.command("retain").description("Export and verify whole finding-containing sources without deleting originals (Linux)");
+for (const mode of ["plan", "run"] as const) {
+  const command = retain.command(mode).argument("<miningOutputs...>", "explicit error-free completed native mining outputs")
+    .requiredOption("-d, --destination <directory>", "fresh independent local retention bundle")
+    .option("--min-free-gib <number>", "free-space reserve, at least 5 GiB", value => quantity(value, "minimum free GiB"), 5)
+    .option("--min-free-percent <number>", "free-space reserve, at least 5 percent", value => quantity(value, "minimum free percent"), 5)
+    .option("--max-output-gib <number>", "optional logical export cap", value => quantity(value, "maximum output GiB"));
+  if (mode === "run") command.requiredOption("--plan-token <sha256>", "bind copying to the reviewed retention plan")
+    .option("--execute", "confirm the reviewed copy operation", false);
+  command.action(async (miningOutputs: string[], options: {destination: string; minFreeGib: number; minFreePercent: number;
+    maxOutputGib?: number; planToken?: string; execute?: boolean}) => {
+    const controller = new AbortController();
+    const stop = () => controller.abort();
+    process.once("SIGINT", stop); process.once("SIGTERM", stop);
+    try {
+      const selection = {miningOutputs, destination: options.destination, minimumFreeGiB: options.minFreeGib,
+        minimumFreePercent: options.minFreePercent,
+        ...(options.maxOutputGib === undefined ? {} : {maximumOutputGiB: options.maxOutputGib}), signal: controller.signal};
+      json(mode === "plan" ? await planRetention(selection)
+        : await runRetention({...selection, planToken: options.planToken!, execute: options.execute === true}));
+    } catch (error) {
+      throw new Error("retention operation failed; inspect protected local controls", {cause: error});
+    } finally { process.removeListener("SIGINT", stop); process.removeListener("SIGTERM", stop); }
+  });
+}
+retain.command("verify").requiredOption("--bundle <directory>", "completed retention bundle; original sources are not required")
+  .action(async (options: {bundle: string}) => {
+    const controller = new AbortController();
+    const stop = () => controller.abort();
+    process.once("SIGINT", stop); process.once("SIGTERM", stop);
+    try { json(await verifyRetentionBundle(options.bundle, controller.signal)); }
+    catch (error) { throw new Error("retention verification failed; inspect protected local controls", {cause: error}); }
+    finally { process.removeListener("SIGINT", stop); process.removeListener("SIGTERM", stop); }
   });
 
 registerCaseCommands(program);

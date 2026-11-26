@@ -819,6 +819,37 @@ test("completion verification requires sealed native scans and verifies packaged
   await assert.rejects(access(path.join(f.attempt.workflow.output, ".aark-workflow.lock")));
 });
 
+for (const advisory of ["legacy", "sourceErasureAuthorized", "wholeFindingSourcesCopiedByWorkflow"] as const) {
+  test(`completion proof handles source-retirement advisory fields: ${advisory}`, async t => {
+    const f = await fixture();
+    t.after(() => rm(f.root, {recursive: true, force: true}));
+    await runWorkflow(f.attempt.configFile, {execute: true});
+    const output = f.attempt.workflow.output;
+    const edit = (summary: Record<string, unknown>) => {
+      if (advisory === "legacy") {
+        delete summary.sourceErasureAuthorized;
+        delete summary.wholeFindingSourcesCopiedByWorkflow;
+      } else summary[advisory] = true;
+    };
+    for (const filename of [path.join(output, "manifest-redacted.json"), path.join(output, "finalization-000001", "manifest-redacted.json")]) {
+      const summary = JSON.parse(await readFile(filename, "utf8")) as Record<string, unknown>;
+      edit(summary);
+      await writeFile(filename, JSON.stringify(summary, null, 2) + "\n");
+    }
+    const stateFile = path.join(output, "workflow-state-sensitive.json");
+    const state = JSON.parse(await readFile(stateFile, "utf8"));
+    edit(state.summary);
+    const data = JSON.stringify(state, null, 2) + "\n";
+    await writeFile(stateFile, data);
+    const checkpointFile = path.join(output, "workflow-checkpoint-redacted.json");
+    const checkpoint = JSON.parse(await readFile(checkpointFile, "utf8"));
+    checkpoint.stateSha256 = hash(data);
+    await writeFile(checkpointFile, JSON.stringify(checkpoint, null, 2) + "\n");
+    if (advisory === "legacy") assert.equal((await verifyCompletedWorkflow(f.attempt)).scansVerified, 1);
+    else await assert.rejects(verifyCompletedWorkflow(f.attempt), /packaged summary differs/);
+  });
+}
+
 test("completion verification rejects a changed frozen input even when all result manifests still say complete", async () => {
   const f = await fixture();
   await runWorkflow(f.attempt.configFile, {execute: true});

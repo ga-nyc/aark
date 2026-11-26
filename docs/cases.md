@@ -233,3 +233,9 @@ verification, create missing scan coverage, or authorize deletion. No case or
 agent action approves cleanup automatically. The separate cleanup plan, exact
 aggregate review, fresh end-user decision, approval token, and execution
 confirmations remain required by [the operating guide](../AGENTS.md).
+
+Case completion also does not establish source-device erasure readiness. A
+finding-containing original may still be on the device being retired. Case
+status and reports explicitly keep source erasure unauthorized; complete the
+separate [retention handoff](retention.md), verify its scope and copies, and get
+the owner's exact erasure decision before reinstalling or wiping a source.

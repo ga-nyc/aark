@@ -10,6 +10,12 @@ The project is deliberately split into three layers:
 2. `mine` scans recovered files or unallocated-space streams, strictly validates candidate structures, and stores sensitive values without printing them.
 3. `cleanup` proves that selected recovery copies were completely scanned, then can remove bulk data while retaining final reports, exact findings, every complete source file associated with a finding, and their integrity metadata.
 
+Before retiring or reinstalling an original source, use the separate Linux
+[`retain plan/run/verify` handoff](docs/retention.md). Scan completion and workflow
+packages do not copy all whole finding-containing sources or authorize erasure.
+Retention exports explicitly selected findings and their controls to independent
+storage; it is not a full personal-data backup and never deletes originals.
+
 > [!CAUTION]
 > Use this only on media and data you own or are authorized to examine. Never recover back onto the source disk. SSD TRIM, overwrite, fragmentation, encryption, and filesystem reuse make “recover everything” impossible to guarantee.
 

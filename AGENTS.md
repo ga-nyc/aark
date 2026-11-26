@@ -52,6 +52,16 @@ required permission must be recorded and notified rather than silently ignored.
 10. Show the path-redacted plan, filesystem-entry/regular-file deletion counts and byte totals, retained-artifact count, retained whole-source file count and bytes, marker-only count, evidence disposition, and approval token to the end user. Ask explicitly whether AARK should delete the bulk recovered copy while keeping the root final reports, complete mining outputs, exact sensitive artifacts, every complete finding-containing source file, and minimal integrity metadata. Do not continue until the user says yes.
 11. After approval, run the unchanged command with `--approval-token <TOKEN> --execute --confirm-delete-recovered-copy`. Evidence images remain by default. If the user separately approves evidence deletion, use `--include-evidence` in both commands and `--confirm-delete-evidence` during execution.
 
+Before a separately authorized source-device erasure or operating-system
+reinstall, complete the [retention handoff](docs/retention.md). In-place mining
+and workflow packaging can leave whole finding-containing originals on that
+device. Select all relevant completed native mining outputs, review `aark retain
+plan`, execute the unchanged plan with its token and `--execute`, and verify the
+new bundle independently. Preserve required case-level controls as well. The
+owner must separately choose whether to preserve ordinary data: retention of
+selected findings is not a full backup. A complete scan or successful retention
+export never supplies source-erasure authorization.
+
 ## Sensitive-data boundary
 
 Routine agent operation must not open, quote, summarize, attach, upload, or place these files in model context:
@@ -60,6 +70,7 @@ Routine agent operation must not open, quote, summarize, attach, upload, or plac
 - `case-sensitive.json`, sensitive run state, or sensitive tool logs;
 - `case-state-sensitive.json`, `host-private.json`, or `agent-private/` supervision controls;
 - `final-report-sensitive.md` or `cleanup-final-report-sensitive.md`; or
+- `retention-manifest-sensitive.json` or a retention bundle's copied controls and whole source files; or
 - anything under `artifacts/`, `evidence/`, `retained-sensitive-source-files/`, or raw recovery output directories.
 
 Do not invoke `aark mine reveal` unless the case authorization explicitly requires disclosure of that exact artifact to the local operator. Never use an online login, provider API, search service, hosted OCR system, hosted model, or other network service to validate recovered material. A future OCR layer must remain offline and apply the same artifact, provenance, checkpoint, and redaction rules.

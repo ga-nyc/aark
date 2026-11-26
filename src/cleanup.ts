@@ -708,7 +708,7 @@ function indexedFileIsAuthorized(filename: string, coverage: CoverageIndex): boo
   }
 }
 
-function assertCompletedInventoryMatchesState(inventory: SensitiveScanInventory, state: ScanState): void {
+export function assertCompletedInventoryMatchesState(inventory: SensitiveScanInventory, state: ScanState): void {
   const occurrences = inventory.findings.reduce((sum, finding) => sum + finding.occurrences.length, 0);
   const artifactFiles = inventory.findings.reduce((sum, finding) => sum + finding.artifactFiles.length, 0);
   if (
@@ -1719,4 +1719,18 @@ export async function runCleanup(options: CleanupRunOptions): Promise<Record<str
       throw releaseError;
     }
   }
+}
+
+/** Shared read-only proof for explicit whole-source preservation, without cleanup authorization. */
+export async function verifyCompletedMiningForRetention(output: string, signal?: AbortSignal, locksHeld = false): Promise<{state: ScanState; inventory: SensitiveScanInventory; controlDigest: string}> {
+  const root = await rootSnapshot(output, await mounts(), new Map(), "retention mining output");
+  if (!locksHeld) await assertNoOperationLocks(output, MINING_LOCK_FILENAMES);
+  const controls = await Promise.all(["scan-state-sensitive.json", "scan-files-sensitive.ndjson", "inventory-sensitive.json", "manifest-redacted.json", "final-report-sensitive.md", "final-report-redacted.md"].map(async filename => ({filename, stat: await stableLstat(safeJoin(output, filename))})));
+  const verified = await verifyMiningOutput(root, signal);
+  await verifyLiveManifest(verified.state, output, new Set(), signal);
+  const inventory = await loadCompletedInventory(output, verified.state.inventory, signal);
+  assertCompletedInventoryMatchesState(inventory, verified.state);
+  for (const control of controls) { const current = await stableLstat(safeJoin(output, control.filename)); if (!sameEntryMetadata(control.stat, current) || await realpath(safeJoin(output, control.filename)) !== safeJoin(output, control.filename)) throw new Error("retention native controls changed during completion verification"); }
+  await assertRootCurrent(root);
+  return {state: verified.state, inventory, controlDigest: verified.controlDigest};
 }

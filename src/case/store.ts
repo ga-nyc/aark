@@ -251,7 +251,8 @@ export function redactedCaseStatus(config: CaseConfig, state: CaseState): Record
       failureCode: job.attempts.at(-1)?.observation?.failureCode ?? null,
       pauseReason: job.attempts.at(-1)?.observation?.pauseReason ?? null,
       currentScan: {bytesScanned: job.attempts.at(-1)?.observation?.bytesScanned ?? null,
-        filesScanned: job.attempts.at(-1)?.observation?.filesScanned ?? null, errors: job.attempts.at(-1)?.observation?.scanErrors ?? null}})), cleanupAuthorized: false};
+        filesScanned: job.attempts.at(-1)?.observation?.filesScanned ?? null, errors: job.attempts.at(-1)?.observation?.scanErrors ?? null}})),
+    sourceErasureAuthorized: false, cleanupAuthorized: false};
 }
 
 function serializeCaseState(control: string, config: CaseConfig, state: CaseState): string {
@@ -283,7 +284,9 @@ export async function writeCaseCompletion(config: CaseConfig, state: CaseState):
     proofs: state.jobs.map(job => ({id: job.id, ...job.attempts.at(-1)!.proof})), cleanupAuthorized: false};
   await atomicWriteJson(path.join(config.control, "manifest-redacted.json"), aggregate);
   await atomicWriteFile(path.join(config.control, "final-report-redacted.md"), "# AARK case report\n\nAll registered jobs passed native completion verification.\n\n"
-    + `Verified jobs: ${state.jobs.length}\n\nScope: registered jobs only. Additional recovery, backup, repair, and cleanup obligations require their own reviewed plans.\n\nCleanup authorized: no. Human acknowledgement: not recorded.\n`);
+    + `Verified jobs: ${state.jobs.length}\n\nScope: registered jobs only. Additional recovery, backup, repair, and cleanup obligations require their own reviewed plans.\n\n`
+    + "Whole finding-containing source files remain at their original locations unless a separate retention export has been verified. Scan completion does not establish that original media may be erased. Review and verify retention before retiring a source.\n\n"
+    + "Source erasure authorized: no. Cleanup authorized: no. Human acknowledgement: not recorded.\n");
 }
 
 export async function requestCaseDesired(control: string, desired: "running" | "user-paused"): Promise<void> {

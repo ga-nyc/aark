@@ -1347,6 +1347,10 @@ test("all verified jobs produce a consolidated redacted report and tracked compl
     assert.equal(value.includes("ordinary synthetic fixture data"), false);
   }
   assert.equal(JSON.parse(manifest).cleanupAuthorized, false);
+  assert.equal(JSON.parse(manifest).sourceErasureAuthorized, false);
+  assert.equal((await supervisor.snapshot()).sourceErasureAuthorized, false);
+  assert.match(report, /separate retention export/);
+  assert.match(report, /Source erasure authorized: no/);
   assert.equal(f.agent.requests.filter(request => request.event.reason === "case-completed").length, 1);
 });
 

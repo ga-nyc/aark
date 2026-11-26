@@ -227,7 +227,11 @@ export async function verifyCompletedWorkflow(attempt: PreparedAttempt): Promise
     finishedAt: summary.finishedAt, scansVerified: config.scans.length, filesScanned: filesVerified, bytesScanned,
     scanCountsMayOverlap: true, findingsAcrossScans, distinctFindingFingerprints: findings.size,
     findingIdentity: "category-and-content-fingerprint; not a count of accounts or independently usable keys",
-    artifactFilesVerified: artifacts.size, categories, originalSourcesAndMiningOutputsRetained: true, cleanupAuthorized: false, packageDirectory: packageName};
+    artifactFilesVerified: artifacts.size, categories, originalSourcesAndMiningOutputsRetained: true, cleanupAuthorized: false, packageDirectory: packageName,
+    // Legacy packages predate these advisory fields. When present, all sealed
+    // copies must agree and may only disclaim whole-source copying and erasure.
+    ...(Object.hasOwn(summary, "wholeFindingSourcesCopiedByWorkflow") ? {wholeFindingSourcesCopiedByWorkflow: false} : {}),
+    ...(Object.hasOwn(summary, "sourceErasureAuthorized") ? {sourceErasureAuthorized: false} : {})};
   if (!isDeepStrictEqual(summary, expectedSummary) || !isDeepStrictEqual(rootSummary, expectedSummary)
     || !isDeepStrictEqual(state.summary, expectedSummary)) throw new Error("workflow packaged summary differs from verified scans");
   const packagedProofs = [];

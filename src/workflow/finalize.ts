@@ -119,6 +119,7 @@ export async function finalizeWorkflow(config: WorkflowConfig, attempt: number,
     scanCountsMayOverlap: true, findingsAcrossScans, distinctFindingFingerprints: unique.size,
     findingIdentity: "category-and-content-fingerprint; not a count of accounts or independently usable keys",
     artifactFilesVerified: artifacts.size, categories, originalSourcesAndMiningOutputsRetained: true,
+    wholeFindingSourcesCopiedByWorkflow: false, sourceErasureAuthorized: false,
     cleanupAuthorized: false, packageDirectory: path.basename(root)};
   await writeJson(path.join(root, "manifest-redacted.json"), summary);
   await safe();

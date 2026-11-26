@@ -511,6 +511,17 @@ export async function writeScanState(output: string, state: ScanState, budget?: 
 }
 
 export async function loadScanState(output: string, signal?: AbortSignal): Promise<ScanState> {
+  return await loadScanStateAt(output, output, signal);
+}
+
+/** Retention-only reader: validates untouched copied controls against their recorded original output.
+ * This never changes native resume/reveal path binding or checks original filesystem paths. */
+export async function loadDetachedScanState(copyDirectory: string, originalOutput: string, signal?: AbortSignal): Promise<ScanState> {
+  if (!path.isAbsolute(originalOutput) || path.resolve(originalOutput) !== originalOutput) throw new Error("detached scan original output must be canonical");
+  return await loadScanStateAt(copyDirectory, originalOutput, signal);
+}
+
+async function loadScanStateAt(output: string, originalOutput: string, signal?: AbortSignal): Promise<ScanState> {
   const filename = safeJoin(output, SCAN_STATE_FILENAME);
   await assertNoSymlinkComponents(output, filename);
   const data = await stableFileBytes(filename, 16 * 1024 * 1024, signal);
@@ -552,7 +563,7 @@ export async function loadScanState(output: string, signal?: AbortSignal): Promi
     || semanticInputs.length > MAX_INPUT_ROOTS
     || semanticInputs.some((entry) => !boundedString(entry, MAX_CONTROL_PATH_BYTES) || !path.isAbsolute(entry) || path.resolve(entry) !== entry)
     || new Set(semanticInputs).size !== semanticInputs.length
-    || semantic.output !== output
+    || semantic.output !== originalOutput
     || typeof semantic.provenance !== "string"
     || !PROVENANCE.has(semantic.provenance)
     || !nonNegativeSafe(semantic.chunkBytes)
@@ -632,6 +643,7 @@ async function loadMiningInventory(
   expected: ScanState["inventory"],
   requiredStatus: "paused" | "complete" | "complete-with-errors",
   signal?: AbortSignal,
+  originalOutput = output,
 ): Promise<SensitiveScanInventory> {
   const filename = safeJoin(output, expected.filename);
   await assertNoSymlinkComponents(output, filename);
@@ -658,7 +670,7 @@ async function loadMiningInventory(
     document.version !== 1
     || document.tool !== "aark"
     || document.layer !== "mining"
-    || document.outputRoot !== output
+    || document.outputRoot !== originalOutput
     || document.status !== requiredStatus
     || document.complete !== (requiredStatus === "complete" || requiredStatus === "complete-with-errors")
     || !boundedString(document.startedAt, 128)
@@ -807,6 +819,14 @@ export async function loadCompletedInventory(output: string, expected: ScanState
   if (inventory.errors.length !== 0 || inventory.errorsOmitted !== 0 || inventory.failureMessage !== undefined) {
     throw new Error("completed mining inventory contains errors or a failure message");
   }
+  return inventory;
+}
+
+/** Retention-only counterpart; original native controls remain byte-for-byte unchanged. */
+export async function loadDetachedCompletedInventory(copyDirectory: string, originalOutput: string, expected: ScanState["inventory"], signal?: AbortSignal): Promise<SensitiveScanInventory> {
+  if (!path.isAbsolute(originalOutput) || path.resolve(originalOutput) !== originalOutput) throw new Error("detached inventory original output must be canonical");
+  const inventory = await loadMiningInventory(copyDirectory, expected, "complete", signal, originalOutput);
+  if (inventory.errors.length !== 0 || inventory.errorsOmitted !== 0 || inventory.failureMessage !== undefined) throw new Error("completed mining inventory contains errors or a failure message");
   return inventory;
 }
 

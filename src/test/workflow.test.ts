@@ -59,6 +59,9 @@ test("workflow automatically verifies, deduplicates, and packages all selected s
   assert.equal(summary.distinctFindingFingerprints, 1);
   assert.equal(summary.artifactFilesVerified, 1);
   assert.equal(summary.cleanupAuthorized, false);
+  assert.equal(summary.wholeFindingSourcesCopiedByWorkflow, false);
+  assert.equal(summary.sourceErasureAuthorized, false);
+  assert.equal(result.sourceErasureAuthorized, false);
   const index = JSON.parse(await readFile(path.join(f.output, summary.packageDirectory, "index-sensitive.json"), "utf8"));
   assert.deepEqual(index.findings[0].scans, [1, 2]);
   const artifact = index.findings[0].artifacts[0];
@@ -71,6 +74,8 @@ test("workflow automatically verifies, deduplicates, and packages all selected s
   const status = await workflowStatus(f.output);
   assert.equal(status.status, "complete");
   assert.equal(status.processObserved, false);
+  assert.equal(status.wholeFindingSourcesCopiedByWorkflow, false);
+  assert.equal(status.sourceErasureAuthorized, false);
   assert.equal(JSON.stringify(status).includes(f.root), false);
   assert.equal(JSON.stringify(result).includes(f.value), false);
   assert.equal(JSON.stringify(result).includes(f.root), false);
@@ -80,6 +85,8 @@ test("workflow plan is read-only and execution requires both confirmations", asy
   const f = await fixture();
   const plan = workflowPlan(await loadWorkflowConfig(f.filename));
   assert.equal(plan.automaticFinalization, true);
+  assert.equal(plan.wholeFindingSourcesCopiedByWorkflow, false);
+  assert.equal(plan.sourceErasureAuthorized, false);
   await assert.rejects(runWorkflow(f.filename, {execute: false}), /execute/);
   await assert.rejects(access(f.output));
   await writeFile(f.filename, JSON.stringify({...f.config, execute: false}));
