@@ -341,8 +341,14 @@ async function execute(state: WorkflowState, options: WorkflowOptions, workflowL
     // A partial native recovery cannot be resumed unless its own quota checkpoint said so.
     if ((state.phase === "recovery" && state.recoveryProof === undefined) || state.phase === "mining") state.status = "failed";
     state.failureClass = error instanceof Error ? error.name : "Error";
-    state.failureCode = workflowFailureCode(error);
-    if (state.status === "paused") state.pauseReason = error instanceof StorageQuotaError ? error.reason : "signal";
+    const failureCode = workflowFailureCode(error);
+    state.failureCode = failureCode === "unclassified-failure" && guardFailure instanceof StorageQuotaError
+      ? workflowFailureCode(guardFailure) : failureCode;
+    if (state.status === "paused") {
+      const code = state.failureCode;
+      state.pauseReason = options.signal?.aborted !== true && (code === "free-space-reserve" || code === "output-cap")
+        ? code : "signal";
+    }
     delete state.summary;
     await save();
     if (state.status === "paused") return redacted(state);

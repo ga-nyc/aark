@@ -1,7 +1,8 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { appendFileSync, existsSync, unlinkSync } from "node:fs";
+import fs, { appendFileSync, existsSync, unlinkSync } from "node:fs";
 import { access, mkdir, readFile, readdir, writeFile } from "node:fs/promises";
+import { syncBuiltinESMExports } from "node:module";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -96,6 +97,30 @@ test("workflow plan is read-only and execution requires both confirmations", asy
   await assert.rejects(loadWorkflowConfig(f.filename), /fields/);
 });
 
+test("a recovery that reaches its free-space reserve reports a non-resumable workflow failure", {skip: process.platform !== "linux"}, async () => {
+  const f = await fixture();
+  const source = path.join(f.root, "synthetic.img");
+  const destination = path.join(f.root, "recovery");
+  const recoveryConfig = path.join(f.root, "recovery.json");
+  await writeFile(source, "synthetic disk image");
+  await writeFile(recoveryConfig, JSON.stringify({
+    version: 1, execute: true, caseId: "synthetic-quota", source, destination,
+    storage: {minFreeGiB: 0, minFreePercent: 100},
+    stages: {deletedMetadata: true, unallocatedStream: false, signatureCarving: false},
+  }));
+  await writeFile(f.filename, JSON.stringify({...f.config, recoveryConfig, scans: [
+    {inputs: [path.join(destination, "recovery", "metadata-deleted")], provenance: "deleted-metadata"},
+  ]}));
+  await assert.rejects(runWorkflow(f.filename, {execute: true}), /workflow failed \(free-space-reserve\)/);
+  const status = await workflowStatus(f.output);
+  assert.equal(status.status, "failed");
+  assert.equal(status.phase, "recovery");
+  assert.equal(status.failureCode, "free-space-reserve");
+  assert.equal(status.resumable, false);
+  assert.equal(status.scansCompleted, 0);
+  await assert.rejects(access(path.join(f.output, "manifest-redacted.json")));
+});
+
 async function pauseFinalization() {
   const f = await fixture();
   const controller = new AbortController();
@@ -106,6 +131,62 @@ async function pauseFinalization() {
   assert.equal((await workflowStatus(f.output)).pauseReason, "signal");
   await assert.rejects(access(path.join(f.output, "manifest-redacted.json")));
   return f;
+}
+
+for (const callerPause of [false, true]) {
+  const name = callerPause ? "an explicit signal pause takes precedence over a concurrent quota stop"
+    : "a background storage stop during verification reports a resumable quota pause";
+  test(name, {timeout: 10_000}, async context => {
+    const f = await fixture();
+    f.config.finalizationStorage.minFreePercent = 1;
+    await writeFile(f.filename, JSON.stringify(f.config));
+    const caller = new AbortController();
+    const scanState = path.join(f.output, "mining", "scan-000001", "scan-state-sensitive.json");
+    const originalOpen = fs.promises.open;
+    const originalStatfs = fs.promises.statfs;
+    let verifyStarted = false;
+    let capacityInjected = false;
+    let notifyCapacityCheck!: () => void;
+    const capacityChecked = new Promise<void>(resolve => { notifyCapacityCheck = resolve; });
+    context.mock.timers.enable({apis: ["setInterval", "Date"], now: Date.now()});
+    fs.promises.statfs = (async (...args: Parameters<typeof originalStatfs>) => {
+      const stat = await originalStatfs(...args);
+      if (!capacityInjected || args[0] !== f.output) return stat;
+      notifyCapacityCheck();
+      return {...stat, bavail: typeof stat.bavail === "bigint" ? 0n : 0};
+    }) as typeof originalStatfs;
+    fs.promises.open = async (...args) => {
+      if (verifyStarted && !capacityInjected && args[0] === scanState) {
+        capacityInjected = true;
+        if (callerPause) caller.abort();
+        context.mock.timers.tick(5_001);
+        await capacityChecked;
+        // The guard aborts before verification reads the opened control.
+        await new Promise<void>(resolve => { setImmediate(resolve); });
+      }
+      return originalOpen(...args);
+    };
+    syncBuiltinESMExports();
+    try {
+      const result = await runWorkflow(f.filename, {execute: true, signal: caller.signal, progress: snapshot => {
+        if (snapshot.phase === "verification" && snapshot.status === "running") verifyStarted = true;
+      }});
+      assert.equal(capacityInjected, true);
+      assert.equal(result.status, "paused");
+      assert.equal(result.failureCode, "free-space-reserve");
+      assert.equal(result.pauseReason, callerPause ? "signal" : "free-space-reserve");
+      const status = await workflowStatus(f.output);
+      assert.equal(status.resumable, true);
+      assert.equal(status.nextAction, callerPause ? "resume-when-ready" : "free-space-and-resume");
+      await assert.rejects(access(path.join(f.output, "manifest-redacted.json")));
+    } finally {
+      fs.promises.open = originalOpen;
+      fs.promises.statfs = originalStatfs;
+      syncBuiltinESMExports();
+      context.mock.timers.reset();
+    }
+    assert.equal((await resumeWorkflow(f.output, {execute: true})).status, "complete");
+  });
 }
 
 test("a clean finalization pause resumes automatically without rerunning completed scans", async () => {

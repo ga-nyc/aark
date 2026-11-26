@@ -1,3 +1,5 @@
+import { StorageQuotaError } from "../core/storage.js";
+
 /** Fixed diagnostics only: exception messages can contain evidence or credentials. */
 const FAILURES = new Map<string, string>([
   ["lsblk did not return the requested source device", "source-device-identity-unresolved"],
@@ -17,16 +19,26 @@ const FAILURES = new Map<string, string>([
   ["workflow mining checkpoint changed during verification", "scan-controls-changed"],
 ]);
 
-export const FAILURE_CODES = new Set([...FAILURES.values(), "unclassified-failure"]);
+const STORAGE_FAILURES = ["free-space-reserve", "output-cap"] as const;
+const MAX_DIAGNOSTIC_ERRORS = 8;
+
+export const FAILURE_CODES = new Set([...FAILURES.values(), ...STORAGE_FAILURES, "unclassified-failure"]);
 
 export function workflowFailureCode(error: unknown): string {
-  const visited = new Set<unknown>();
-  let current = error;
-  for (let depth = 0; depth < 8 && current instanceof Error && !visited.has(current); depth++) {
+  const pending = [error];
+  const visited = new Set<Error>();
+  while (pending.length > 0 && visited.size < MAX_DIAGNOSTIC_ERRORS) {
+    const current = pending.pop();
+    if (!(current instanceof Error) || visited.has(current)) continue;
     visited.add(current);
+    if (current instanceof StorageQuotaError && STORAGE_FAILURES.includes(current.reason)) return current.reason;
     const code = FAILURES.get(current.message);
     if (code !== undefined) return code;
-    current = current.cause;
+    // Recovery aggregates its original error before report and lock-release errors.
+    if (current instanceof AggregateError && Array.isArray(current.errors)) {
+      pending.push(...current.errors.slice(0, MAX_DIAGNOSTIC_ERRORS).reverse());
+    }
+    pending.push(current.cause);
   }
   return "unclassified-failure";
 }
