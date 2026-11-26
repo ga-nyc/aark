@@ -4,6 +4,7 @@ import path from "node:path";
 import { isDeepStrictEqual } from "node:util";
 import { acquireExclusiveLock, assertNoSymlinkComponents, atomicWriteInformationalFile, atomicWriteJson, ensurePrivateDirectory, nearestExistingParent, readDirectoryNamesBounded, readJson } from "../core/fs-safe.js";
 import type { ExclusiveLock } from "../core/fs-safe.js";
+import { OperationInterruptedError } from "../core/interruption.js";
 import { assertStorageCapacity, StorageQuotaError, storagePolicyFromGiB } from "../core/storage.js";
 import { assertLoopBackingsOutside, mountForPath, mountIsNetworkBacked, protectedMountBacking } from "../core/mounts.js";
 import { redactedProgress } from "../core/progress.js";
@@ -252,8 +253,10 @@ async function execute(state: WorkflowState, options: WorkflowOptions, workflowL
           state.recoveryProgress = redactedProgress(snapshot, "recovery");
         }, sourceIdentities);
         if (result.status === "paused") {
+          if (guardFailure !== undefined && !(guardFailure instanceof StorageQuotaError)) throw guardFailure;
           const stop = result.storageStop;
-          if (typeof stop === "object" && stop !== null && !Array.isArray(stop)
+          if (options.signal?.aborted) state.pauseReason = "signal";
+          else if (typeof stop === "object" && stop !== null && !Array.isArray(stop)
             && (stop.reason === "free-space-reserve" || stop.reason === "output-cap")) state.pauseReason = stop.reason;
           state.status = "paused"; await save(); return redacted(state);
         }
@@ -307,11 +310,12 @@ async function execute(state: WorkflowState, options: WorkflowOptions, workflowL
         if (typeof value === "number" && Number.isSafeInteger(value) && value >= 0) state[target] = value;
       }
       if (result.status === "paused") {
-        if (guardFailure !== undefined && !(guardFailure instanceof StorageQuotaError)) throw guardFailure;
         const paused = await loadScanState(output);
         if (!paused.resumable || paused.status !== "paused") throw new Error("workflow scan did not publish a clean pause");
+        if (guardFailure !== undefined && !(guardFailure instanceof StorageQuotaError)) throw guardFailure;
         state.pausedScan = index; state.status = "paused";
-        if (guardFailure instanceof StorageQuotaError) state.pauseReason = guardFailure.reason;
+        if (options.signal?.aborted) state.pauseReason = "signal";
+        else if (guardFailure instanceof StorageQuotaError) state.pauseReason = guardFailure.reason;
         else if (paused.pauseReason !== undefined) state.pauseReason = paused.pauseReason;
         await save(); return redacted(state);
       }
@@ -336,13 +340,20 @@ async function execute(state: WorkflowState, options: WorkflowOptions, workflowL
     await save();
     return redacted(state);
   } catch (error) {
+    // A concurrent abort cannot make an independent I/O or integrity failure resumable.
+    const interruptedByController = controller.signal.aborted && error instanceof OperationInterruptedError;
+    const failure = interruptedByController && guardFailure !== undefined ? guardFailure : error;
     state.status = (guardFailure === undefined || guardFailure instanceof StorageQuotaError)
-      && (controller.signal.aborted || error instanceof StorageQuotaError) ? "paused" : "failed";
+      && (interruptedByController || error instanceof StorageQuotaError) ? "paused" : "failed";
     // A partial native recovery cannot be resumed unless its own quota checkpoint said so.
     if ((state.phase === "recovery" && state.recoveryProof === undefined) || state.phase === "mining") state.status = "failed";
     state.failureClass = error instanceof Error ? error.name : "Error";
-    state.failureCode = workflowFailureCode(error);
-    if (state.status === "paused") state.pauseReason = error instanceof StorageQuotaError ? error.reason : "signal";
+    state.failureCode = workflowFailureCode(failure);
+    if (state.status === "paused") {
+      const code = state.failureCode;
+      state.pauseReason = options.signal?.aborted !== true && (code === "free-space-reserve" || code === "output-cap")
+        ? code : "signal";
+    }
     delete state.summary;
     await save();
     if (state.status === "paused") return redacted(state);

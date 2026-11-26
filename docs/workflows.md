@@ -43,10 +43,14 @@ notification channel requires explicit authorization and must carry only fixed
 redacted status, never evidence, recovered values, or source paths.
 
 Workflow terminal snapshots and `workflow status` include a fixed `failureCode`
-for recognized failures. Unknown exceptions use `unclassified-failure`; their
-messages are never copied into redacted status. Failed workflows remain failed
-and cannot be resumed as though they were clean pauses. A reviewed correction
-requires a fresh output. Preserve prior outputs and do not change their seals.
+for recognized failures. Storage quota errors use `free-space-reserve` or
+`output-cap`. A clean quota pause during verification or packaging also records
+the quota reason. A clean pause requested by the caller records `signal`,
+including when a quota is reached at the same time. An independent I/O or
+integrity error during verification or packaging still fails the workflow.
+Unknown exceptions use `unclassified-failure`. Redacted status omits exception
+messages. A reviewed correction to a failed workflow requires a fresh output.
+Preserve prior outputs and their seals.
 
 `currentScanErrors` reports the active scan's aggregate error count. A scan that
 finishes `complete-with-errors` stops its workflow with the fixed

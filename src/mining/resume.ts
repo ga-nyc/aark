@@ -4,6 +4,7 @@ import { lstat, open, realpath, rename, unlink } from "node:fs/promises";
 import path from "node:path";
 import { StringDecoder } from "node:string_decoder";
 import { isDeepStrictEqual } from "node:util";
+import { OperationInterruptedError } from "../core/interruption.js";
 import type { Provenance } from "../core/types.js";
 import { sha256Hex } from "../core/crypto.js";
 import { assertNoSymlinkComponents, atomicWriteJson, readDirectoryNamesBounded, safeJoin, stableHandleStat, stableLstat, syncDirectory } from "../core/fs-safe.js";
@@ -320,7 +321,7 @@ export async function createScanManifest(
 }
 
 function assertNotAborted(signal: AbortSignal | undefined, operation: string): void {
-  if (signal?.aborted === true) throw new Error(`${operation} was interrupted`);
+  if (signal?.aborted === true) throw new OperationInterruptedError(`${operation} was interrupted`);
 }
 
 async function stableFileBytes(filename: string, maximumBytes?: number, signal?: AbortSignal): Promise<Buffer> {
